@@ -112,14 +112,21 @@ them through the new API signatures. The ACO compilation step is unchanged.
 
 ## Phases
 
-### Phase 1: Project skeleton + Mesa vendoring [IN PROGRESS]
-- Create opengnm-psbc/ with fresh git history
-- Vendor Mesa 26.2.0 components from workspace `mesa/`
-- Copy psbc-specific code (cmd/, crc32_sb)
-- Port PSSL types header to use opengnm headers
-- Write build system (Makefile, config.mak)
+> **Development priority:** opengnm-psbc is deferred until opengnm is complete.
+> opengnm (the runtime GNM library) is the primary deliverable. opengnm-psbc
+> (the shader compiler) depends on opengnm's headers and is developed afterward.
+> Phases 1 is done; Phases 2-5 resume after opengnm reaches Gate P7.
 
-### Phase 2: Port main.c to Mesa 26.2.0 APIs [CRITICAL]
+### Phase 1: Project skeleton + Mesa vendoring [DONE]
+- [x] Create opengnm-psbc/ with fresh git history
+- [x] Vendor Mesa 26.2.0 components from workspace `mesa/` (901 files, 24.5 MB)
+- [x] Copy psbc-specific code (cmd/psbc/main.c, crc32_sb.c/h)
+- [x] Port PSSL types header to use opengnm headers (`<gnm_shaderbinary.h>`)
+- [x] Write build system skeleton (Makefile, config.mak)
+- [x] Write plan document with Mesa 26.2.0 API migration table
+- [x] Initial git commit (46a71ba)
+
+### Phase 2: Port main.c to Mesa 26.2.0 APIs [DEFERRED — after opengnm]
 - Construct `radv_compiler_info` (ac_compiler_info, hw config)
 - Construct `radv_shader_stage` (spirv data, entrypoint, stage info)
 - Update `radv_shader_spirv_to_nir` call to new signature
@@ -130,20 +137,20 @@ them through the new API signatures. The ACO compilation step is unchanged.
 - Keep `aco_compile_shader` call as-is (stable interface)
 - Update `buildsb` callback to use new `radv_postprocess_binary_config` signature
 
-### Phase 3: Build system completion [CRITICAL]
+### Phase 3: Build system completion [DEFERRED — after opengnm]
 - Add all Mesa source files to Makefile
 - Add Python codegen rules for generated sources (nir_opcodes, aco_opcodes, etc.)
 - Add compile rules for C and C++ sources
 - Add link rule
 
-### Phase 4: Compile + test [IMPORTANT]
+### Phase 4: Compile + test [DEFERRED — after opengnm]
 - Compile opengnm-psbc on host
 - Test with a simple SPIR-V vertex shader
 - Verify output .sb file has correct GnmShaderFileHeader magic
 - Verify CRC32 is correct
 - Compare output with RE-6 shader binary parser findings
 
-### Phase 5: Complete shader stage support [LOW]
+### Phase 5: Complete shader stage support [DEFERRED — after opengnm]
 - Add GS/HS/LS/ES/CS support (currently only VS/PS)
 - Fill remaining shader binary metadata (resource table, input usage slots)
 - Fix resource table index generation
