@@ -30,7 +30,7 @@ src/compiler/spirv/vtn_generator_ids.h
 config.mak
 
 # Binary
-psbc
+/psbc
 
 # Editor / OS
 .DS_Store

@@ -115,7 +115,7 @@ them through the new API signatures. The ACO compilation step is unchanged.
 > **Development priority:** opengnm-psbc is deferred until opengnm is complete.
 > opengnm (the runtime GNM library) is the primary deliverable. opengnm-psbc
 > (the shader compiler) depends on opengnm's headers and is developed afterward.
-> Phases 1 is done; Phases 2-5 resume after opengnm reaches Gate P7.
+> Phases 1-2 are done; Phases 3-5 resume after opengnm reaches Gate P7.
 
 ### Phase 1: Project skeleton + Mesa vendoring [DONE]
 - [x] Create opengnm-psbc/ with fresh git history
@@ -126,16 +126,21 @@ them through the new API signatures. The ACO compilation step is unchanged.
 - [x] Write plan document with Mesa 26.2.0 API migration table
 - [x] Initial git commit (46a71ba)
 
-### Phase 2: Port main.c to Mesa 26.2.0 APIs [DEFERRED — after opengnm]
-- Construct `radv_compiler_info` (ac_compiler_info, hw config)
-- Construct `radv_shader_stage` (spirv data, entrypoint, stage info)
-- Update `radv_shader_spirv_to_nir` call to new signature
-- Update `radv_nir_shader_info_init` / `info_pass` calls
-- Update `radv_declare_shader_args` call
-- Update `radv_postprocess_nir` call
-- Update `radv_postprocess_binary_config` call
-- Keep `aco_compile_shader` call as-is (stable interface)
-- Update `buildsb` callback to use new `radv_postprocess_binary_config` signature
+### Phase 2: Port main.c to Mesa 26.2.0 APIs [DONE]
+- [x] Construct `radv_compiler_info` (ac_compiler_info, hw config, NIR options)
+- [x] Construct `radv_shader_stage` (spirv data, entrypoint, stage info, key)
+- [x] Update `radv_shader_spirv_to_nir` call to new signature
+- [x] Update `radv_nir_shader_info_init` / `radv_nir_shader_info_pass` calls
+- [x] Update `radv_declare_shader_args` call
+- [x] Update `radv_postprocess_nir` call (set `stage.nir` before call)
+- [x] Use `radv_shader_nir_to_asm()` for ACO compilation (replaces direct `aco_compile_shader`)
+- [x] Add GFX10.3 (PS5/RDNA2) target support with `CHIP_NAVI21`
+- [x] Fix `get_num_pos_exports` to match Mesa's `radv_get_num_pos_exports` (clip/cull dist masks)
+- [x] Fix `compute_db_shader_control` to match Mesa 26.2.0 `radv_precompute_registers_hw_ps`
+- [x] Fix `spipsincontrol` NUM_INTERP handling for GFX10.3
+- [x] Replace `gl_shader_stage` with `mesa_shader_stage` (not defined in new Mesa headers)
+- [x] Create `radv_constants.h` with `MAX_SETS`, `MAX_VERTEX_ATTRIBS`, `MAX_RTS`, `RADV_MAX_HEAPS`
+- [x] Fix `.gitignore` to not ignore `cmd/psbc/` directory
 
 ### Phase 3: Build system completion [DEFERRED — after opengnm]
 - Add all Mesa source files to Makefile

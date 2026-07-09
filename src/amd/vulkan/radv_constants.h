@@ -1,0 +1,16 @@
+#ifndef RADV_CONSTANTS_H
+#define RADV_CONSTANTS_H
+
+#define MAX_VBS 32
+#define MAX_VERTEX_ATTRIBS 32
+#define MAX_RTS 8
+#define MAX_VIEWPORTS 16
+#define MAX_SETS 32
+
+#define RADV_HEAP_RESOURCE  0
+#define RADV_HEAP_SAMPLER   1
+#define RADV_MAX_HEAPS (RADV_HEAP_SAMPLER + 1)
+
+#define RADV_SUBGROUP_SIZE 64
+
+#endif /* RADV_CONSTANTS_H */
