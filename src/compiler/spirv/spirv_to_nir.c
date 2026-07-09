@@ -35,7 +35,7 @@
  * This list should remain alphabetized.  For the purposes of alphabetization,
  * suffixes do not exist and 8 comes before 16.
  */
-static const struct spirv_capabilities implemented_capabilities = {
+const struct spirv_capabilities implemented_capabilities = {
    .AbortKHR = true,
    .Addresses = true,
    .AtomicFloat16AddEXT = true,

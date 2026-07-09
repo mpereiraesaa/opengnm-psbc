@@ -1,3 +1,4 @@
+#include "amdgfxregs.h"
 /*
  * Copyright © 2020 Valve Corporation
  *

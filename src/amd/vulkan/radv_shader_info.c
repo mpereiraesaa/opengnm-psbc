@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: MIT
  */
 #include "radv_shader_info.h"
+#include "sid.h"
 #include "nir/nir.h"
 #include "nir/nir_xfb_info.h"
 #include "nir/radv_nir.h"
@@ -12,6 +13,7 @@
 #include "radv_device.h"
 #include "radv_physical_device.h"
 #include "radv_pipeline_graphics.h"
+#include "radv_pipeline.h"
 #include "radv_shader.h"
 
 #include "ac_nir.h"

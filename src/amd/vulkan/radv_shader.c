@@ -8,7 +8,14 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include <stdio.h>
+
 #include "radv_shader.h"
+#include "radv_instance.h"
+#include "radv_device.h"
+#include "radv_descriptor_set.h"
+#include "radv_pipeline_graphics.h"
+#include "radv_pipeline_compute.h"
 #include "meta/radv_meta.h"
 #include "nir/nir.h"
 #include "nir/nir_builder.h"
@@ -16,7 +23,8 @@
 #include "nir/radv_meta_nir.h"
 #include "nir/radv_nir.h"
 #include "spirv/nir_spirv.h"
-#include "tools/radv_debug_hang.h"
+/* PSBC: not needed for standalone compiler */
+/* #include "tools/radv_debug_hang.h" */
 #include "tools/radv_debug_nir.h"
 #include "util/memstream.h"
 #include "util/mesa-blake3.h"
@@ -38,6 +46,7 @@
 #include "sid.h"
 #include "vk_debug_report.h"
 #include "vk_nir.h"
+#include "vk_pipeline.h"
 #include "vk_nir_lower_descriptor_heaps.h"
 #include "vk_sampler.h"
 #include "vk_nir_convert_ycbcr.h"
@@ -1035,6 +1044,7 @@ radv_lower_ngg(const struct radv_compiler_info *compiler_info, struct radv_shade
    }
 }
 
+#if 0 /* PSBC: shader arena management not needed for standalone compiler */
 static unsigned
 get_size_class(unsigned size, bool round_up)
 {
@@ -1573,6 +1583,7 @@ radv_destroy_shader_upload_queue(struct radv_device *device)
       ws->ctx_destroy(device->shader_upload_hw_ctx);
    }
 }
+#endif /* PSBC: end shader arena management */
 
 static bool
 radv_should_use_wgp_mode(enum amd_gfx_level gfx_level, mesa_shader_stage stage, const struct radv_shader_info *info)
@@ -2695,6 +2706,7 @@ radv_shader_binary_get_layout(struct radv_shader_binary_legacy *binary)
    return layout;
 }
 
+#if 0 /* PSBC: shader upload/DMA not needed for standalone compiler */
 static bool
 radv_shader_binary_upload(struct radv_device *device, const struct radv_shader_binary *binary,
                           struct radv_shader *shader, void *dest_ptr)
@@ -2917,6 +2929,7 @@ radv_shader_upload(struct radv_device *device, struct radv_shader *shader, const
    }
    return true;
 }
+#endif /* PSBC: end shader upload/DMA */
 
 unsigned
 radv_get_max_waves(const struct radv_device *device, const struct ac_shader_config *conf,
@@ -2965,6 +2978,7 @@ radv_get_max_waves(const struct radv_device *device, const struct ac_shader_conf
    return gfx_level >= GFX10 ? max_simd_waves * (wave_size / 32) : max_simd_waves;
 }
 
+#if 0 /* PSBC: shader create/upload/part functions not needed for standalone compiler */
 unsigned
 radv_get_max_scratch_waves(const struct radv_device *device, struct radv_shader *shader)
 {
@@ -3261,6 +3275,7 @@ radv_shader_part_cache_get(struct radv_device *device, struct radv_shader_part_c
    local->key = &shader_part->key;
    return shader_part;
 }
+#endif /* PSBC: end shader create/upload/part functions */
 
 static char *
 radv_gather_nir_debug_info(struct nir_shader *const *shaders, int shader_count)
@@ -3492,6 +3507,7 @@ radv_shader_dump_asm(const struct radv_compiler_info *compiler_info, struct radv
    }
 }
 
+#if 0 /* PSBC: trap handler and prolog/epilog creation not needed */
 struct radv_shader *
 radv_create_trap_handler_shader(struct radv_device *device)
 {
@@ -3755,7 +3771,9 @@ fail:
    free(binary);
    return NULL;
 }
+#endif /* PSBC: end trap handler and prolog/epilog */
 
+#if 0 /* PSBC: shader part destroy/get_va/find_shader not needed */
 void
 radv_shader_part_destroy(struct radv_device *device, struct radv_shader_part *shader_part)
 {
@@ -3802,6 +3820,7 @@ radv_find_shader(struct radv_device *device, uint64_t pc)
    mtx_unlock(&device->shader_arena_mutex);
    return NULL;
 }
+#endif /* PSBC: end shader part destroy/get_va/find_shader */
 
 const char *
 radv_get_shader_name(const struct radv_shader_info *info, mesa_shader_stage stage)
@@ -3949,6 +3968,7 @@ radv_get_tess_wg_info(const struct radv_compiler_info *compiler_info, const ac_n
                                tcs_num_input_vertices, lds_input_vertex_size, 0, num_patches_per_wg, lds_size);
 }
 
+#if 0 /* PSBC: dump_shader_stats not needed for standalone compiler */
 VkResult
 radv_dump_shader_stats(struct radv_device *device, struct radv_pipeline *pipeline, struct radv_shader *shader,
                        FILE *output)
@@ -4034,3 +4054,4 @@ fail:
    free(props);
    return result;
 }
+#endif /* PSBC: end dump_shader_stats */
