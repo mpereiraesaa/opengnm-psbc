@@ -1,9 +1,10 @@
 # opengnm-psbc — Plan
 
-> **Goal:** A SPIR-V to PS4 Shader Binary compiler, built on Mesa 26.2.0
+> **Goal:** A SPIR-V to PS5 Shader Binary compiler, built on Mesa 26.2.0
 > (NIR + ACO), producing the `GnmShaderFileHeader` / `GnmVsShader` /
 > `GnmPsShader` binary container format that `sceGnmSetVsShader` /
-> `sceGnmSetPsShader` consume.
+> `sceGnmSetPsShader` consume. The PS5 GPU is RDNA2 (GFX10.3).
+> Legacy PS4 (GFX7) and PS4 Pro (GFX8/NEO) targets are also supported.
 >
 > **Mesa version:** 26.2.0-devel (vendored from workspace `mesa/`)
 > **GNM headers:** opengnm (`../opengnm/include/`)

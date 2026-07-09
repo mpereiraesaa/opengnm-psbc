@@ -72,7 +72,7 @@ static CmdOptions parsecmdoptions(int argc, char* argv[]) {
 	    .entrypoint = "main",
 	    .stage = MESA_SHADER_NONE,
 	    .optimise = true,
-	    .target = GFX_TARGET_PS4_BASE,
+	    .target = GFX_TARGET_PS5,
 	};
 
 	for (int i = 0; i < argc; i += 1) {
@@ -95,7 +95,9 @@ static CmdOptions parsecmdoptions(int argc, char* argv[]) {
 			if (i + 1 < argc) {
 				res.stage = findstage(argv[i + 1]);
 			}
-		} else if (!strcmp(curarg, "-n")) {
+		} else if (!strcmp(curarg, "-4")) {
+		res.target = GFX_TARGET_PS4_BASE;
+	} else if (!strcmp(curarg, "-n")) {
 			res.target = GFX_TARGET_PS4_NEO;
 		} else if (!strcmp(curarg, "-g")) {
 			res.target = GFX_TARGET_PS5;
@@ -118,8 +120,9 @@ static inline void showhelp(void) {
 	    "\t-e [entrypoint] -- The entrypoint's name (default: \"main\")\n"
 	    "\t-s [stage] -- The shader's stage name\n"
 	    "\t-Od -- Disable some optimisations\n"
-	    "\t-n -- Target PS4 Pro (NEO/GFX8) instead of base PS4 (GFX7)\n"
-	    "\t-g -- Target PS5 (RDNA2/GFX10.3)\n"
+	    "\t-4 -- Target PS4 base (GFX7) instead of PS5\n"
+	    "\t-n -- Target PS4 Pro (NEO/GFX8) instead of PS5\n"
+	    "\t-g -- Target PS5 (RDNA2/GFX10.3) [default]\n"
 	    "\t-vv -- Enable verbose messages output\n"
 	    "\t-h -- Show this help message\n",
 	    VERSION_STR
