@@ -134,8 +134,8 @@ them through the new API signatures. The ACO compilation step is unchanged.
 > **Development priority:** opengnm-psbc is deferred until opengnm is complete.
 > opengnm (the runtime GNM library) is the primary deliverable. opengnm-psbc
 > (the shader compiler) depends on opengnm's headers and is developed afterward.
-> Phases 1-5 are done. Remaining work is GS/HS/LS/ES stage headers and
-> hardware validation.
+> Phases 1-5 are done. GS/HS/DS stages are now implemented. Remaining work is
+> ES/LS stage headers, resource table metadata, and hardware validation.
 
 ### Phase 1: Project skeleton + Mesa vendoring [DONE]
 - [x] Create opengnm-psbc/ with fresh git history
@@ -184,13 +184,13 @@ them through the new API signatures. The ACO compilation step is unchanged.
 - [ ] Compare output with RE-6 shader binary parser findings (deferred to hardware test)
 - [ ] Validate on PS4 hardware (deferred)
 
-### Phase 5: Shader stage support [PARTIAL — VS/PS/CS done]
+### Phase 5: Shader stage support [DONE — VS/PS/CS/GS/HS/DS]
 - [x] Compute shader (CS) support: `GnmCsShader` struct, `buildshaderbinary` CS case
 - [x] Thread group size from `nir->info.workgroup_size`
 - [x] Input usage slots for all stages
-- [ ] Geometry shader (GS) support: needs `GnmGsShader` struct + header construction
-- [ ] Hull shader (HS/TCS) support: needs `GnmHsShader` struct + header construction
-- [ ] Domain shader (DS/TES) support: needs `GnmDsShader` struct + header construction
+- [x] Geometry shader (GS) support: `GnmGsShader` struct + legacy GS lowering + header construction
+- [x] Hull shader (HS/TCS) support: `GnmHsShader` struct + VGT_TF_PARAM encoding + header construction
+- [x] Domain shader (DS/TES) support: uses `GnmVsShader` struct with `GNM_SHB_DS_VS` binary type
 - [ ] Export shader (ES) and Local shader (LS) support
 - [ ] Fill remaining shader binary metadata (resource table, input usage slots)
 - [ ] Fix resource table index generation
