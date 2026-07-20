@@ -233,6 +233,22 @@ by the GNM driver and execute correctly on GFX7 hardware.
 - [x] `g_init_refcount` thread safety (already protected by pthread_mutex)
 - [x] Hoist `psbc_init`/`psbc_shutdown` to device lifecycle in vulkan-ps4
 
+## Future Work
+
+All 7 phases are complete. opengnm-psbc is feature-complete and hardware-validated.
+Potential future improvements:
+
+- **PS5 hardware validation**: Test on PS5 (GFX10.3) hardware once available
+- **Texture/sampler descriptor support**: Full descriptor set lowering for
+  textures and samplers (currently handles UBO/SSBO)
+- **Geometry/tessellation pipeline hardware test**: Validate GS/HS/DS/ES/LS
+  shaders on PS4 hardware with a multi-stage pipeline test app
+- **Compute shader hardware test**: Validate CS execution on PS4 hardware
+- **Shader caching**: Cache compiled shader binaries to avoid recompilation
+- **SPIR-V optimization passes**: Enable additional NIR optimization passes
+  for smaller/faster generated GCN code
+- **Debug info**: Optional source mapping / disassembly output for debugging
+
 ## RE Reference
 
 The shader binary format is RE'd in `tools/gnm_driver_fw900_analysis.md`:
