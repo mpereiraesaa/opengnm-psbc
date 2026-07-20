@@ -247,11 +247,24 @@ static PsbcResult buildshaderbinary(
 
     memcpy(nextcode, code, code_dw * sizeof(uint32_t));
 
+    /* Count input usage slots.
+     * prolog_inputs (SUBPTR_FETCHSHADER) and vertex_buffers
+     * (PTR_VERTEXBUFFERTABLE) are VS-specific — they belong to the VS
+     * portion of a merged pipeline. For standalone HS/GS compilation,
+     * these args are declared because previous_stage=VERTEX, but the
+     * slots should not be emitted in the HS/GS shader binary.
+     * The descriptor table (PTR_INDIRECTRESOURCETABLE) is shared by
+     * all stages and should always be emitted when used. */
+    const bool is_vs_family =
+        ctx->stage == MESA_SHADER_VERTEX ||
+        ctx->psbc_stage == PSBC_STAGE_EXPORT ||
+        ctx->psbc_stage == PSBC_STAGE_LOCAL;
+
     uint32_t numinputslots = 0;
-    if (ctx->rargs->prolog_inputs.used) {
+    if (is_vs_family && ctx->rargs->prolog_inputs.used) {
         numinputslots += 1;
     }
-    if (ctx->rargs->ac.vertex_buffers.used) {
+    if (is_vs_family && ctx->rargs->ac.vertex_buffers.used) {
         numinputslots += 1;
     }
     if (ctx->rargs->descriptors[0].used) {
@@ -659,7 +672,7 @@ static PsbcResult buildshaderbinary(
     }
 
     /* write shader common data: input usage slots */
-    if (ctx->rargs->prolog_inputs.used) {
+    if (is_vs_family && ctx->rargs->prolog_inputs.used) {
         const GnmInputUsageSlot s = {
             .usagetype = GNM_SHINPUTUSAGE_SUBPTR_FETCHSHADER,
             .startregister =
@@ -669,7 +682,7 @@ static PsbcResult buildshaderbinary(
         memcpy(buf + offset, &s, sizeof(s));
         offset += sizeof(s);
     }
-    if (ctx->rargs->ac.vertex_buffers.used) {
+    if (is_vs_family && ctx->rargs->ac.vertex_buffers.used) {
         const GnmInputUsageSlot s = {
             .usagetype = GNM_SHINPUTUSAGE_PTR_VERTEXBUFFERTABLE,
             .startregister =
@@ -1021,7 +1034,10 @@ PsbcResult psbc_compile_shader(
     );
 
     /* Determine previous stage for shader args declaration.
-     * This tells the current stage what stage feeds it inputs. */
+     * HS/GS need previous_stage=VERTEX so that the merged-pipeline args
+     * (prolog_inputs, vertex_buffers, etc.) are declared for the NIR
+     * lowering passes. The VS-specific input usage slots are filtered
+     * out in buildshaderbinary for non-VS stages. */
     mesa_shader_stage previous_stage = MESA_SHADER_NONE;
     switch (mesa_stage) {
     case MESA_SHADER_TESS_CTRL: previous_stage = MESA_SHADER_VERTEX;    break;
