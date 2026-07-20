@@ -29,10 +29,13 @@ SPIR-V input
     ↓ GCN ISA machine code
 [buildshaderbinary] — libpsbc/psbc_compile.c
     ↓
-PSSL header + GnmShaderFileHeader + GnmVsShader/GnmPsShader/GnmCsShader
+PSSL header + GnmShaderFileHeader + GnmVsShader/GnmPsShader/GnmCsShader/
+GnmGsShader/GnmHsShader/GnmEsShader/GnmLsShader
     + GCN code + GnmShaderBinaryInfo (with CRC32) + PsslBinaryParamInfo
     ↓
-Output .sb file → sceGnmSetVsShader/sceGnmSetPsShader/sceGnmSetCsShader
+Output .sb file → sceGnmSetVsShader/sceGnmSetPsShader/sceGnmSetCsShader/
+                 sceGnmSetGsShader/sceGnmSetHsShader/sceGnmSetEsShader/
+                 sceGnmSetLsShader
 
 Consumers:
   - opengnm-psbc CLI (cmd/psbc/main.c) — host tool for offline compilation
@@ -55,7 +58,10 @@ opengnm-psbc/
 │   ├── tri.vert            # Simple vertex shader test
 │   ├── tri.frag            # Simple fragment shader test
 │   ├── test.comp           # Compute shader test (64x1x1 workgroup)
-│   └── verify_sb.py        # Automated .sb output verification (magic, CRC32)
+│   ├── test.geom           # Geometry shader test
+│   ├── test.tesc           # Tessellation control (hull) shader test
+│   ├── test.tese           # Tessellation evaluation (domain) shader test
+│   └── verify_sb.py        # Automated .sb output verification (magic, CRC32, structure)
 ├── include/
 │   ├── pssl_types.h        # PSSL binary format types (ported)
 │   └── mesa/               # Mesa compat headers
@@ -134,9 +140,9 @@ them through the new API signatures. The ACO compilation step is unchanged.
 > **Development priority:** opengnm-psbc is deferred until opengnm is complete.
 > opengnm (the runtime GNM library) is the primary deliverable. opengnm-psbc
 > (the shader compiler) depends on opengnm's headers and is developed afterward.
-> Phases 1-5 are done. GS/HS/DS/ES/LS stages are now implemented. CRC32
-> verification is implemented in verify_sb.py using the PS4-specific algorithm.
-> Remaining work is resource table metadata and hardware validation.
+> Phases 1-5 are done. All 8 shader stages (VS/PS/CS/GS/HS/DS/ES/LS) are
+> implemented and pass structural + CRC32 verification. Remaining work is
+> Phase 6 (shader binary metadata) and Phase 7 (hardware validation).
 
 ### Phase 1: Project skeleton + Mesa vendoring [DONE]
 - [x] Create opengnm-psbc/ with fresh git history
@@ -185,16 +191,30 @@ them through the new API signatures. The ACO compilation step is unchanged.
 - [ ] Compare output with RE-6 shader binary parser findings (deferred to hardware test)
 - [ ] Validate on PS4 hardware (deferred)
 
-### Phase 5: Shader stage support [DONE — VS/PS/CS/GS/HS/DS]
+### Phase 5: Shader stage support [DONE — VS/PS/CS/GS/HS/DS/ES/LS]
 - [x] Compute shader (CS) support: `GnmCsShader` struct, `buildshaderbinary` CS case
 - [x] Thread group size from `nir->info.workgroup_size`
 - [x] Input usage slots for all stages
 - [x] Geometry shader (GS) support: `GnmGsShader` struct + legacy GS lowering + header construction
 - [x] Hull shader (HS/TCS) support: `GnmHsShader` struct + VGT_TF_PARAM encoding + header construction
 - [x] Domain shader (DS/TES) support: uses `GnmVsShader` struct with `GNM_SHB_DS_VS` binary type
-- [ ] Export shader (ES) and Local shader (LS) support
-- [ ] Fill remaining shader binary metadata (resource table, input usage slots)
-- [ ] Fix resource table index generation
+- [x] Export shader (ES) support: `GnmEsShader` struct with `GNM_SHB_VS_ES` binary type
+- [x] Local shader (LS) support: `GnmLsShader` struct with `GNM_SHB_VS_LS` binary type
+- [x] HS input semantics fix: allocate + write `GnmVertexInputSemantic` entries
+- [x] CRC32 verification in `verify_sb.py` using PS4-specific algorithm
+- [x] All 8 shader types pass structural + CRC32 verification
+
+### Phase 6: Shader binary metadata [TODO]
+- [ ] Fill resource table metadata (descriptor set layouts, binding info)
+- [ ] Fill input usage slots with actual resource usage data
+- [ ] Fix resource table index generation (`chunkusagebaseoffsetdwords`)
+- [ ] Populate `shaderhash0`/`shaderhash1` from SPIR-V hash
+- [ ] Populate `numinputusageslots` with actual count (currently 0)
+
+### Phase 7: Hardware validation [TODO — deferred]
+- [ ] Compare output with RE-6 shader binary parser findings
+- [ ] Validate on PS4 hardware with `sceGnmSetVsShader` / `sceGnmSetPsShader`
+- [ ] Test pipeline binding with real GNM command buffers
 
 ### Code review fixes [DONE]
 - [x] Null-layout NIR descriptor index handling (all 5 `state->layout->set[].layout` guards)
