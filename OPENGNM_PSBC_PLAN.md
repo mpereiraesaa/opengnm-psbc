@@ -134,8 +134,9 @@ them through the new API signatures. The ACO compilation step is unchanged.
 > **Development priority:** opengnm-psbc is deferred until opengnm is complete.
 > opengnm (the runtime GNM library) is the primary deliverable. opengnm-psbc
 > (the shader compiler) depends on opengnm's headers and is developed afterward.
-> Phases 1-5 are done. GS/HS/DS stages are now implemented. Remaining work is
-> ES/LS stage headers, resource table metadata, and hardware validation.
+> Phases 1-5 are done. GS/HS/DS/ES/LS stages are now implemented. CRC32
+> verification is implemented in verify_sb.py using the PS4-specific algorithm.
+> Remaining work is resource table metadata and hardware validation.
 
 ### Phase 1: Project skeleton + Mesa vendoring [DONE]
 - [x] Create opengnm-psbc/ with fresh git history
