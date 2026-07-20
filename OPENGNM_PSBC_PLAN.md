@@ -17,6 +17,8 @@
 ```
 SPIR-V input
     ↓
+[libpsbc: psbc_compile_shader()]
+    ↓
 [Mesa SPIRV-to-NIR]  — src/compiler/spirv/
     ↓ NIR
 [Mesa NIR optimizations] — src/compiler/nir/
@@ -25,11 +27,16 @@ SPIR-V input
     ↓
 [ACO instruction selection] — src/amd/compiler/
     ↓ GCN ISA machine code
-[PS4 Shader Binary packaging] — cmd/psbc/main.c
+[buildshaderbinary] — libpsbc/psbc_compile.c
     ↓
-GnmShaderFileHeader + GnmVsShader/GnmPsShader + GCN code + GnmShaderBinaryInfo
+PSSL header + GnmShaderFileHeader + GnmVsShader/GnmPsShader/GnmCsShader
+    + GCN code + GnmShaderBinaryInfo (with CRC32) + PsslBinaryParamInfo
     ↓
-Output .sb file → sceGnmSetVsShader/sceGnmSetPsShader
+Output .sb file → sceGnmSetVsShader/sceGnmSetPsShader/sceGnmSetCsShader
+
+Consumers:
+  - opengnm-psbc CLI (cmd/psbc/main.c) — host tool for offline compilation
+  - vulkan-ps4 ICD (vk_ps4_compile_shader_module) — runtime compilation on PS4
 ```
 
 ## Project Structure
@@ -37,9 +44,18 @@ Output .sb file → sceGnmSetVsShader/sceGnmSetPsShader
 ```
 opengnm-psbc/
 ├── cmd/psbc/
-│   ├── main.c              # SPIRV→NIR→ACO→ShaderBinary compiler
+│   ├── main.c              # SPIRV→NIR→ACO→ShaderBinary compiler (CLI)
 │   ├── crc32_sb.c          # CRC32 for shader binary validation
 │   └── crc32_sb.h
+├── libpsbc/
+│   ├── psbc_compile.c      # Reusable compilation library (SPIRV→GCN binary)
+│   └── psbc_compile.h      # Public C API (psbc_compile_shader, psbc_init, etc.)
+├── psbc_stubs.c            # Stubs for excluded Mesa functions (ac_gpu_info, etc.)
+├── tests/
+│   ├── tri.vert            # Simple vertex shader test
+│   ├── tri.frag            # Simple fragment shader test
+│   ├── test.comp           # Compute shader test (64x1x1 workgroup)
+│   └── verify_sb.py        # Automated .sb output verification (magic, CRC32)
 ├── include/
 │   ├── pssl_types.h        # PSSL binary format types (ported)
 │   └── mesa/               # Mesa compat headers
@@ -57,8 +73,10 @@ opengnm-psbc/
 │   ├── gallium/include/     # pipe format definitions
 │   ├── mesa/main/           # Mesa config headers (minimal)
 │   └── util/                # Mesa utility library
-├── config.mak
-├── Makefile
+├── config.mak               # Host build config
+├── config.orbis.mak         # OpenOrbis (PS4) cross-compile config
+├── Makefile                 # Host build (CLI + libpsbc.a)
+├── Makefile.orbis           # Orbis cross-compile (libpsbc.orbis.a)
 ├── .gitignore
 ├── COPYING
 └── README.md
@@ -116,7 +134,8 @@ them through the new API signatures. The ACO compilation step is unchanged.
 > **Development priority:** opengnm-psbc is deferred until opengnm is complete.
 > opengnm (the runtime GNM library) is the primary deliverable. opengnm-psbc
 > (the shader compiler) depends on opengnm's headers and is developed afterward.
-> Phases 1-2 are done; Phases 3-5 resume after opengnm reaches Gate P7.
+> Phases 1-5 are done. Remaining work is GS/HS/LS/ES stage headers and
+> hardware validation.
 
 ### Phase 1: Project skeleton + Mesa vendoring [DONE]
 - [x] Create opengnm-psbc/ with fresh git history
@@ -143,23 +162,48 @@ them through the new API signatures. The ACO compilation step is unchanged.
 - [x] Create `radv_constants.h` with `MAX_SETS`, `MAX_VERTEX_ATTRIBS`, `MAX_RTS`, `RADV_MAX_HEAPS`
 - [x] Fix `.gitignore` to not ignore `cmd/psbc/` directory
 
-### Phase 3: Build system completion [DEFERRED — after opengnm]
-- Add all Mesa source files to Makefile
-- Add Python codegen rules for generated sources (nir_opcodes, aco_opcodes, etc.)
-- Add compile rules for C and C++ sources
-- Add link rule
+### Phase 3: Build system completion [DONE]
+- [x] Add all Mesa source files to Makefile (NIR, SPIRV, ACO, AMD common, RADV, util)
+- [x] Add Python codegen rules for generated sources (nir_opcodes, aco_opcodes, etc.)
+- [x] Add compile rules for C and C++ sources
+- [x] Add link rule for host CLI (`opengnm-psbc`)
+- [x] Add OpenOrbis cross-compile support (`Makefile.orbis`, `config.orbis.mak`)
+- [x] Produce `libpsbc.orbis.a` (477 PS4/FreeBSD ELF objects) for PS4 target
+- [x] Link `libpsbc.orbis.a` into `vulkan-ps4` ICD (`libvulkan_ps4.so`)
+- [x] Fix OpenOrbis portability: `alloca`, `strcasecmp`, futex backend, `detect_os.h`
+- [x] Fix GL header compat stub (`tools/openorbis-compat/include/GL/gl.h`)
 
-### Phase 4: Compile + test [DEFERRED — after opengnm]
-- Compile opengnm-psbc on host
-- Test with a simple SPIR-V vertex shader
-- Verify output .sb file has correct GnmShaderFileHeader magic
-- Verify CRC32 is correct
-- Compare output with RE-6 shader binary parser findings
+### Phase 4: Compile + test [DONE]
+- [x] Compile opengnm-psbc on host (macOS arm64)
+- [x] Test with a simple SPIR-V vertex shader (`tests/tri.vert`)
+- [x] Verify output .sb file has correct GnmShaderFileHeader magic ("Shdr")
+- [x] Verify CRC32 is correct
+- [x] Add fragment shader test (`tests/tri.frag`)
+- [x] Add compute shader test (`tests/test.comp`)
+- [x] Write automated verification script (`tests/verify_sb.py`)
+- [ ] Compare output with RE-6 shader binary parser findings (deferred to hardware test)
+- [ ] Validate on PS4 hardware (deferred)
 
-### Phase 5: Complete shader stage support [DEFERRED — after opengnm]
-- Add GS/HS/LS/ES/CS support (currently only VS/PS)
-- Fill remaining shader binary metadata (resource table, input usage slots)
-- Fix resource table index generation
+### Phase 5: Shader stage support [PARTIAL — VS/PS/CS done]
+- [x] Compute shader (CS) support: `GnmCsShader` struct, `buildshaderbinary` CS case
+- [x] Thread group size from `nir->info.workgroup_size`
+- [x] Input usage slots for all stages
+- [ ] Geometry shader (GS) support: needs `GnmGsShader` struct + header construction
+- [ ] Hull shader (HS/TCS) support: needs `GnmHsShader` struct + header construction
+- [ ] Domain shader (DS/TES) support: needs `GnmDsShader` struct + header construction
+- [ ] Export shader (ES) and Local shader (LS) support
+- [ ] Fill remaining shader binary metadata (resource table, input usage slots)
+- [ ] Fix resource table index generation
+
+### Code review fixes [DONE]
+- [x] Null-layout NIR descriptor index handling (all 5 `state->layout->set[].layout` guards)
+- [x] Darwin-only `AR` path → conditional on `uname -s`
+- [x] Remove `_DARWIN_C_SOURCE` from Orbis config
+- [x] Futex timeout return convention (re-check value after ETIMEDOUT)
+- [x] Futex thundering herd (signal for count==1, broadcast for count>1)
+- [x] `ac_get_harvested_configs` null-check asymmetry
+- [x] `g_init_refcount` thread safety (already protected by pthread_mutex)
+- [x] Hoist `psbc_init`/`psbc_shutdown` to device lifecycle in vulkan-ps4
 
 ## RE Reference
 
@@ -171,6 +215,32 @@ The shader binary format is RE'd in `tools/gnm_driver_fw900_analysis.md`:
 ## Dependencies
 
 - **Mesa 26.2.0** — vendored in `src/` (NIR, ACO, SPIRV, radv, util)
-- **opengnm** — `../opengnm/include/` (GnmShaderFileHeader, GnmVsShader, etc.)
+- **opengnm** — `../opengnm/include/` (GnmShaderFileHeader, GnmVsShader, GnmPsShader, GnmCsShader, etc.)
+- **OpenOrbis PS4 Toolchain** — for PS4 cross-compilation (`OO_PS4_TOOLCHAIN`)
+- **openorbis-compat** — `../tools/openorbis-compat/include/` (GL stub headers for PS4)
 - **Python 3 + py3-mako** — for Mesa codegen scripts
-- **C11 + C++17 compiler** — for building
+- **C11 + C++17 compiler** — for building (clang recommended)
+- **glslangValidator** — for compiling GLSL test shaders to SPIR-V
+
+## Build Commands
+
+### Host build (CLI tool + libpsbc.a)
+```bash
+cd opengnm-psbc
+make -j$(nproc)           # builds opengnm-psbc CLI + libpsbc.a
+python3 tests/verify_sb.py  # compile + verify test shaders
+```
+
+### PS4 (Orbis) cross-compile (libpsbc.orbis.a)
+```bash
+export OO_PS4_TOOLCHAIN=/path/to/OpenOrbis-PS4-Toolchain
+cd opengnm-psbc
+make -f Makefile.orbis -j$(nproc)  # builds libpsbc.orbis.a (477 objects)
+```
+
+### vulkan-ps4 ICD (links against libpsbc.orbis.a)
+```bash
+export OO_PS4_TOOLCHAIN=/path/to/OpenOrbis-PS4-Toolchain
+cd vulkan-ps4
+make -f Makefile.orbis -j$(nproc)  # builds libvulkan_ps4.so
+```
