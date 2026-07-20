@@ -24,6 +24,7 @@
 #include "ac_gpu_info.h"
 #include "ac_shader_util.h"
 #include "ac_binary.h"
+#include "ac_nir.h"
 #include "amd_family.h"
 #include "nir/radv_nir.h"
 #include "radv_shader.h"
@@ -75,37 +76,49 @@ void psbc_shutdown(void) {
 
 static PsslShaderType psbshtype(mesa_shader_stage s) {
     switch (s) {
-    case MESA_SHADER_VERTEX:   return PSSL_SHADER_VS;
-    case MESA_SHADER_FRAGMENT: return PSSL_SHADER_FS;
-    case MESA_SHADER_COMPUTE:  return PSSL_SHADER_CS;
-    default:                   return PSSL_SHADER_VS; /* shouldn't happen */
+    case MESA_SHADER_VERTEX:      return PSSL_SHADER_VS;
+    case MESA_SHADER_TESS_EVAL:   return PSSL_SHADER_VS;  /* DS outputs vertices */
+    case MESA_SHADER_FRAGMENT:    return PSSL_SHADER_FS;
+    case MESA_SHADER_COMPUTE:     return PSSL_SHADER_CS;
+    case MESA_SHADER_GEOMETRY:    return PSSL_SHADER_VS;  /* no PSSL GS type; use VS */
+    case MESA_SHADER_TESS_CTRL:   return PSSL_SHADER_VS;  /* no PSSL HS type; use VS */
+    default:                      return PSSL_SHADER_VS;
     }
 }
 
 static GnmShaderType gnmshtype(mesa_shader_stage s) {
     switch (s) {
-    case MESA_SHADER_VERTEX:   return GNM_SHADER_VERTEX;
-    case MESA_SHADER_FRAGMENT: return GNM_SHADER_PIXEL;
-    case MESA_SHADER_COMPUTE:  return GNM_SHADER_COMPUTE;
-    default:                   return GNM_SHADER_VERTEX;
+    case MESA_SHADER_VERTEX:      return GNM_SHADER_VERTEX;
+    case MESA_SHADER_TESS_EVAL:   return GNM_SHADER_VERTEX;  /* DS outputs vertices */
+    case MESA_SHADER_FRAGMENT:    return GNM_SHADER_PIXEL;
+    case MESA_SHADER_COMPUTE:     return GNM_SHADER_COMPUTE;
+    case MESA_SHADER_GEOMETRY:    return GNM_SHADER_GEOMETRY;
+    case MESA_SHADER_TESS_CTRL:   return GNM_SHADER_HULL;
+    default:                      return GNM_SHADER_VERTEX;
     }
 }
 
 static GnmShaderBinaryType shbintype(mesa_shader_stage s) {
     switch (s) {
-    case MESA_SHADER_VERTEX:   return GNM_SHB_VS_VS;
-    case MESA_SHADER_FRAGMENT: return GNM_SHB_PS;
-    case MESA_SHADER_COMPUTE:  return GNM_SHB_CS;
-    default:                   return GNM_SHB_VS_VS;
+    case MESA_SHADER_VERTEX:      return GNM_SHB_VS_VS;
+    case MESA_SHADER_TESS_EVAL:   return GNM_SHB_DS_VS;
+    case MESA_SHADER_FRAGMENT:    return GNM_SHB_PS;
+    case MESA_SHADER_COMPUTE:     return GNM_SHB_CS;
+    case MESA_SHADER_GEOMETRY:    return GNM_SHB_GS;
+    case MESA_SHADER_TESS_CTRL:   return GNM_SHB_HS;
+    default:                      return GNM_SHB_VS_VS;
     }
 }
 
 static uint32_t headershsize(mesa_shader_stage s) {
     switch (s) {
-    case MESA_SHADER_VERTEX:   return sizeof(GnmVsShader);
-    case MESA_SHADER_FRAGMENT: return sizeof(GnmPsShader);
-    case MESA_SHADER_COMPUTE:  return sizeof(GnmCsShader);
-    default:                   return sizeof(GnmVsShader);
+    case MESA_SHADER_VERTEX:      return sizeof(GnmVsShader);
+    case MESA_SHADER_TESS_EVAL:   return sizeof(GnmVsShader);  /* DS uses VS struct */
+    case MESA_SHADER_FRAGMENT:    return sizeof(GnmPsShader);
+    case MESA_SHADER_COMPUTE:     return sizeof(GnmCsShader);
+    case MESA_SHADER_GEOMETRY:    return sizeof(GnmGsShader);
+    case MESA_SHADER_TESS_CTRL:   return sizeof(GnmHsShader);
+    default:                      return sizeof(GnmVsShader);
     }
 }
 
@@ -241,6 +254,7 @@ static PsbcResult buildshaderbinary(
 
     switch (ctx->stage) {
     case MESA_SHADER_VERTEX:
+    case MESA_SHADER_TESS_EVAL:  /* DS outputs vertices like VS */
         shspecificsize += util_bitcount64(ctx->nir->info.inputs_read) *
                           sizeof(GnmVertexInputSemantic);
         shspecificsize +=
@@ -249,6 +263,13 @@ static PsbcResult buildshaderbinary(
     case MESA_SHADER_FRAGMENT:
         shspecificsize += util_bitcount64(ctx->nir->info.inputs_read) *
                           sizeof(GnmPixelInputSemantic);
+        break;
+    case MESA_SHADER_GEOMETRY:
+        /* GS has input/export semantics like VS */
+        shspecificsize += util_bitcount64(ctx->nir->info.inputs_read) *
+                          sizeof(GnmVertexInputSemantic);
+        shspecificsize +=
+            outputswritten * sizeof(GnmVertexExportSemantic);
         break;
     default:
         break;
@@ -466,6 +487,188 @@ static PsbcResult buildshaderbinary(
         offset += sizeof(csh);
         break;
     }
+    case MESA_SHADER_GEOMETRY: {
+        /* Map mesa_prim to VGT_GS_OUT_PRIM_TYPE values */
+        uint32_t gs_out_prim;
+        switch (ctx->nir->info.gs.output_primitive) {
+        case MESA_PRIM_POINTS:       gs_out_prim = V_028A6C_POINTLIST; break;
+        case MESA_PRIM_LINES:        gs_out_prim = V_028A6C_LINESTRIP; break;
+        case MESA_PRIM_TRIANGLES:    gs_out_prim = V_028A6C_TRISTRIP;  break;
+        default:                     gs_out_prim = V_028A6C_TRISTRIP;  break;
+        }
+
+        const GnmGsShader gsh = {
+            .common =
+                {
+                    .shadersize =
+                        codesize + sizeof(GnmShaderBinaryInfo),
+                    .numinputusageslots = numinputslots,
+                },
+            .registers =
+                {
+                    .spishaderpgmlogs = shspecificsize,
+                    .spishaderpgmhigs = 0xffffffff,
+                    .spishaderpgmrsrc1gs = ctx->config->rsrc1,
+                    .spishaderpgmrsrc2gs = ctx->config->rsrc2,
+                    .vgtstrmoutconfig = 0,
+                    .vgtgsoutprimtype = gs_out_prim,
+                    .vgtgsinstancecnt =
+                        S_028B90_CNT(MIN2(ctx->rinfo->gs.invocations, 127)) |
+                        S_028B90_ENABLE(ctx->rinfo->gs.invocations > 0),
+                },
+            .numinputsemantics =
+                util_bitcount64(ctx->nir->info.inputs_read),
+            .numexportsemantics = outputswritten,
+        };
+        memcpy(buf + offset, &gsh, sizeof(gsh));
+        offset += sizeof(gsh);
+        break;
+    }
+    case MESA_SHADER_TESS_CTRL: {
+        /* Map tess primitive mode to VGT_TF_PARAM TYPE field */
+        uint32_t tf_type;
+        switch (ctx->nir->info.tess._primitive_mode) {
+        case TESS_PRIMITIVE_ISOLINES:   tf_type = V_028B6C_TESS_ISOLINE;  break;
+        case TESS_PRIMITIVE_TRIANGLES:  tf_type = V_028B6C_TESS_TRIANGLE; break;
+        case TESS_PRIMITIVE_QUADS:      tf_type = V_028B6C_TESS_QUAD;     break;
+        default:                        tf_type = V_028B6C_TESS_TRIANGLE; break;
+        }
+
+        /* Map tess spacing to VGT_TF_PARAM PARTITIONING field */
+        uint32_t tf_partition;
+        switch (ctx->nir->info.tess.spacing) {
+        case TESS_SPACING_EQUAL:           tf_partition = V_028B6C_PART_INTEGER;    break;
+        case TESS_SPACING_FRACTIONAL_ODD:  tf_partition = V_028B6C_PART_FRAC_ODD;   break;
+        case TESS_SPACING_FRACTIONAL_EVEN: tf_partition = V_028B6C_PART_FRAC_EVEN;  break;
+        default:                           tf_partition = V_028B6C_PART_INTEGER;    break;
+        }
+
+        /* Map CCW + point_mode to VGT_TF_PARAM TOPOLOGY field */
+        uint32_t tf_topology;
+        if (ctx->nir->info.tess.point_mode) {
+            tf_topology = V_028B6C_OUTPUT_POINT;
+        } else if (ctx->nir->info.tess.ccw) {
+            tf_topology = V_028B6C_OUTPUT_TRIANGLE_CCW;
+        } else {
+            tf_topology = V_028B6C_OUTPUT_TRIANGLE_CW;
+        }
+
+        const uint32_t tf_param =
+            S_028B6C_TYPE(tf_type) |
+            S_028B6C_PARTITIONING(tf_partition) |
+            S_028B6C_TOPOLOGY(tf_topology);
+
+        const GnmHsShader hsh = {
+            .common =
+                {
+                    .shadersize =
+                        codesize + sizeof(GnmShaderBinaryInfo),
+                    .numinputusageslots = numinputslots,
+                },
+            .registers =
+                {
+                    .spishaderpgmlohs = shspecificsize,
+                    .spishaderpgmhihs = 0xffffffff,
+                    .spishaderpgmrsrc1hs = ctx->config->rsrc1,
+                    .spishaderpgmrsrc2hs = ctx->config->rsrc2,
+                    .vgttfparam = tf_param,
+                    /* Tessellation levels — use defaults if not available */
+                    .vgthosmaxtesslevel = 64,
+                    .vgthosmintesslevel = 1,
+                },
+            .numinputsemantics =
+                util_bitcount64(ctx->nir->info.inputs_read),
+        };
+        memcpy(buf + offset, &hsh, sizeof(hsh));
+        offset += sizeof(hsh);
+        break;
+    }
+    case MESA_SHADER_TESS_EVAL: {
+        /* DS outputs vertices like VS — use GnmVsShader struct.
+         * The GnmShaderBinaryType (GNM_SHB_DS_VS) distinguishes it. */
+        const uint32_t nparams =
+            MAX2(ctx->rinfo->outinfo.param_exports, 1);
+        unsigned clip_dist_mask = 0, cull_dist_mask = 0;
+        const unsigned num_pos_exports =
+            get_num_pos_exports(ctx->rinfo, &clip_dist_mask, &cull_dist_mask);
+        const uint32_t total_mask = clip_dist_mask | cull_dist_mask;
+        const bool misc_vec_ena =
+            ctx->rinfo->outinfo.writes_pointsize ||
+            ctx->rinfo->outinfo.writes_layer ||
+            ctx->rinfo->outinfo.writes_viewport_index ||
+            ctx->rinfo->outinfo.writes_primitive_shading_rate;
+
+        const GnmVsShader dsh = {
+            .common =
+                {
+                    .shadersize =
+                        codesize + sizeof(GnmShaderBinaryInfo),
+                    .numinputusageslots = numinputslots,
+                },
+            .registers =
+                {
+                    .spishaderpgmlovs = shspecificsize,
+                    .spishaderpgmhivs = 0xffffffff,
+                    .spishaderpgmrsrc1vs = ctx->config->rsrc1,
+                    .spishaderpgmrsrc2vs = ctx->config->rsrc2,
+                    .spivsoutconfig =
+                        S_0286C4_VS_EXPORT_COUNT(nparams - 1),
+                    .spishaderposformat =
+                        S_02870C_POS0_EXPORT_FORMAT(
+                            V_02870C_SPI_SHADER_4COMP
+                        ) |
+                        S_02870C_POS1_EXPORT_FORMAT(
+                            num_pos_exports > 1
+                                ? V_02870C_SPI_SHADER_4COMP
+                                : V_02870C_SPI_SHADER_NONE
+                        ) |
+                        S_02870C_POS2_EXPORT_FORMAT(
+                            num_pos_exports > 2
+                                ? V_02870C_SPI_SHADER_4COMP
+                                : V_02870C_SPI_SHADER_NONE
+                        ) |
+                        S_02870C_POS3_EXPORT_FORMAT(
+                            num_pos_exports > 3
+                                ? V_02870C_SPI_SHADER_4COMP
+                                : V_02870C_SPI_SHADER_NONE
+                        ),
+                    .paclvsoutcntl =
+                        S_02881C_USE_VTX_POINT_SIZE(
+                            ctx->rinfo->outinfo.writes_pointsize
+                        ) |
+                        S_02881C_USE_VTX_RENDER_TARGET_INDX(
+                            ctx->rinfo->outinfo.writes_layer
+                        ) |
+                        S_02881C_USE_VTX_VIEWPORT_INDX(
+                            ctx->rinfo->outinfo.writes_viewport_index
+                        ) |
+                        S_02881C_USE_VTX_VRS_RATE(
+                            ctx->rinfo->outinfo
+                                .writes_primitive_shading_rate
+                        ) |
+                        S_02881C_VS_OUT_MISC_VEC_ENA(misc_vec_ena) |
+                        S_02881C_VS_OUT_MISC_SIDE_BUS_ENA(
+                            misc_vec_ena ||
+                            (ctx->gfx_level >= GFX10_3 &&
+                             num_pos_exports > 1)
+                        ) |
+                        S_02881C_VS_OUT_CCDIST0_VEC_ENA(
+                            (total_mask & 0x0f) != 0
+                        ) |
+                        S_02881C_VS_OUT_CCDIST1_VEC_ENA(
+                            (total_mask & 0xf0) != 0
+                        ) |
+                        total_mask << 8 |
+                        clip_dist_mask,
+                },
+            .numinputsemantics =
+                util_bitcount64(ctx->nir->info.inputs_read),
+            .numexportsemantics = outputswritten,
+        };
+        memcpy(buf + offset, &dsh, sizeof(dsh));
+        offset += sizeof(dsh);
+        break;
+    }
     default:
         free(newcode);
         free(buf);
@@ -509,6 +712,7 @@ static PsbcResult buildshaderbinary(
     /* write input/export semantics */
     switch (ctx->stage) {
     case MESA_SHADER_VERTEX:
+    case MESA_SHADER_TESS_EVAL:  /* DS uses same semantics as VS */
         for (uint32_t i = 0;
              i < util_bitcount64(ctx->nir->info.inputs_read); i += 1) {
             const GnmVertexInputSemantic input = {
@@ -543,6 +747,26 @@ static PsbcResult buildshaderbinary(
             };
             memcpy(buf + offset, &input, sizeof(input));
             offset += sizeof(input);
+        }
+        break;
+    case MESA_SHADER_GEOMETRY:
+        /* GS input/export semantics use the same vertex semantic format */
+        for (uint32_t i = 0;
+             i < util_bitcount64(ctx->nir->info.inputs_read); i += 1) {
+            const GnmVertexInputSemantic input = {
+                .semantic = i,
+            };
+            memcpy(buf + offset, &input, sizeof(input));
+            offset += sizeof(input);
+        }
+        for (uint32_t i = 0; i < outputswritten; i += 1) {
+            const GnmVertexExportSemantic out = {
+                .semantic = 15 + i,
+                .outindex = i,
+                .exportf16 = 0,
+            };
+            memcpy(buf + offset, &out, sizeof(out));
+            offset += sizeof(out);
         }
         break;
     default:
@@ -714,7 +938,17 @@ PsbcResult psbc_compile_shader(
     /* Construct radv_shader_stage */
     struct radv_shader_stage stage = {0};
     stage.stage = mesa_stage;
-    stage.next_stage = (mesa_stage == MESA_SHADER_VERTEX) ? MESA_SHADER_FRAGMENT : MESA_SHADER_NONE;
+    /* Set next_stage based on the pipeline graph.
+     * For standalone compilation we assume the simplest pipeline:
+     *   VS → FS, VS → HS → DS → FS, VS → GS → FS
+     */
+    switch (mesa_stage) {
+    case MESA_SHADER_VERTEX:    stage.next_stage = MESA_SHADER_FRAGMENT;     break;
+    case MESA_SHADER_TESS_CTRL: stage.next_stage = MESA_SHADER_TESS_EVAL;    break;
+    case MESA_SHADER_TESS_EVAL: stage.next_stage = MESA_SHADER_FRAGMENT;     break;
+    case MESA_SHADER_GEOMETRY:  stage.next_stage = MESA_SHADER_FRAGMENT;     break;
+    default:                    stage.next_stage = MESA_SHADER_NONE;         break;
+    }
     stage.spirv.data = (const char*)spirv;
     stage.spirv.size = spirv_size;
     stage.entrypoint = opts->entrypoint ? opts->entrypoint : "main";
@@ -756,13 +990,49 @@ PsbcResult psbc_compile_shader(
         RADV_PIPELINE_GRAPHICS, false, &stage.info
     );
 
+    /* Determine previous stage for shader args declaration.
+     * This tells the current stage what stage feeds it inputs. */
+    mesa_shader_stage previous_stage = MESA_SHADER_NONE;
+    switch (mesa_stage) {
+    case MESA_SHADER_TESS_CTRL: previous_stage = MESA_SHADER_VERTEX;    break;
+    case MESA_SHADER_TESS_EVAL: previous_stage = MESA_SHADER_TESS_CTRL; break;
+    case MESA_SHADER_GEOMETRY:  previous_stage = MESA_SHADER_VERTEX;    break;
+    default:                    previous_stage = MESA_SHADER_NONE;      break;
+    }
+
     radv_declare_shader_args(
-        &compiler_info, &gfx_state, &stage, MESA_SHADER_NONE, NULL
+        &compiler_info, &gfx_state, &stage, previous_stage, NULL
     );
 
     stage.nir = nir;
     stage.info.user_sgprs_locs = stage.args.user_sgprs_locs;
     stage.info.inline_push_constant_mask = stage.args.ac.inline_push_const_mask;
+
+    /* For geometry shaders, run the legacy GS lowering pass.
+     * On GFX10.3 (PS5), NGG GS requires merging with the previous stage,
+     * which is not possible for standalone compilation. We use the legacy
+     * GS path instead, which ACO supports on all GFX levels. */
+    if (mesa_stage == MESA_SHADER_GEOMETRY && !stage.info.is_ngg) {
+        /* Convert emit_vertex to emit_vertex_with_counter */
+        NIR_PASS(_, nir, nir_lower_gs_intrinsics,
+                 nir_lower_gs_intrinsics_per_stream);
+        NIR_PASS(_, nir, nir_lower_vars_to_ssa);
+
+        ac_nir_lower_legacy_gs_options gs_options = {
+            .gfx_level = gfxlevel,
+            .export_clipdist_mask = 0xff,
+            .write_pos_to_clipvertex = true,
+            .has_param_exports = stage.info.outinfo.param_exports > 0,
+            .disable_streamout = true,
+        };
+        nir_shader* gs_copy = NULL;
+        ac_nir_legacy_gs_info gs_out_info = {0};
+        NIR_PASS(_, nir, ac_nir_lower_legacy_gs, &gs_options, &gs_copy, &gs_out_info);
+        /* The GS copy shader is discarded for standalone compilation.
+         * The PS4 runtime generates the copy shader separately. */
+        if (gs_copy)
+            ralloc_free(gs_copy);
+    }
 
     radv_postprocess_nir(
         &compiler_info, &gfx_state, &stage

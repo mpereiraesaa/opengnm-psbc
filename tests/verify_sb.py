@@ -13,7 +13,9 @@ GNM_SHADER_FILE_HEADER_ID = 0x72646853  # "Shdr"
 GNM_SHADER_BINARY_INFO_MAGIC = b"OrbShdr"
 GNM_SHADER_VERTEX = 0x1
 GNM_SHADER_PIXEL = 0x2
+GNM_SHADER_GEOMETRY = 0x3
 GNM_SHADER_COMPUTE = 0x4
+GNM_SHADER_HULL = 0x7
 GNM_TARGETGPUMODE_NEO = 0x2
 
 PSSL_HEADER_SIZE = 0x24
@@ -137,11 +139,56 @@ def main():
         sys.exit(1)
     print(r.stdout.strip())
 
+    # Compile geometry shader
+    geom_glsl = os.path.join(TESTS, "test.geom")
+    geom_spv = os.path.join(TESTS, "test.geom.spv")
+    geom_sb = os.path.join(TESTS, "test.geom.sb")
+    if not os.path.exists(geom_spv):
+        subprocess.run(["glslangValidator", "-V", geom_glsl, "-o", geom_spv], check=True)
+    print("Compiling geometry shader...")
+    r = subprocess.run([psbc_bin, "-f", geom_spv, "-o", geom_sb, "-s", "geometry", "-vv"],
+                       capture_output=True, text=True, cwd=PSBC)
+    if r.returncode != 0:
+        print(f"Geometry compile failed: {r.stderr}")
+        sys.exit(1)
+    print(r.stdout.strip())
+
+    # Compile tessellation control (hull) shader
+    tesc_glsl = os.path.join(TESTS, "test.tesc")
+    tesc_spv = os.path.join(TESTS, "test.tesc.spv")
+    tesc_sb = os.path.join(TESTS, "test.tesc.sb")
+    if not os.path.exists(tesc_spv):
+        subprocess.run(["glslangValidator", "-V", tesc_glsl, "-o", tesc_spv], check=True)
+    print("Compiling tessellation control (hull) shader...")
+    r = subprocess.run([psbc_bin, "-f", tesc_spv, "-o", tesc_sb, "-s", "tess-ctrl", "-vv"],
+                       capture_output=True, text=True, cwd=PSBC)
+    if r.returncode != 0:
+        print(f"Tessellation control compile failed: {r.stderr}")
+        sys.exit(1)
+    print(r.stdout.strip())
+
+    # Compile tessellation evaluation (domain) shader
+    tese_glsl = os.path.join(TESTS, "test.tese")
+    tese_spv = os.path.join(TESTS, "test.tese.spv")
+    tese_sb = os.path.join(TESTS, "test.tese.sb")
+    if not os.path.exists(tese_spv):
+        subprocess.run(["glslangValidator", "-V", tese_glsl, "-o", tese_spv], check=True)
+    print("Compiling tessellation evaluation (domain) shader...")
+    r = subprocess.run([psbc_bin, "-f", tese_spv, "-o", tese_sb, "-s", "tess-eval", "-vv"],
+                       capture_output=True, text=True, cwd=PSBC)
+    if r.returncode != 0:
+        print(f"Tessellation evaluation compile failed: {r.stderr}")
+        sys.exit(1)
+    print(r.stdout.strip())
+
     # Verify
     ok = True
     ok &= verify_shader(vert_sb, GNM_SHADER_VERTEX)
     ok &= verify_shader(frag_sb, GNM_SHADER_PIXEL)
     ok &= verify_shader(comp_sb, GNM_SHADER_COMPUTE)
+    ok &= verify_shader(geom_sb, GNM_SHADER_GEOMETRY)
+    ok &= verify_shader(tesc_sb, GNM_SHADER_HULL)
+    ok &= verify_shader(tese_sb, GNM_SHADER_VERTEX)  # DS uses VS type
 
     if ok:
         print("\n=== ALL TESTS PASSED ===")
