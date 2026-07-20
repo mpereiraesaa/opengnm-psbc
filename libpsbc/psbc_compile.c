@@ -214,6 +214,8 @@ typedef struct {
     enum radeon_family family;
     mesa_shader_stage stage;
     PsbcStage psbc_stage;
+    const uint32_t* spirv_data;
+    size_t spirv_size;
     bool neo;
 } BuildContext;
 
@@ -775,12 +777,47 @@ static PsbcResult buildshaderbinary(
     offset += codesize;
 
     /* shader binary info */
+    /* Compute chunkusagebaseoffsetdwords: offset from OrbShdr back to the
+     * input usage slot table, in dwords.
+     * Input usage slots are at: PSSL_HEADER_SIZE + GNM_FILE_HEADER_SIZE + headershsize
+     * OrbShdr is at: current offset (= PSSL_HEADER_SIZE + GNM_FILE_HEADER_SIZE + shspecificsize + codesize)
+     * Distance = offset - (PSSL_HEADER_SIZE + GNM_FILE_HEADER_SIZE + headershsize)
+     * But the comment says "starts at ((uint32_t*)&ShaderBinaryInfo) - chunkusagebaseoffsetdwords"
+     * so chunkusagebaseoffsetdwords = distance / 4
+     * Note: if numinputslots == 0, the offset is 0 (no table to point to). */
+    const size_t inputslots_offset =
+        sizeof(PsslBinaryHeader) + sizeof(GnmShaderFileHeader) +
+        headershsize(ctx->psbc_stage);
+    const size_t orbshdr_offset = offset;
+    const uint32_t chunkusageoffset =
+        numinputslots > 0
+            ? (uint32_t)((orbshdr_offset - inputslots_offset) / 4)
+            : 0;
+
+    /* Compute shader hash from SPIR-V data.
+     * The PS4 uses this for shader cache identification.
+     * We use a simple hash of the SPIR-V binary. */
+    uint64_t shaderhash = 0;
+    if (ctx->spirv_data && ctx->spirv_size > 0) {
+        /* FNV-1a hash of the SPIR-V bytes */
+        const uint8_t* sp = (const uint8_t*)ctx->spirv_data;
+        shaderhash = 0xcbf29ce484222325ULL;
+        for (size_t i = 0; i < ctx->spirv_size; i += 1) {
+            shaderhash ^= sp[i];
+            shaderhash *= 0x100000001b3ULL;
+        }
+    }
+
     GnmShaderBinaryInfo bininfo = {
         .signature = GNM_SHADER_BINARY_INFO_MAGIC,
         .version = 7,
         .ispsslcg = 1,
         .type = shbintype(ctx->psbc_stage),
         .length = codesize,
+        .chunkusagebaseoffsetdwords = chunkusageoffset,
+        .numinputusageslots = numinputslots,
+        .shaderhash0 = (uint32_t)(shaderhash & 0xffffffff),
+        .shaderhash1 = (uint32_t)(shaderhash >> 32),
     };
     bininfo.crc32 = hashsb(newcode, codesize, &bininfo);
     memcpy(buf + offset, &bininfo, sizeof(bininfo));
@@ -1061,6 +1098,8 @@ PsbcResult psbc_compile_shader(
         .family = chipfamily,
         .stage = mesa_stage,
         .psbc_stage = opts->stage,
+        .spirv_data = spirv,
+        .spirv_size = spirv_size,
         .neo = neo,
     };
 

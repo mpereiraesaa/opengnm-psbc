@@ -143,6 +143,30 @@ def verify_shader(sb_path, expected_type):
     bin_info = data[orbshdr_off:orbshdr_off + GNM_BINARY_INFO_SIZE]
     print(f"  Binary info ({len(bin_info)} bytes): {bin_info[:16].hex()} ...")
 
+    # 3b. Verify metadata fields
+    chunkusageoffset = data[orbshdr_off + 12]
+    numinputusageslots = data[orbshdr_off + 13]
+    shaderhash0 = read_u32_le(data, orbshdr_off + 16)
+    shaderhash1 = read_u32_le(data, orbshdr_off + 20)
+    print(f"  Metadata: chunkoff={chunkusageoffset} numslots={numinputusageslots} hash=0x{shaderhash1:08x}{shaderhash0:08x}")
+
+    if shaderhash0 == 0 and shaderhash1 == 0:
+        print(f"  ✗ Shader hash is zero (should be populated from SPIR-V)")
+        return False
+
+    # If numinputusageslots > 0, verify chunkusagebaseoffsetdwords points to valid data
+    if numinputusageslots > 0:
+        if chunkusageoffset == 0:
+            print(f"  ✗ numinputusageslots={numinputusageslots} but chunkusagebaseoffsetdwords=0")
+            return False
+        slot_off = orbshdr_off - chunkusageoffset * 4
+        if slot_off < PSSL_HEADER_SIZE + GNM_FILE_HEADER_SIZE:
+            print(f"  ✗ Input usage slot offset 0x{slot_off:x} is before shader header")
+            return False
+        # Read first slot's usage type
+        first_slot_type = data[slot_off]
+        print(f"  First input usage slot at 0x{slot_off:x}: type=0x{first_slot_type:02x}")
+
     # 4. Verify CRC32
     # The CRC covers: GCN code + padding (virtual, not in file) + OrbShdr (minus crc32)
     # GnmShaderBinaryInfo layout:
