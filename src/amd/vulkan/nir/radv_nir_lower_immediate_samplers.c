@@ -62,6 +62,9 @@ lower_immediate_samplers(nir_builder *b, nir_tex_instr *tex, void *cb_data)
       const unsigned desc_set = var->data.descriptor_set;
       const unsigned binding_index = var->data.binding;
       const struct radv_descriptor_set_layout *layout = state->layout->set[desc_set].layout;
+      /* Standalone compiler has no descriptor set layout — skip lowering */
+      if (!layout)
+         return false;
       const struct radv_descriptor_set_binding_layout *binding = &layout->binding[binding_index];
 
       if (!binding->immutable_samplers_offset)

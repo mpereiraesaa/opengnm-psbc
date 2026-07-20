@@ -15,7 +15,10 @@
 #ifndef DETECT_OS_H
 #define DETECT_OS_H
 
-#if defined(__linux__)
+#if defined(__ORBIS__) || defined(__PS4__)
+#define DETECT_OS_ORBIS 1
+#define DETECT_OS_POSIX 1
+#elif defined(__linux__)
 #define DETECT_OS_LINUX 1
 #define DETECT_OS_POSIX 1
 #endif
@@ -28,7 +31,7 @@
 #define DETECT_OS_ANDROID 1
 #endif
 
-#if defined(__FreeBSD__) || defined(__FreeBSD_kernel__)
+#if !defined(__ORBIS__) && !defined(__PS4__) && (defined(__FreeBSD__) || defined(__FreeBSD_kernel__))
 #define DETECT_OS_FREEBSD 1
 #define DETECT_OS_BSD 1
 #define DETECT_OS_POSIX 1
@@ -95,6 +98,9 @@
 /*
  * Make sure DETECT_OS_* are always defined, so that they can be used with #if
  */
+#ifndef DETECT_OS_ORBIS
+#define DETECT_OS_ORBIS 0
+#endif
 #ifndef DETECT_OS_ANDROID
 #define DETECT_OS_ANDROID 0
 #endif

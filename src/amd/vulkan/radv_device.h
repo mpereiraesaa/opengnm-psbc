@@ -30,11 +30,4 @@ radv_device_instance(const struct radv_device *device)
    return device->instance;
 }
 
-static inline bool
-radv_device_fault_detection_enabled(const struct radv_device *device)
-{
-   (void)device;
-   return false;
-}
-
 #endif

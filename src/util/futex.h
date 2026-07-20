@@ -29,7 +29,7 @@
 #else
 #if defined(HAVE_LINUX_FUTEX_H) && defined(__linux__)
 #define UTIL_FUTEX_SUPPORTED 1
-#elif defined(__FreeBSD__)
+#elif defined(__ORBIS__) || defined(__FreeBSD__)
 #define UTIL_FUTEX_SUPPORTED 1
 #elif defined(__OpenBSD__)
 #define UTIL_FUTEX_SUPPORTED 1

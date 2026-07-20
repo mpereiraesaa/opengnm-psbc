@@ -74,6 +74,10 @@ get_dynamic_descriptors_offset(nir_builder *b, lower_descriptors_state *state, u
    struct radv_descriptor_set_layout *layout = state->layout->set[desc_set].layout;
    nir_def *dynamic_offset_start;
 
+   /* Standalone compiler has no descriptor set layout */
+   if (!layout)
+      return nir_imm_int(b, 0);
+
    if (state->layout->independent_sets) {
       nir_def *addr = get_scalar_arg(b, 1, state->args->ac.dynamic_descriptors_offset_addr);
       addr = convert_pointer_to_64_bit(b, state, addr);
@@ -119,6 +123,17 @@ visit_vulkan_resource_index(nir_builder *b, lower_descriptors_state *state, nir_
    unsigned binding = nir_intrinsic_binding(intrin);
    struct radv_descriptor_set_layout *layout = state->layout->set[desc_set].layout;
    unsigned stride;
+
+   /* Standalone compiler has no descriptor set layout. Replace the resource
+    * index with a null descriptor tuple instead of leaving the intrinsic for
+    * ACO to process. */
+   if (!layout) {
+      nir_def_rewrite_uses(&intrin->def,
+                           nir_vec3(b, nir_imm_int(b, 0),
+                                    nir_imm_int(b, 0), nir_imm_int(b, 0)));
+      nir_instr_remove(&intrin->instr);
+      return;
+   }
 
    nir_def *set_ptr, *offset;
    if (vk_descriptor_type_is_dynamic(layout->binding[binding].type)) {
@@ -207,6 +222,15 @@ load_buffer_descriptor(nir_builder *b, lower_descriptors_state *state, nir_def *
     */
    if (binding.success) {
       struct radv_descriptor_set_layout *layout = state->layout->set[binding.desc_set].layout;
+      /* The standalone compiler has no descriptor set layout. Keep descriptor
+       * users deterministic by returning a null pointer/descriptor rather than
+       * generating an address-zero load. */
+      if (!layout) {
+         if (access & ACCESS_NON_UNIFORM)
+            return nir_imm_int(b, 0);
+         return nir_imm_ivec4(b, 0, 0, 0, 0);
+      }
+
       if (layout->binding[binding.binding].type == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK) {
          rsrc = nir_iadd(b, nir_channel(b, rsrc, 0), nir_channel(b, rsrc, 1));
          return load_inline_buffer_descriptor(b, state, rsrc);
@@ -256,6 +280,9 @@ get_sampler_desc(nir_builder *b, lower_descriptors_state *state, nir_deref_instr
       indirect = nir_deref_instr_has_indirect(deref);
 
       struct radv_descriptor_set_layout *layout = state->layout->set[desc_set].layout;
+      /* Standalone compiler has no descriptor set layout — return a zero descriptor */
+      if (!layout)
+         return nir_imm_ivec4(b, 0, 0, 0, 0);
       struct radv_descriptor_set_binding_layout *binding = &layout->binding[binding_index];
 
       if (desc_type == AC_DESC_SAMPLER) {

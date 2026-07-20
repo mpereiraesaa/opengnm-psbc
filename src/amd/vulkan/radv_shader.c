@@ -460,11 +460,16 @@ ycbcr_conversion_lookup(const void *data, uint32_t set, uint32_t binding, uint32
 
    if (set == VK_NIR_YCBCR_SET_IMMUTABLE_SAMPLERS) {
       const struct vk_sampler_state_array *embedded_samplers = state->embedded_samplers;
-      assert(binding < embedded_samplers->sampler_count);
+      /* Standalone compiler may have no embedded samplers */
+      if (!embedded_samplers || !embedded_samplers->samplers || binding >= embedded_samplers->sampler_count)
+         return NULL;
       return &embedded_samplers->samplers[binding].ycbcr_conversion;
    } else {
 
       const struct radv_descriptor_set_layout *set_layout = state->layout->set[set].layout;
+      /* Standalone compiler has no descriptor set layout */
+      if (!set_layout)
+         return NULL;
       const struct vk_ycbcr_conversion_state *ycbcr_samplers = radv_immutable_ycbcr_samplers(set_layout, binding);
 
       if (!ycbcr_samplers)
@@ -478,7 +483,7 @@ nir_shader *
 radv_shader_spirv_to_nir(const struct radv_compiler_info *compiler_info, struct radv_shader_stage *stage,
                          const struct radv_spirv_to_nir_options *options, bool is_internal)
 {
-   struct vk_sampler_state_array embedded_samplers;
+   struct vk_sampler_state_array embedded_samplers = {0};
    nir_shader *nir;
    bool progress;
 

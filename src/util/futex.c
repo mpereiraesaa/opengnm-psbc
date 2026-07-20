@@ -56,6 +56,85 @@ int futex_wait(uint32_t *addr, int32_t value, const struct timespec *timeout)
                     FUTEX_BITSET_MATCH_ANY);
 }
 
+#elif defined(__ORBIS__)
+
+#include <errno.h>
+#include <pthread.h>
+#include <stdint.h>
+#include <time.h>
+
+/* OpenOrbis does not expose FreeBSD's <sys/umtx.h>. Use a process-local
+ * condition variable as the futex backend. Waiters check the futex value
+ * while holding the mutex, so a wake cannot race with condition registration. */
+static pthread_mutex_t orbis_futex_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t orbis_futex_cond;
+static pthread_once_t orbis_futex_once = PTHREAD_ONCE_INIT;
+
+static void
+orbis_futex_init(void)
+{
+   pthread_condattr_t attr;
+   pthread_condattr_init(&attr);
+   pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+   pthread_cond_init(&orbis_futex_cond, &attr);
+   pthread_condattr_destroy(&attr);
+}
+
+static void
+orbis_futex_ensure_initialized(void)
+{
+   pthread_once(&orbis_futex_once, orbis_futex_init);
+}
+
+int futex_wake(uint32_t *addr, int32_t count)
+{
+   (void)addr;
+   if (count <= 0)
+      return 0;
+
+   orbis_futex_ensure_initialized();
+   pthread_mutex_lock(&orbis_futex_mutex);
+   if (count == 1)
+      pthread_cond_signal(&orbis_futex_cond);
+   else
+      pthread_cond_broadcast(&orbis_futex_cond);
+   pthread_mutex_unlock(&orbis_futex_mutex);
+   return count;
+}
+
+int futex_wait(uint32_t *addr, int32_t value, const struct timespec *timeout)
+{
+   int result = 0;
+
+   orbis_futex_ensure_initialized();
+   pthread_mutex_lock(&orbis_futex_mutex);
+   while (__atomic_load_n(addr, __ATOMIC_ACQUIRE) == (uint32_t)value) {
+      if (timeout) {
+         result = pthread_cond_timedwait(&orbis_futex_cond,
+                                         &orbis_futex_mutex, timeout);
+         if (result != 0)
+            break;
+      } else {
+         result = pthread_cond_wait(&orbis_futex_cond,
+                                    &orbis_futex_mutex);
+         if (result != 0)
+            break;
+      }
+   }
+   pthread_mutex_unlock(&orbis_futex_mutex);
+
+   /* If the value changed before we noticed the timeout, treat as success. */
+   if (result == ETIMEDOUT &&
+       __atomic_load_n(addr, __ATOMIC_ACQUIRE) != (uint32_t)value)
+      return 0;
+
+   if (result != 0) {
+      errno = result;
+      return -1;
+   }
+   return 0;
+}
+
 #elif defined(__FreeBSD__)
 
 #include <assert.h>

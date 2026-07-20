@@ -52,6 +52,7 @@ config.mak
 
 # Binary
 /psbc
+/opengnm-psbc
 
 # Editor / OS
 .DS_Store

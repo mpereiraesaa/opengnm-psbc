@@ -17,4 +17,8 @@ struct radv_pipeline {
 bool radv_shader_should_clear_lds(const struct radv_compiler_info *compiler_info,
                                   const nir_shader *shader);
 
+void radv_postprocess_nir(const struct radv_compiler_info *compiler_info,
+                          const struct radv_graphics_state_key *gfx_state,
+                          struct radv_shader_stage *stage);
+
 #endif
