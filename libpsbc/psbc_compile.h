@@ -37,6 +37,8 @@ typedef enum {
     PSBC_STAGE_FRAGMENT   = 5,
     PSBC_STAGE_COMPUTE    = 6,
     PSBC_STAGE_TASK       = 7,
+    PSBC_STAGE_EXPORT     = 8,  /* VS as ES (Export Shader) */
+    PSBC_STAGE_LOCAL      = 9,  /* VS as LS (Local Shader) */
 } PsbcStage;
 
 typedef enum {
