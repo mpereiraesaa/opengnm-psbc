@@ -54,6 +54,10 @@ config.mak
 /psbc
 /opengnm-psbc
 
+# Test artifacts
+tests/*.spv
+tests/*.sb
+
 # Editor / OS
 .DS_Store
 *.swp

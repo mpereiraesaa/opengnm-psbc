@@ -104,6 +104,7 @@ static uint32_t headershsize(mesa_shader_stage s) {
     switch (s) {
     case MESA_SHADER_VERTEX:   return sizeof(GnmVsShader);
     case MESA_SHADER_FRAGMENT: return sizeof(GnmPsShader);
+    case MESA_SHADER_COMPUTE:  return sizeof(GnmCsShader);
     default:                   return sizeof(GnmVsShader);
     }
 }
@@ -433,6 +434,36 @@ static PsbcResult buildshaderbinary(
         };
         memcpy(buf + offset, &psh, sizeof(psh));
         offset += sizeof(psh);
+        break;
+    }
+    case MESA_SHADER_COMPUTE: {
+        const GnmCsShader csh = {
+            .common =
+                {
+                    .shadersize =
+                        codesize + sizeof(GnmShaderBinaryInfo),
+                    .numinputusageslots = numinputslots,
+                },
+            .registers =
+                {
+                    .computepgmlo = shspecificsize,
+                    .computepgmhi = 0,
+                    .computepgmrsrc1 = ctx->config->rsrc1,
+                    .computepgmrsrc2 = ctx->config->rsrc2,
+                    /* Thread group size from NIR compute shader info */
+                    .computenumthreadx =
+                        ctx->nir->info.workgroup_size[0] ?
+                        ctx->nir->info.workgroup_size[0] : 1,
+                    .computenumthready =
+                        ctx->nir->info.workgroup_size[1] ?
+                        ctx->nir->info.workgroup_size[1] : 1,
+                    .computenumthreadz =
+                        ctx->nir->info.workgroup_size[2] ?
+                        ctx->nir->info.workgroup_size[2] : 1,
+                },
+        };
+        memcpy(buf + offset, &csh, sizeof(csh));
+        offset += sizeof(csh);
         break;
     }
     default:
