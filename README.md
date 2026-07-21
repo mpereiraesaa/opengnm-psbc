@@ -114,4 +114,4 @@ applications. The `vulkan-ps4` ICD links it to provide
 ## License
 
 Most of this project's code is from Mesa, licensed under the MIT license.
-The rest is also licensed under the MIT license, see [COPYING](COPYING).
+The rest is also licensed under the MIT license, see [LICENSE](LICENSE).
