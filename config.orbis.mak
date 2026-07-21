@@ -54,7 +54,7 @@ ARCHFLAGS=--target=x86_64-pc-freebsd12-elf -fPIC -DORBIS -D__ORBIS__ -D__PS4__ \
           -I$(OO_PS4_TOOLCHAIN)/include \
           -I$(OO_PS4_TOOLCHAIN)/include/c++/v1 \
           -I$(OO_PS4_TOOLCHAIN)/include/orbis \
-          -I../tools/openorbis-compat/include
+          -Iopenorbis-compat/include
 
 CC=clang
 CXX=clang++

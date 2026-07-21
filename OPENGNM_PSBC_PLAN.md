@@ -179,7 +179,7 @@ them through the new API signatures. The ACO compilation step is unchanged.
 - [x] Produce `libpsbc.orbis.a` (477 PS4/FreeBSD ELF objects) for PS4 target
 - [x] Link `libpsbc.orbis.a` into `vulkan-ps4` ICD (`libvulkan_ps4.so`)
 - [x] Fix OpenOrbis portability: `alloca`, `strcasecmp`, futex backend, `detect_os.h`
-- [x] Fix GL header compat stub (`tools/openorbis-compat/include/GL/gl.h`)
+- [x] Fix GL header compat stub (`openorbis-compat/include/GL/gl.h`)
 
 ### Phase 4: Compile + test [DONE]
 - [x] Compile opengnm-psbc on host (macOS arm64)
@@ -261,7 +261,7 @@ The shader binary format is RE'd in `tools/gnm_driver_fw900_analysis.md`:
 - **Mesa 26.2.0** — vendored in `src/` (NIR, ACO, SPIRV, radv, util)
 - **opengnm** — `../opengnm/include/` (GnmShaderFileHeader, GnmVsShader, GnmPsShader, GnmCsShader, etc.)
 - **OpenOrbis PS4 Toolchain** — for PS4 cross-compilation (`OO_PS4_TOOLCHAIN`)
-- **openorbis-compat** — `../tools/openorbis-compat/include/` (GL stub headers for PS4)
+- **openorbis-compat** — `openorbis-compat/include/` (GL/POSIX stub headers for PS4, vendored)
 - **Python 3 + py3-mako** — for Mesa codegen scripts
 - **C11 + C++17 compiler** — for building (clang recommended)
 - **glslangValidator** — for compiling GLSL test shaders to SPIR-V

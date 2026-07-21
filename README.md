@@ -109,7 +109,7 @@ applications. The `vulkan-ps4` ICD links it to provide
 - **Mesa 26.2.0** — NIR, SPIRV-to-NIR, ACO, radv shader info (vendored in `src/`)
 - **opengnm** — GNM shader binary format types (`GnmShaderFileHeader`, etc.)
 - **OpenOrbis PS4 Toolchain** — for PS4 cross-compilation (optional)
-- **openorbis-compat** — GL stub headers for PS4 (in `../tools/openorbis-compat/`)
+- **openorbis-compat** — GL/POSIX stub headers for PS4 (vendored in `openorbis-compat/`)
 
 ## License
 
