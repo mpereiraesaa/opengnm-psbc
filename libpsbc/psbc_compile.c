@@ -36,6 +36,7 @@
 #include "radv_aco_shader_info.h"
 #include "radv_pipeline.h"
 #include "sid.h"
+#include "spirv/spirv.h"
 
 #include "crc32_sb.h"
 
@@ -1784,6 +1785,55 @@ static nir_shader* prepare_stage_nir(
     return nir;
 }
 
+static PsbcResult validate_spirv_capabilities(
+    const uint32_t* spirv,
+    size_t spirv_size,
+    const PsbcCompileOptions* opts
+) {
+    if (!spirv || spirv_size < 5 * sizeof(uint32_t) ||
+        spirv_size % sizeof(uint32_t) || spirv[0] != UINT32_C(0x07230203))
+        return PSBC_RESULT_INVALID_SPIRV;
+
+    const size_t word_count = spirv_size / sizeof(uint32_t);
+    for (size_t offset = 5; offset < word_count;) {
+        const uint32_t instruction = spirv[offset];
+        const uint16_t words = instruction >> 16;
+        const uint16_t opcode = instruction & UINT16_MAX;
+        if (!words || words > word_count - offset)
+            return PSBC_RESULT_INVALID_SPIRV;
+        if (opcode == SpvOpCapability && words == 2) {
+            const SpvCapability capability = (SpvCapability)spirv[offset + 1];
+            bool enabled = true;
+            switch (capability) {
+            case SpvCapabilityInt8:
+                enabled = opts->enable_int8;
+                break;
+            case SpvCapabilityInt16:
+                enabled = opts->enable_int16;
+                break;
+            case SpvCapabilityStorageBuffer8BitAccess:
+                enabled = opts->enable_storage_buffer_8bit_access;
+                break;
+            case SpvCapabilityUniformAndStorageBuffer8BitAccess:
+                enabled = opts->enable_uniform_and_storage_buffer_8bit_access;
+                break;
+            case SpvCapabilityStorageBuffer16BitAccess:
+                enabled = opts->enable_storage_buffer_16bit_access;
+                break;
+            case SpvCapabilityUniformAndStorageBuffer16BitAccess:
+                enabled = opts->enable_uniform_and_storage_buffer_16bit_access;
+                break;
+            default:
+                break;
+            }
+            if (!enabled)
+                return PSBC_RESULT_UNSUPPORTED_CAPABILITY;
+        }
+        offset += words;
+    }
+    return PSBC_RESULT_OK;
+}
+
 static PsbcResult psbc_compile_impl(
     const uint32_t*       spirv,
     size_t                spirv_size,
@@ -1798,10 +1848,21 @@ static PsbcResult psbc_compile_impl(
         return PSBC_RESULT_INTERNAL_ERROR;
 
     memset(out, 0, sizeof(*out));
+    if ((opts->enable_uniform_and_storage_buffer_8bit_access &&
+         !opts->enable_storage_buffer_8bit_access) ||
+        (opts->enable_uniform_and_storage_buffer_16bit_access &&
+         !opts->enable_storage_buffer_16bit_access))
+        return PSBC_RESULT_INTERNAL_ERROR;
 
-    /* Validate SPIR-V header when the caller did not supply NIR. */
-    if (!input_nir && (spirv_size < 4 || spirv[0] != 0x07230203u))
-        return PSBC_RESULT_INVALID_SPIRV;
+    /* Validate SPIR-V structure and opt-in capabilities before Mesa lowering.
+     * Mesa's generic reader warns and continues when a capability is absent
+     * from its mask; a reusable Vulkan compiler must fail closed instead. */
+    if (!input_nir) {
+        const PsbcResult validation =
+            validate_spirv_capabilities(spirv, spirv_size, opts);
+        if (validation != PSBC_RESULT_OK)
+            return validation;
+    }
 
     const bool paired_geometry = previous_spirv || previous_input_nir;
     mesa_shader_stage mesa_stage = psbc_to_mesa_stage(opts->stage);
@@ -1819,9 +1880,13 @@ static PsbcResult psbc_compile_impl(
     if (previous_input_nir &&
         previous_input_nir->info.stage != MESA_SHADER_VERTEX)
         return PSBC_RESULT_UNSUPPORTED_STAGE;
-    if (previous_spirv &&
-        (previous_spirv_size < 4 || previous_spirv[0] != 0x07230203u))
-        return PSBC_RESULT_INVALID_SPIRV;
+    if (previous_spirv) {
+        const PsbcResult validation =
+            validate_spirv_capabilities(previous_spirv, previous_spirv_size,
+                                        opts);
+        if (validation != PSBC_RESULT_OK)
+            return validation;
+    }
     if (opts->ngg &&
         (opts->target != PSBC_TARGET_PS5 ||
          (mesa_stage != MESA_SHADER_VERTEX && !paired_geometry)))
@@ -1894,6 +1959,16 @@ static PsbcResult psbc_compile_impl(
     compiler_info.spirv_caps.TransformFeedback = true;
     compiler_info.spirv_caps.DotProduct = true;
     compiler_info.spirv_caps.DotProductInput4x8BitPacked = true;
+    compiler_info.spirv_caps.Int8 = opts->enable_int8;
+    compiler_info.spirv_caps.Int16 = opts->enable_int16;
+    compiler_info.spirv_caps.StorageBuffer8BitAccess =
+        opts->enable_storage_buffer_8bit_access;
+    compiler_info.spirv_caps.UniformAndStorageBuffer8BitAccess =
+        opts->enable_uniform_and_storage_buffer_8bit_access;
+    compiler_info.spirv_caps.StorageUniformBufferBlock16 =
+        opts->enable_storage_buffer_16bit_access;
+    compiler_info.spirv_caps.StorageUniform16 =
+        opts->enable_uniform_and_storage_buffer_16bit_access;
     if (opts->force_accelerated_dot) {
         compiler_info.spirv_caps.Int16 = true;
         compiler_info.spirv_caps.DotProductInputAll = true;
@@ -2584,6 +2659,7 @@ const char* psbc_result_string(PsbcResult result) {
     case PSBC_RESULT_COMPILE_ACO:      return "ACO shader compilation failed";
     case PSBC_RESULT_OUT_OF_MEMORY:    return "out of memory";
     case PSBC_RESULT_INTERNAL_ERROR:   return "internal error";
+    case PSBC_RESULT_UNSUPPORTED_CAPABILITY: return "unsupported SPIR-V capability";
     default:                           return "unknown error";
     }
 }

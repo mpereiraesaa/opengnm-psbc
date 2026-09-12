@@ -54,6 +54,7 @@ typedef enum {
     PSBC_RESULT_COMPILE_ACO,
     PSBC_RESULT_OUT_OF_MEMORY,
     PSBC_RESULT_INTERNAL_ERROR,
+    PSBC_RESULT_UNSUPPORTED_CAPABILITY,
 } PsbcResult;
 
 #define PSBC_MAX_CONTEXT_REGISTERS 16
@@ -242,6 +243,15 @@ typedef struct {
     uint32_t    spi_shader_col_format; /* Per-MRT export nibbles; 0=legacy defaults */
     uint32_t    color_is_int8;         /* Per-MRT narrow integer clamp masks */
     uint32_t    color_is_int10;
+    /* Appended opt-in SPIR-V capabilities.  A compiler consumer must mirror
+     * the features enabled on its logical device instead of silently
+     * accepting a module that the public API did not enable. */
+    bool        enable_int8;
+    bool        enable_int16;
+    bool        enable_storage_buffer_8bit_access;
+    bool        enable_uniform_and_storage_buffer_8bit_access;
+    bool        enable_storage_buffer_16bit_access;
+    bool        enable_uniform_and_storage_buffer_16bit_access;
 } PsbcCompileOptions;
 
 /* === API === */

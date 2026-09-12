@@ -34,6 +34,10 @@ The PS5 GPU is RDNA2 (GFX10.3). Legacy PS4 (GFX7) and PS4 Pro
 - Vulkan specialization constants and an indirect push-constant pointer ABI
   are available through `PsbcCompileOptions`; emitted metadata reports the
   compiler-selected user-SGPR slot and the required push-constant byte range.
+- Narrow integer and storage capabilities are explicit `PsbcCompileOptions`
+  opt-ins. SPIR-V requiring 8/16-bit arithmetic or storage is rejected before
+  lowering unless the caller enables the matching logical-device capability;
+  storage-only support does not implicitly enable narrow arithmetic.
 - OpenOrbis cross-compilation support (`libpsbc.orbis.a`, 477 objects)
 - Automated test suite (`tests/verify_sb.py`) verifies shader binary
   structure (PSSL header, GNM magic, CRC32) for all 8 shader stages
@@ -104,6 +108,7 @@ You need:
 make                    # builds opengnm-psbc CLI + libpsbc.a
 python3 tests/verify_sb.py  # compile + verify all 8 shader stage test shaders
 make test-runtime-parameters # verify specialization + push metadata/codegen
+make test-storage-widths # verify fail-closed 8/16-bit capability gates + lowering
 make install DESTDIR=/usr/local
 ```
 
