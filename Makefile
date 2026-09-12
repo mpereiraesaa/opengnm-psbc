@@ -15,11 +15,17 @@ include $(CONFIG)
 
 PSBC ?= opengnm-psbc
 LIBPSBC ?= libpsbc.a
+GLSLANG ?= glslangValidator
 
-.PHONY: all clean install generated libpsbc
+.PHONY: all clean install generated libpsbc test-runtime-parameters
 .DEFAULT_GOAL := all
 
 all: $(PSBC)
+
+test-runtime-parameters: $(LIBPSBC)
+	$(GLSLANG) -V --target-env vulkan1.0 tests/runtime_parameters.comp -o tests/runtime_parameters.spv
+	$(CC) -std=c11 -Wall -Wextra -Werror -Ilibpsbc tests/test_runtime_parameters.c $(LIBPSBC) -lstdc++ -lm -lpthread -o tests/test_runtime_parameters
+	./tests/test_runtime_parameters tests/runtime_parameters.spv
 
 # === AMD register JSON files (for codegen) ===
 # Include all GPU generations so all register fields are available

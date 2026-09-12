@@ -1,0 +1,6 @@
+#version 450
+layout(local_size_x = 1) in;
+layout(constant_id = 0) const uint multiplier = 3u;
+layout(push_constant) uniform PushConstants { uint addend; } push_data;
+layout(set = 0, binding = 0, std430) writeonly buffer Output { uint value; } output_data;
+void main() { output_data.value = multiplier + push_data.addend; }

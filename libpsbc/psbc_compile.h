@@ -20,7 +20,7 @@
 extern "C" {
 #endif
 
-#define PSBC_SHADER_METADATA_VERSION 9u
+#define PSBC_SHADER_METADATA_VERSION 10u
 
 struct nir_shader;
 struct nir_shader_compiler_options;
@@ -65,6 +65,8 @@ typedef enum {
 #define PSBC_MAX_VERTEX_ATTRIBUTES 32
 #define PSBC_MAX_DESCRIPTOR_BINDINGS 64
 #define PSBC_MAX_DESCRIPTOR_SETS 4
+#define PSBC_MAX_SPECIALIZATION_CONSTANTS 64
+#define PSBC_MAX_SPECIALIZATION_BYTES 8
 /* Reserve distinct 16-sampler banks for merged Gallium vertex/geometry stages. */
 #define PSBC_GALLIUM_UBO_BINDING_BASE 32
 
@@ -121,6 +123,14 @@ typedef struct {
     uint32_t           stride;
 } PsbcDescriptorBinding;
 
+/* Vulkan specialization-map scalar. Composite constants are specialized by
+ * their scalar constituent IDs; Vulkan map entries therefore fit in 8 bytes. */
+typedef struct {
+    uint32_t constant_id;
+    uint32_t size;
+    uint8_t  data[PSBC_MAX_SPECIALIZATION_BYTES];
+} PsbcSpecializationConstant;
+
 typedef enum {
     PSBC_HW_STAGE_UNKNOWN = 0,
     PSBC_HW_STAGE_VERTEX  = 1,
@@ -169,9 +179,12 @@ typedef struct {
     uint32_t             descriptor_set0_user_data_dword;
     /* Direct 32-bit descriptor-table pointers used by the PS5 RADV ABI.  The
      * set-0 fields above remain source-level aliases for existing consumers;
-     * metadata version 9 identifies the enlarged binary structure. */
+     * metadata version 9 and later identify the enlarged binary structure. */
     bool                 descriptor_set_valid[PSBC_MAX_DESCRIPTOR_SETS];
     uint32_t             descriptor_set_user_data_dword[PSBC_MAX_DESCRIPTOR_SETS];
+    bool                 push_constants_valid;
+    uint32_t             push_constants_user_data_dword;
+    uint32_t             push_constant_size;
     uint32_t             descriptor_binding_count;
     PsbcDescriptorBinding descriptor_bindings[PSBC_MAX_DESCRIPTOR_BINDINGS];
     bool                 base_vertex_valid;
@@ -219,6 +232,12 @@ typedef struct {
     PsbcVertexAttribute vertex_attributes[PSBC_MAX_VERTEX_ATTRIBUTES];
     uint32_t    descriptor_binding_count;
     PsbcDescriptorBinding descriptor_bindings[PSBC_MAX_DESCRIPTOR_BINDINGS];
+    uint32_t    specialization_constant_count;
+    PsbcSpecializationConstant
+        specialization_constants[PSBC_MAX_SPECIALIZATION_CONSTANTS];
+    /* Keep push constants indirect so the public runtime can upload one
+     * bounded block and bind its 32-bit gfx1013 address in a user SGPR. */
+    bool        force_indirect_push_constants;
     uint32_t    rasterization_samples; /* 0=single/default, otherwise 1/2/4/8 */
     uint32_t    spi_shader_col_format; /* Per-MRT export nibbles; 0=legacy defaults */
     uint32_t    color_is_int8;         /* Per-MRT narrow integer clamp masks */
