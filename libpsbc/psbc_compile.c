@@ -621,13 +621,18 @@ static void fill_shader_metadata(const BuildContext* ctx,
             ctx->rargs->user_sgprs_locs
                 .shader_data[AC_UD_SCRATCH_RING_OFFSETS].sgpr_idx;
     }
-    if (ctx->rargs->descriptors[0].used &&
-        ctx->rargs->user_sgprs_locs.descriptor_sets[0].sgpr_idx !=
-            UINT32_MAX) {
-        metadata->descriptor_set0_valid = true;
-        metadata->descriptor_set0_user_data_dword =
-            ctx->rargs->user_sgprs_locs.descriptor_sets[0].sgpr_idx;
+    for (uint32_t set = 0; set < PSBC_MAX_DESCRIPTOR_SETS; ++set) {
+        if (ctx->rargs->descriptors[set].used &&
+            ctx->rargs->user_sgprs_locs.descriptor_sets[set].sgpr_idx !=
+                UINT32_MAX) {
+            metadata->descriptor_set_valid[set] = true;
+            metadata->descriptor_set_user_data_dword[set] =
+                ctx->rargs->user_sgprs_locs.descriptor_sets[set].sgpr_idx;
+        }
     }
+    metadata->descriptor_set0_valid = metadata->descriptor_set_valid[0];
+    metadata->descriptor_set0_user_data_dword =
+        metadata->descriptor_set_user_data_dword[0];
     if ((ctx->stage == MESA_SHADER_VERTEX ||
          (ctx->stage == MESA_SHADER_GEOMETRY && ctx->ngg)) &&
         ctx->rargs->ac.vertex_buffers.used) {
@@ -1802,11 +1807,13 @@ static PsbcResult psbc_compile_impl(
         const PsbcDescriptorBinding* binding = &opts->descriptor_bindings[i];
         const bool valid_type =
             binding->type == PSBC_DESCRIPTOR_UNIFORM_BUFFER ||
+            binding->type == PSBC_DESCRIPTOR_UNIFORM_TEXEL_BUFFER ||
             binding->type == PSBC_DESCRIPTOR_COMBINED_IMAGE_SAMPLER ||
             binding->type == PSBC_DESCRIPTOR_STORAGE_BUFFER;
         const uint32_t expected_stride =
             binding->type == PSBC_DESCRIPTOR_COMBINED_IMAGE_SAMPLER ? 48u : 16u;
-        if (binding->set != 0 || binding->binding >= PSBC_MAX_DESCRIPTOR_BINDINGS ||
+        if (binding->set >= PSBC_MAX_DESCRIPTOR_SETS ||
+            binding->binding >= PSBC_MAX_DESCRIPTOR_BINDINGS ||
             !valid_type || !binding->array_size ||
             binding->stride != expected_stride ||
             (binding->offset & 15u) ||
@@ -1952,36 +1959,39 @@ static PsbcResult psbc_compile_impl(
 
     struct radv_shader_layout layout = {0};
     _Alignas(struct radv_descriptor_set_layout)
-        uint8_t descriptor_set0_storage[
+        uint8_t descriptor_set_storage[PSBC_MAX_DESCRIPTOR_SETS][
             sizeof(struct radv_descriptor_set_layout) +
             PSBC_MAX_DESCRIPTOR_BINDINGS *
                 sizeof(struct radv_descriptor_set_binding_layout)] = {0};
     if (opts->descriptor_binding_count) {
-        struct radv_descriptor_set_layout* set_layout =
-            (struct radv_descriptor_set_layout*)descriptor_set0_storage;
-        uint32_t binding_count = 0;
-        uint32_t set_size = 0;
+        uint32_t set_count = 0;
         for (uint32_t i = 0; i < opts->descriptor_binding_count; ++i) {
             const PsbcDescriptorBinding* source =
                 &opts->descriptor_bindings[i];
+            struct radv_descriptor_set_layout* set_layout =
+                (struct radv_descriptor_set_layout*)descriptor_set_storage[source->set];
             struct radv_descriptor_set_binding_layout* target =
                 &set_layout->binding[source->binding];
             target->type = source->type == PSBC_DESCRIPTOR_UNIFORM_BUFFER
                                ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
+                           : source->type == PSBC_DESCRIPTOR_UNIFORM_TEXEL_BUFFER
+                               ? VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER
                            : source->type == PSBC_DESCRIPTOR_STORAGE_BUFFER
                                ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
                                : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
             target->array_size = source->array_size;
             target->offset = source->offset;
             target->size = source->stride;
-            binding_count = MAX2(binding_count, source->binding + 1u);
-            set_size = MAX2(set_size, source->offset +
-                                      source->array_size * source->stride);
+            set_layout->binding_count =
+                MAX2(set_layout->binding_count, source->binding + 1u);
+            set_layout->size = MAX2(set_layout->size, source->offset +
+                source->array_size * source->stride);
+            set_count = MAX2(set_count, source->set + 1u);
         }
-        set_layout->binding_count = binding_count;
-        set_layout->size = set_size;
-        layout.num_sets = 1;
-        layout.set[0].layout = set_layout;
+        layout.num_sets = set_count;
+        for (uint32_t set = 0; set < set_count; ++set)
+            layout.set[set].layout =
+                (struct radv_descriptor_set_layout*)descriptor_set_storage[set];
     }
     stage.layout = layout;
     if (paired_geometry)
@@ -2186,10 +2196,14 @@ static PsbcResult psbc_compile_impl(
     }
     /* Legacy Gallium texture indices carry no Vulkan deref for RADV's info
      * pass to discover. The explicit PSBC layout still requires set 0. */
-    if (opts->descriptor_binding_count)
-        stage.info.desc_set_used_mask |= 1u;
-    if (paired_geometry && opts->descriptor_binding_count)
-        previous.info.desc_set_used_mask |= 1u;
+    if (opts->descriptor_binding_count) {
+        uint32_t descriptor_set_mask = 0;
+        for (uint32_t i = 0; i < opts->descriptor_binding_count; ++i)
+            descriptor_set_mask |= 1u << opts->descriptor_bindings[i].set;
+        stage.info.desc_set_used_mask |= descriptor_set_mask;
+        if (paired_geometry)
+            previous.info.desc_set_used_mask |= descriptor_set_mask;
+    }
     debug_stage("shader-info-end");
     debug_shader_io("info", nir, &stage.info);
     if (paired_geometry)
@@ -2234,7 +2248,7 @@ static PsbcResult psbc_compile_impl(
         debug_shader_io("linked", nir, &stage.info);
     }
 
-    /* PSBC exposes one explicit set-0 table to its standalone caller.  Do not
+    /* PSBC exposes explicit descriptor-set tables to its standalone caller. Do not
      * inherit RADV's pipeline-library indirection for merged shaders: the
      * direct set pointer fits the PS5 merged user-SGPR budget and matches the
      * public metadata/runtime ABI. */

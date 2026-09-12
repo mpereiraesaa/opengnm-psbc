@@ -20,7 +20,7 @@
 extern "C" {
 #endif
 
-#define PSBC_SHADER_METADATA_VERSION 8u
+#define PSBC_SHADER_METADATA_VERSION 9u
 
 struct nir_shader;
 struct nir_shader_compiler_options;
@@ -64,6 +64,7 @@ typedef enum {
 #define PSBC_SEMANTIC_PRIMITIVE_ID 47u
 #define PSBC_MAX_VERTEX_ATTRIBUTES 32
 #define PSBC_MAX_DESCRIPTOR_BINDINGS 64
+#define PSBC_MAX_DESCRIPTOR_SETS 4
 /* Reserve distinct 16-sampler banks for merged Gallium vertex/geometry stages. */
 #define PSBC_GALLIUM_UBO_BINDING_BASE 32
 
@@ -106,6 +107,7 @@ typedef struct {
 typedef enum {
     PSBC_DESCRIPTOR_NONE = 0,
     PSBC_DESCRIPTOR_UNIFORM_BUFFER,
+    PSBC_DESCRIPTOR_UNIFORM_TEXEL_BUFFER,
     PSBC_DESCRIPTOR_COMBINED_IMAGE_SAMPLER,
     PSBC_DESCRIPTOR_STORAGE_BUFFER,
 } PsbcDescriptorType;
@@ -165,6 +167,11 @@ typedef struct {
     uint32_t             vertex_buffer_table_user_data_dword;
     bool                 descriptor_set0_valid;
     uint32_t             descriptor_set0_user_data_dword;
+    /* Direct 32-bit descriptor-table pointers used by the PS5 RADV ABI.  The
+     * set-0 fields above remain source-level aliases for existing consumers;
+     * metadata version 9 identifies the enlarged binary structure. */
+    bool                 descriptor_set_valid[PSBC_MAX_DESCRIPTOR_SETS];
+    uint32_t             descriptor_set_user_data_dword[PSBC_MAX_DESCRIPTOR_SETS];
     uint32_t             descriptor_binding_count;
     PsbcDescriptorBinding descriptor_bindings[PSBC_MAX_DESCRIPTOR_BINDINGS];
     bool                 base_vertex_valid;
