@@ -31,6 +31,9 @@ The PS5 GPU is RDNA2 (GFX10.3). Legacy PS4 (GFX7) and PS4 Pro
   samplers.  On PS5 the metadata reports the compiler-assigned user-SGPR slot
   for every descriptor-table pointer; the caller remains responsible for
   encoding and binding the matching tables.
+- Vulkan specialization constants and an indirect push-constant pointer ABI
+  are available through `PsbcCompileOptions`; emitted metadata reports the
+  compiler-selected user-SGPR slot and the required push-constant byte range.
 - OpenOrbis cross-compilation support (`libpsbc.orbis.a`, 477 objects)
 - Automated test suite (`tests/verify_sb.py`) verifies shader binary
   structure (PSSL header, GNM magic, CRC32) for all 8 shader stages
@@ -100,6 +103,7 @@ You need:
 ```sh
 make                    # builds opengnm-psbc CLI + libpsbc.a
 python3 tests/verify_sb.py  # compile + verify all 8 shader stage test shaders
+make test-runtime-parameters # verify specialization + push metadata/codegen
 make install DESTDIR=/usr/local
 ```
 

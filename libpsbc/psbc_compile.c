@@ -606,6 +606,14 @@ static void fill_shader_metadata(const BuildContext* ctx,
     metadata->cull_distance_mask = ctx->rinfo->outinfo.cull_dist_mask;
     metadata->address32_hi = ctx->address32_hi;
     metadata->user_sgpr_count = ctx->rargs->num_user_sgprs;
+    if (ctx->rinfo->loads_push_constants &&
+        ctx->rargs->ac.push_constants.used) {
+        metadata->push_constants_valid = true;
+        metadata->push_constants_user_data_dword =
+            ctx->rargs->user_sgprs_locs
+                .shader_data[AC_UD_PUSH_CONSTANTS].sgpr_idx;
+        metadata->push_constant_size = ctx->rinfo->push_constant_size;
+    }
     if (ctx->ngg && ctx->rargs->ngg_lds_layout.used) {
         metadata->ngg_lds_layout_valid = true;
         metadata->ngg_lds_layout_user_data_dword =
@@ -1705,6 +1713,29 @@ static nir_shader* prepare_stage_nir(
     stage->entrypoint = opts->entrypoint ? opts->entrypoint : "main";
     stage->key.optimisations_disabled = !opts->optimise;
 
+    VkSpecializationMapEntry
+        spec_entries[PSBC_MAX_SPECIALIZATION_CONSTANTS] = {0};
+    uint8_t spec_data[PSBC_MAX_SPECIALIZATION_CONSTANTS *
+                      PSBC_MAX_SPECIALIZATION_BYTES] = {0};
+    VkSpecializationInfo spec_info = {0};
+    if (opts->specialization_constant_count) {
+        size_t data_size = 0;
+        for (uint32_t i = 0; i < opts->specialization_constant_count; ++i) {
+            const PsbcSpecializationConstant* source =
+                &opts->specialization_constants[i];
+            spec_entries[i].constantID = source->constant_id;
+            spec_entries[i].offset = (uint32_t)data_size;
+            spec_entries[i].size = source->size;
+            memcpy(spec_data + data_size, source->data, source->size);
+            data_size += source->size;
+        }
+        spec_info.mapEntryCount = opts->specialization_constant_count;
+        spec_info.pMapEntries = spec_entries;
+        spec_info.dataSize = data_size;
+        spec_info.pData = spec_data;
+        stage->spec_info = &spec_info;
+    }
+
     if (input_nir)
         stage->internal_nir = (nir_shader*)input_nir;
 
@@ -1797,6 +1828,19 @@ static PsbcResult psbc_compile_impl(
         return PSBC_RESULT_UNSUPPORTED_STAGE;
     if (opts->descriptor_binding_count > PSBC_MAX_DESCRIPTOR_BINDINGS)
         return PSBC_RESULT_INTERNAL_ERROR;
+    if (opts->specialization_constant_count >
+        PSBC_MAX_SPECIALIZATION_CONSTANTS)
+        return PSBC_RESULT_INTERNAL_ERROR;
+    for (uint32_t i = 0; i < opts->specialization_constant_count; ++i) {
+        const PsbcSpecializationConstant* spec =
+            &opts->specialization_constants[i];
+        if (!spec->size || spec->size > PSBC_MAX_SPECIALIZATION_BYTES)
+            return PSBC_RESULT_INTERNAL_ERROR;
+        for (uint32_t j = 0; j < i; ++j)
+            if (opts->specialization_constants[j].constant_id ==
+                spec->constant_id)
+                return PSBC_RESULT_INTERNAL_ERROR;
+    }
     if ((opts->color_is_int8 | opts->color_is_int10) & ~UINT32_C(0xff))
         return PSBC_RESULT_INTERNAL_ERROR;
     for (unsigned i = 0; i < 8; ++i)
@@ -2203,6 +2247,19 @@ static PsbcResult psbc_compile_impl(
         stage.info.desc_set_used_mask |= descriptor_set_mask;
         if (paired_geometry)
             previous.info.desc_set_used_mask |= descriptor_set_mask;
+    }
+    /* The native PS5 runtime uploads one bounded block and supplies its low
+     * gfx1013 address. Prevent RADV from replacing any fields with inline
+     * SGPR values so metadata and command encoding have one stable ABI. */
+    if (opts->force_indirect_push_constants) {
+        if (stage.info.loads_push_constants) {
+            stage.info.can_inline_all_push_constants = false;
+            stage.info.inline_push_constant_mask = 0;
+        }
+        if (paired_geometry && previous.info.loads_push_constants) {
+            previous.info.can_inline_all_push_constants = false;
+            previous.info.inline_push_constant_mask = 0;
+        }
     }
     debug_stage("shader-info-end");
     debug_shader_io("info", nir, &stage.info);

@@ -60,9 +60,30 @@ void ac_vcn_dec_init_regs(struct ac_vcn_dec_reg *reg, enum vcn_version version)
 
 /* === From vk_shader.c / vk_nir.c (excluded — needs full Vulkan runtime) === */
 #include "vk_util.h"
+#include "compiler/spirv/nir_spirv.h"
 struct nir_spirv_specialization *vk_spec_info_to_nir_spirv(const VkSpecializationInfo *vk_spec_info)
 {
-   return NULL;
+   if (!vk_spec_info || !vk_spec_info->mapEntryCount)
+      return NULL;
+
+   struct nir_spirv_specialization *spec =
+      vtn_alloc_specialization(vk_spec_info->mapEntryCount);
+   if (!spec)
+      return NULL;
+
+   for (uint32_t i = 0; i < vk_spec_info->mapEntryCount; ++i) {
+      const VkSpecializationMapEntry *entry = &vk_spec_info->pMapEntries[i];
+      if (entry->offset > vk_spec_info->dataSize ||
+          entry->size > vk_spec_info->dataSize - entry->offset ||
+          !vtn_add_specialization_entry(spec, i, entry->constantID,
+                                        (uint32_t)entry->size,
+                                        (const uint8_t *)vk_spec_info->pData + entry->offset,
+                                        false)) {
+         vtn_free_specialization(spec);
+         return NULL;
+      }
+   }
+   return spec;
 }
 
 #include "vk_nir.h"
