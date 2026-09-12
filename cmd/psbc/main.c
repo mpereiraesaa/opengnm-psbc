@@ -69,6 +69,8 @@ static PsbcVertexFormat parse_vertex_format(const char* name) {
 static PsbcDescriptorType parse_descriptor_type(const char* name) {
 	if (!strcmp(name, "uniform_buffer"))
 		return PSBC_DESCRIPTOR_UNIFORM_BUFFER;
+	if (!strcmp(name, "uniform_texel_buffer"))
+		return PSBC_DESCRIPTOR_UNIFORM_TEXEL_BUFFER;
 	if (!strcmp(name, "combined_image_sampler"))
 		return PSBC_DESCRIPTOR_COMBINED_IMAGE_SAMPLER;
 	if (!strcmp(name, "storage_buffer"))
@@ -338,6 +340,16 @@ static void write_metadata(const char* path, const PsbcShaderOutput* output) {
 		fprintf(h, "%u", metadata->descriptor_set0_user_data_dword);
 	else
 		fprintf(h, "null");
+	fprintf(h, ",\n  \"descriptor_set_user_data_dwords\": [");
+	for (uint32_t set = 0; set < PSBC_MAX_DESCRIPTOR_SETS; ++set) {
+		if (set)
+			fprintf(h, ", ");
+		if (metadata->descriptor_set_valid[set])
+			fprintf(h, "%u", metadata->descriptor_set_user_data_dword[set]);
+		else
+			fprintf(h, "null");
+	}
+	fprintf(h, "]");
 	fprintf(h, ",\n  \"base_vertex_user_data_dword\": ");
 	if (metadata->base_vertex_valid)
 		fprintf(h, "%u", metadata->base_vertex_user_data_dword);

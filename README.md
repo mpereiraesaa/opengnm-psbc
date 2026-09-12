@@ -26,6 +26,11 @@ The PS5 GPU is RDNA2 (GFX10.3). Legacy PS4 (GFX7) and PS4 Pro
 - PS4-specific CRC32 validation (non-standard index transformation)
 - Reusable C library (`libpsbc`) — linked by both the CLI and the
   `vulkan-ps4` ICD for runtime shader compilation on PS4
+- Typed runtime descriptor metadata for up to four descriptor sets, including
+  uniform buffers, storage buffers, uniform texel buffers and combined image
+  samplers.  On PS5 the metadata reports the compiler-assigned user-SGPR slot
+  for every descriptor-table pointer; the caller remains responsible for
+  encoding and binding the matching tables.
 - OpenOrbis cross-compilation support (`libpsbc.orbis.a`, 477 objects)
 - Automated test suite (`tests/verify_sb.py`) verifies shader binary
   structure (PSSL header, GNM magic, CRC32) for all 8 shader stages
@@ -44,6 +49,14 @@ opengnm-psbc -s fragment -f input.spv -o output.sb
 
 # Compile a compute shader (64x1x1 workgroup)
 opengnm-psbc -s compute -f input.spv -o output.sb
+
+# Emit raw PS5 code plus the runtime descriptor-table ABI. Binding records use
+# set:binding:type:array-size:byte-offset:byte-stride.
+opengnm-psbc -s compute -f input.spv -o output.bin --raw \
+  --address32-hi 2 --metadata output.json \
+  --descriptor-binding 0:0:storage_buffer:1:0:16 \
+  --descriptor-binding 1:0:uniform_buffer:1:0:16 \
+  --descriptor-binding 2:0:uniform_texel_buffer:1:0:16
 
 # Compile a geometry shader
 opengnm-psbc -s geometry -f input.spv -o output.sb
