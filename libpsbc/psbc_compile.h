@@ -20,6 +20,11 @@
 extern "C" {
 #endif
 
+#define PSBC_SHADER_METADATA_VERSION 8u
+
+struct nir_shader;
+struct nir_shader_compiler_options;
+
 /* === Types === */
 
 typedef enum {
@@ -51,9 +56,143 @@ typedef enum {
     PSBC_RESULT_INTERNAL_ERROR,
 } PsbcResult;
 
+#define PSBC_MAX_CONTEXT_REGISTERS 16
+#define PSBC_MAX_SHADER_REGISTERS 8
+#define PSBC_MAX_SEMANTICS 32
+/* Private matching key shared by our AGC producer/consumer packages, after
+ * the generic keys 15..46. This is not a PSSL system-semantic enum. */
+#define PSBC_SEMANTIC_PRIMITIVE_ID 47u
+#define PSBC_MAX_VERTEX_ATTRIBUTES 32
+#define PSBC_MAX_DESCRIPTOR_BINDINGS 64
+/* Reserve distinct 16-sampler banks for merged Gallium vertex/geometry stages. */
+#define PSBC_GALLIUM_UBO_BINDING_BASE 32
+
+typedef enum {
+    PSBC_VERTEX_FORMAT_NONE = 0,
+    PSBC_VERTEX_FORMAT_R32_FLOAT,
+    PSBC_VERTEX_FORMAT_R32G32_FLOAT,
+    PSBC_VERTEX_FORMAT_R32G32B32_FLOAT,
+    PSBC_VERTEX_FORMAT_R32G32B32A32_FLOAT,
+    PSBC_VERTEX_FORMAT_B8G8R8A8_UNORM,
+    PSBC_VERTEX_FORMAT_R10G10B10A2_UNORM,
+    PSBC_VERTEX_FORMAT_B10G10R10A2_UNORM,
+    PSBC_VERTEX_FORMAT_R10G10B10A2_SNORM,
+    PSBC_VERTEX_FORMAT_B10G10R10A2_SNORM,
+    PSBC_VERTEX_FORMAT_R10G10B10A2_USCALED,
+    PSBC_VERTEX_FORMAT_B10G10R10A2_USCALED,
+    PSBC_VERTEX_FORMAT_R10G10B10A2_SSCALED,
+    PSBC_VERTEX_FORMAT_B10G10R10A2_SSCALED,
+    PSBC_VERTEX_FORMAT_R32_SINT,
+    PSBC_VERTEX_FORMAT_R32G32_SINT,
+    PSBC_VERTEX_FORMAT_R32G32B32_SINT,
+    PSBC_VERTEX_FORMAT_R32G32B32A32_SINT,
+    PSBC_VERTEX_FORMAT_R32_UINT,
+    PSBC_VERTEX_FORMAT_R32G32_UINT,
+    PSBC_VERTEX_FORMAT_R32G32B32_UINT,
+    PSBC_VERTEX_FORMAT_R32G32B32A32_UINT,
+    PSBC_VERTEX_FORMAT_R8G8B8A8_UNORM,
+} PsbcVertexFormat;
+
 typedef struct {
-    void*   data;         /* Compiled shader binary (PSSL header + GNM header + code + trailer) */
-    size_t  size;         /* Total size of data in bytes */
+    uint8_t          location;
+    uint8_t          binding;
+    PsbcVertexFormat format;
+    uint32_t         offset;
+    uint32_t         stride; /* PS5: zero repeats a current/constant attribute. */
+    uint32_t         alignment;
+    uint32_t         instance_divisor;
+} PsbcVertexAttribute;
+
+typedef enum {
+    PSBC_DESCRIPTOR_NONE = 0,
+    PSBC_DESCRIPTOR_UNIFORM_BUFFER,
+    PSBC_DESCRIPTOR_COMBINED_IMAGE_SAMPLER,
+    PSBC_DESCRIPTOR_STORAGE_BUFFER,
+} PsbcDescriptorType;
+
+typedef struct {
+    uint8_t            set;
+    uint8_t            binding;
+    PsbcDescriptorType type;
+    uint32_t           array_size;
+    uint32_t           offset;
+    uint32_t           stride;
+} PsbcDescriptorBinding;
+
+typedef enum {
+    PSBC_HW_STAGE_UNKNOWN = 0,
+    PSBC_HW_STAGE_VERTEX  = 1,
+    PSBC_HW_STAGE_PIXEL   = 2,
+    PSBC_HW_STAGE_NGG     = 3,
+} PsbcHardwareStage;
+
+typedef enum {
+    PSBC_UNRESOLVED_NONE                   = 0,
+    PSBC_UNRESOLVED_PROGRAM_CHECKSUM       = 1u << 0,
+    PSBC_UNRESOLVED_NGG_ESGS_RING_ITEMSIZE = 1u << 1,
+    PSBC_UNRESOLVED_AGC_LINKAGE             = 1u << 2,
+} PsbcUnresolvedField;
+
+typedef struct {
+    uint16_t offset;
+    uint16_t padding;
+    uint32_t value;
+} PsbcRegisterWrite;
+
+typedef struct {
+    uint32_t             version;
+    PsbcTarget           target;
+    PsbcStage            source_stage;
+    PsbcHardwareStage    hardware_stage;
+    uint32_t             unresolved_fields;
+    uint32_t             context_register_count;
+    PsbcRegisterWrite    context_registers[PSBC_MAX_CONTEXT_REGISTERS];
+    uint32_t             shader_register_count;
+    PsbcRegisterWrite    shader_registers[PSBC_MAX_SHADER_REGISTERS];
+    bool                 linkage_valid;
+    PsbcRegisterWrite    linkage_ge_cntl;
+    PsbcRegisterWrite    linkage_stages_en;
+    PsbcRegisterWrite    linkage_user_vgpr_en;
+    uint32_t             input_semantic_count;
+    uint32_t             input_semantics[PSBC_MAX_SEMANTICS];
+    uint32_t             output_semantic_count;
+    uint32_t             output_semantics[PSBC_MAX_SEMANTICS];
+    uint32_t             clip_distance_mask;
+    uint32_t             cull_distance_mask;
+    uint32_t             address32_hi;
+    uint32_t             user_sgpr_count;
+    bool                 vertex_buffer_table_valid;
+    uint32_t             vertex_buffer_table_user_data_dword;
+    bool                 descriptor_set0_valid;
+    uint32_t             descriptor_set0_user_data_dword;
+    uint32_t             descriptor_binding_count;
+    PsbcDescriptorBinding descriptor_bindings[PSBC_MAX_DESCRIPTOR_BINDINGS];
+    bool                 base_vertex_valid;
+    uint32_t             base_vertex_user_data_dword;
+    bool                 start_instance_valid;
+    uint32_t             start_instance_user_data_dword;
+    bool                 streamout_valid;
+    uint32_t             streamout_buffer_table_user_data_dword;
+    uint32_t             streamout_enabled_stream_buffers_mask;
+    uint32_t             streamout_strides_dwords[4];
+    uint32_t             streamout_config_sgpr;
+    uint32_t             streamout_write_index_sgpr;
+    uint32_t             streamout_offset_sgprs[4];
+    bool                 scratch_valid;
+    uint32_t             scratch_bytes_per_wave;
+    uint32_t             scratch_size_per_thread;
+    uint32_t             scratch_buffer_table_user_data_dword;
+    bool                 ngg_lds_layout_valid;
+    uint32_t             ngg_lds_layout_user_data_dword;
+    uint32_t             ngg_lds_layout; /* GS output base in bytes, after ES inputs. */
+} PsbcShaderMetadata;
+
+typedef struct {
+    void*               data;         /* Legacy PSSL/GNM wrapper */
+    size_t              size;
+    void*               machine_code; /* Raw ACO machine code; no wrapper/trailer */
+    size_t              machine_code_size;
+    PsbcShaderMetadata  metadata;
 } PsbcShaderOutput;
 
 typedef struct {
@@ -61,6 +200,22 @@ typedef struct {
     PsbcStage   stage;
     const char* entrypoint;  /* Default: "main" */
     bool        optimise;    /* Default: true */
+    bool        ngg;         /* Experimental PS5 VS->FS NGG lowering */
+    bool        omit_implicit_primitive_id; /* Caller proves FS does not read it; false if unknown. */
+    bool        primitive_id_per_primitive; /* FS consumes an implicit PS5 NGG VS export, not a GS varying. */
+    bool        ps5_global_streamout; /* No-GDS NGG GS counters */
+    bool        force_accelerated_dot; /* Diagnostic only: emit native dot ISA */
+    uint32_t    primitive_type; /* GFX10 DI primitive type: 0, 1..6, 10..13 */
+    bool        provoking_vtx_last; /* Select the final flat-shaded vertex */
+    uint32_t    address32_hi; /* Upper half for ACO 32-bit GPU pointers */
+    uint32_t    vertex_attribute_count;
+    PsbcVertexAttribute vertex_attributes[PSBC_MAX_VERTEX_ATTRIBUTES];
+    uint32_t    descriptor_binding_count;
+    PsbcDescriptorBinding descriptor_bindings[PSBC_MAX_DESCRIPTOR_BINDINGS];
+    uint32_t    rasterization_samples; /* 0=single/default, otherwise 1/2/4/8 */
+    uint32_t    spi_shader_col_format; /* Per-MRT export nibbles; 0=legacy defaults */
+    uint32_t    color_is_int8;         /* Per-MRT narrow integer clamp masks */
+    uint32_t    color_is_int10;
 } PsbcCompileOptions;
 
 /* === API === */
@@ -77,26 +232,61 @@ void psbc_init(void);
  */
 void psbc_shutdown(void);
 
+/* Immutable PS5 ACO NIR options for Gallium/front-end shader creation. */
+const struct nir_shader_compiler_options*
+psbc_get_nir_options(PsbcStage stage);
+
 /*
  * Compile a SPIR-V shader into a PS4/PS5 shader binary.
  *
  *   spirv       — pointer to SPIR-V bytecode
  *   spirv_size  — size of SPIR-V bytecode in bytes
  *   opts        — compilation options (target, stage, entrypoint, etc.)
- *   out         — receives the compiled binary; caller must free out->data
+ *   out         — receives the legacy wrapper, raw code, and typed metadata;
+ *                 release all owned memory with psbc_free_output()
  *
- * The current standalone binary builder emits vertex and fragment GNM
- * shader headers. Other stages may compile through NIR/ACO but return
- * PSBC_RESULT_UNSUPPORTED_STAGE while their GNM headers are unavailable.
+ * The standalone builder emits GNM wrappers for all represented stages.
+ * On GFX9+, a standalone geometry result is a compiler diagnostic only;
+ * a loadable geometry pipeline also requires a merged pre-raster stage and,
+ * for legacy geometry, a separately compiled copy shader.
  *
  * Returns PSBC_RESULT_OK on success, error code otherwise.
- * On error, out->data is NULL and out->size is 0.
+ * On error, all output fields are zero.
  */
 PsbcResult psbc_compile_shader(
     const uint32_t*       spirv,
     size_t                spirv_size,
     const PsbcCompileOptions* opts,
     PsbcShaderOutput*     out
+);
+
+/*
+ * Compile an existing NIR shader.  The input remains owned by the caller;
+ * libpsbc clones it before optimization and target lowering.  This is the
+ * Gallium-facing path and requires opts->stage to match nir->info.stage.
+ */
+PsbcResult psbc_compile_nir(
+    const struct nir_shader* nir,
+    const PsbcCompileOptions* opts,
+    PsbcShaderOutput* out
+);
+
+/* Compile a complete PS5 NGG vertex+geometry pair into one hardware shader. */
+PsbcResult psbc_compile_geometry_pipeline(
+    const uint32_t* vertex_spirv,
+    size_t vertex_spirv_size,
+    const uint32_t* geometry_spirv,
+    size_t geometry_spirv_size,
+    const PsbcCompileOptions* opts,
+    PsbcShaderOutput* out
+);
+
+/* NIR equivalent used by Gallium when a geometry shader is bound. */
+PsbcResult psbc_compile_nir_geometry_pipeline(
+    const struct nir_shader* vertex_nir,
+    const struct nir_shader* geometry_nir,
+    const PsbcCompileOptions* opts,
+    PsbcShaderOutput* out
 );
 
 /*

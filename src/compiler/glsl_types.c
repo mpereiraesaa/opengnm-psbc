@@ -507,6 +507,29 @@ glsl_type_singleton_decref()
    simple_mtx_unlock(&glsl_type_cache_mutex);
 }
 
+void
+psbc_glsl_type_cache_print_stats(unsigned iteration)
+{
+   simple_mtx_lock(&glsl_type_cache_mutex);
+#ifndef NDEBUG
+   const size_t bytes = glsl_type_cache.mem_ctx ?
+      ralloc_total_size(glsl_type_cache.mem_ctx) : 0;
+#else
+   const size_t bytes = 0;
+#endif
+   printf("[psbc] glsl-types iteration=%u bytes=%zu users=%u arrays=%u "
+          "structs=%u interfaces=%u\n",
+          iteration, bytes, glsl_type_cache.users,
+          glsl_type_cache.array_types ?
+             _mesa_hash_table_num_entries(glsl_type_cache.array_types) : 0,
+          glsl_type_cache.struct_types ?
+             _mesa_hash_table_num_entries(glsl_type_cache.struct_types) : 0,
+          glsl_type_cache.interface_types ?
+             _mesa_hash_table_num_entries(glsl_type_cache.interface_types) : 0);
+   fflush(stdout);
+   simple_mtx_unlock(&glsl_type_cache_mutex);
+}
+
 static const glsl_type *
 make_array_type(linear_ctx *lin_ctx, const glsl_type *element_type, unsigned length,
                 unsigned explicit_stride)

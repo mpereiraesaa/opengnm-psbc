@@ -55,6 +55,9 @@ typedef struct shader_info {
    /* BLAKE3 of the original source, used by shader detection in drivers. */
    blake3_hash source_blake3;
 
+   /* Human-readable description of specialization constants passed to shader. */
+   const char *spec;
+
    /** The shader stage, such as MESA_SHADER_VERTEX. */
    mesa_shader_stage stage:8;
 
@@ -504,6 +507,9 @@ typedef struct shader_info {
          bool pixel_interlock_unordered:1;
          bool sample_interlock_ordered:1;
          bool sample_interlock_unordered:1;
+
+         /** Whether the original shader declared sample_mask_in. */
+         bool sample_mask_in_declared:1;
 
          /**
           * whether this shader has pixel_local_storage load/store instructions

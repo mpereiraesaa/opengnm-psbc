@@ -171,6 +171,11 @@ aco_postprocess_shader(const struct aco_compiler_options* options,
    if (program->gfx_level >= GFX10)
       form_hard_clauses(program.get());
 
+   if (options->dump_ir) {
+      fprintf(stderr, "After waitcnt:\n");
+      aco_print_program(program.get(), stderr);
+   }
+
    if (program->gfx_level >= GFX11)
       combine_delay_alu(program.get());
 

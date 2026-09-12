@@ -12,6 +12,7 @@
 #include "psbc_compile.h"
 
 #include <errno.h>
+#include <stddef.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -26,15 +27,104 @@
 #include "ac_binary.h"
 #include "ac_nir.h"
 #include "amd_family.h"
+#include "nir/nir_builder.h"
 #include "nir/radv_nir.h"
 #include "radv_shader.h"
 #include "radv_shader_args.h"
 #include "radv_shader_info.h"
+#include "radv_descriptor_set.h"
 #include "radv_aco_shader_info.h"
 #include "radv_pipeline.h"
 #include "sid.h"
 
 #include "crc32_sb.h"
+
+/* Keep standalone PSBC ABI-compatible with the pinned Mesa NIR build. */
+_Static_assert(sizeof(nir_instr_type) == 1, "NIR enums must be packed");
+_Static_assert(sizeof(nir_intrinsic_op) == 4, "unexpected NIR intrinsic enum size");
+_Static_assert(offsetof(nir_intrinsic_instr, intrinsic) == 56,
+               "PSBC/Mesa NIR layout mismatch");
+
+/* ACO packs color exports into consecutive MRT slots. Match RADV's final
+ * register emission, but keep CB_SHADER_MASK in logical attachment order. */
+static uint32_t compact_spi_shader_col_format(uint32_t formats) {
+    uint32_t compacted = 0;
+    unsigned slot = 0;
+    for (unsigned i = 0; i < 8; ++i) {
+        uint32_t format = (formats >> (4 * i)) & 0xf;
+        if (format)
+            compacted |= format << (4 * slot++);
+    }
+    return compacted;
+}
+
+static void debug_shader_io(const char* label, const nir_shader* nir,
+                            const struct radv_shader_info* info) {
+    if (!getenv("PSBC_DEBUG_IO"))
+        return;
+    fprintf(stderr,
+            "PSBC IO %s: inputs=0x%016" PRIx64
+            " outputs=0x%016" PRIx64
+            " ps_inputs=%u ps_mask=0x%08x params=%u prim_params=%u"
+            " linked=%u/%u merged_separate=%u slots=%u/%u\n",
+            label, nir->info.inputs_read, nir->info.outputs_written,
+            info ? info->ps.num_inputs : 0,
+            info ? info->ps.input_mask : 0,
+            info ? info->outinfo.param_exports : 0,
+            info ? info->outinfo.prim_param_exports : 0,
+            info ? info->inputs_linked : 0,
+            info ? info->outputs_linked : 0,
+            info ? info->merged_shader_compiled_separately : 0,
+            info && info->stage == MESA_SHADER_VERTEX
+                ? info->vs.num_linked_outputs : 0,
+            info && info->stage == MESA_SHADER_GEOMETRY
+                ? info->gs.num_linked_inputs : 0);
+}
+
+static void debug_stage(const char* label) {
+    if (!getenv("PSBC_DEBUG_STAGE"))
+        return;
+    fprintf(stderr, "PSBC stage %s\n", label);
+    fflush(stderr);
+}
+
+/* Gallium NIR names constant buffers with a scalar slot. RADV's descriptor
+ * lowering expects the Vulkan resource-index tuple produced by SPIR-V import.
+ * Convert constant scalar slots at the standalone API boundary so both input
+ * forms use the same descriptor pipeline. */
+static bool lower_gallium_ubo_index(nir_builder* b, nir_instr* instruction,
+                                    void* data) {
+    nir_intrinsic_instr* intrinsic;
+    nir_src slot_src;
+    uint64_t slot;
+    nir_def* resource;
+
+    (void)data;
+    if (instruction->type != nir_instr_type_intrinsic)
+        return false;
+    intrinsic = nir_instr_as_intrinsic(instruction);
+    if (intrinsic->intrinsic != nir_intrinsic_load_ubo ||
+        intrinsic->src[0].ssa->num_components != 1)
+        return false;
+
+    slot_src = intrinsic->src[0];
+    if (!nir_src_is_const(slot_src))
+        return false;
+    slot = nir_src_as_uint(slot_src);
+    if (slot >= PSBC_MAX_DESCRIPTOR_BINDINGS -
+                    PSBC_GALLIUM_UBO_BINDING_BASE)
+        return false;
+
+    b->cursor = nir_before_instr(instruction);
+    resource = nir_vulkan_resource_index(
+        b, 3, 32, nir_imm_int(b, 0),
+        .desc_set = 0,
+        .binding = PSBC_GALLIUM_UBO_BINDING_BASE + (unsigned)slot,
+        .desc_type = nir_descriptor_type_uniform_buffer,
+        .resource_type = nir_resource_type_uniform_buffer);
+    nir_src_rewrite(&intrinsic->src[0], resource);
+    return true;
+}
 
 /* === Mesa stage mapping === */
 
@@ -206,6 +296,12 @@ static uint32_t compute_db_shader_control(const struct radv_shader_info *info) {
 /* === Shader binary builder === */
 
 typedef struct {
+    bool valid;
+    uint32_t count;
+    uint32_t words[PSBC_MAX_SEMANTICS];
+} PsbcInputSemantics;
+
+typedef struct {
     const struct nir_shader* nir;
     const struct radv_shader_info* rinfo;
     const struct radv_shader_args* rargs;
@@ -216,8 +312,635 @@ typedef struct {
     PsbcStage psbc_stage;
     const uint32_t* spirv_data;
     size_t spirv_size;
+    PsbcTarget target;
+    bool ngg;
     bool neo;
+    uint32_t address32_hi;
+    const PsbcCompileOptions* options;
+    const PsbcInputSemantics* input_semantics;
 } BuildContext;
+
+static unsigned ps5_last_provoking_vertex(uint32_t primitive_type) {
+    switch (primitive_type) {
+    case 1: /* point list */
+        return 0;
+    case 2: /* line list */
+    case 3: /* line strip */
+        return 1;
+    case 4: /* triangle list */
+    case 5: /* triangle fan */
+    case 6: /* triangle strip */
+        return 2;
+    default:
+        return 0;
+    }
+}
+
+static bool lower_flat_input_vertex(nir_builder* builder,
+                                    nir_intrinsic_instr* intrinsic,
+                                    void* data) {
+    const PsbcCompileOptions* options = data;
+    const unsigned vertex_id = ps5_last_provoking_vertex(options->primitive_type);
+    if (intrinsic->intrinsic != nir_intrinsic_load_input)
+        return false;
+    /* An implicit NGG PrimitiveID has one value per primitive, not P0/P1/P2.
+     * Explicit GS outputs still obey the ordinary provoking-vertex rule. */
+    if (options->primitive_id_per_primitive &&
+        nir_intrinsic_io_semantics(intrinsic).location == VARYING_SLOT_PRIMITIVE_ID)
+        return false;
+
+    builder->cursor = nir_before_instr(&intrinsic->instr);
+    nir_def* replacement = nir_load_input_vertex(
+        builder, intrinsic->def.num_components, intrinsic->def.bit_size,
+        nir_imm_int(builder, vertex_id), intrinsic->src[0].ssa,
+        .base = nir_intrinsic_base(intrinsic),
+        .component = nir_intrinsic_component(intrinsic),
+        .dest_type = nir_intrinsic_dest_type(intrinsic),
+        .io_semantics = nir_intrinsic_io_semantics(intrinsic));
+    nir_def_replace(&intrinsic->def, replacement);
+    return true;
+}
+
+static unsigned ps5_input_interpolation_mode(
+    const nir_intrinsic_instr* intrinsic) {
+    if (intrinsic->intrinsic == nir_intrinsic_load_interpolated_input)
+        return 2;
+    if (intrinsic->intrinsic == nir_intrinsic_load_input ||
+        intrinsic->intrinsic == nir_intrinsic_load_input_vertex)
+        return 1;
+    return 0;
+}
+
+typedef struct {
+    uint8_t modes[PSBC_MAX_SEMANTICS];
+    uint8_t flat_attribute[PSBC_MAX_SEMANTICS];
+    uint8_t primitive_id_attribute;
+} Ps5MixedInputState;
+
+static bool classify_ps5_input(nir_builder* builder,
+                               nir_instr* instruction, void* data) {
+    (void)builder;
+    if (instruction->type != nir_instr_type_intrinsic)
+        return false;
+    nir_intrinsic_instr* intrinsic = nir_instr_as_intrinsic(instruction);
+    const unsigned mode = ps5_input_interpolation_mode(intrinsic);
+    if (!mode)
+        return false;
+    const nir_io_semantics io = nir_intrinsic_io_semantics(intrinsic);
+    if (io.location < VARYING_SLOT_VAR0)
+        return false;
+    for (unsigned slot = 0; slot < io.num_slots; ++slot) {
+        const unsigned location = io.location - VARYING_SLOT_VAR0 + slot;
+        if (location < PSBC_MAX_SEMANTICS)
+            ((Ps5MixedInputState*)data)->modes[location] |= mode;
+    }
+    return false;
+}
+
+static bool remap_ps5_flat_input(nir_builder* builder,
+                                 nir_instr* instruction, void* data) {
+    (void)builder;
+    if (instruction->type != nir_instr_type_intrinsic)
+        return false;
+    nir_intrinsic_instr* intrinsic = nir_instr_as_intrinsic(instruction);
+    if (ps5_input_interpolation_mode(intrinsic) != 1)
+        return false;
+    const nir_io_semantics io = nir_intrinsic_io_semantics(intrinsic);
+    const Ps5MixedInputState* state = data;
+    if (io.location == VARYING_SLOT_PRIMITIVE_ID &&
+        state->primitive_id_attribute != UINT8_MAX) {
+        nir_intrinsic_set_base(intrinsic, state->primitive_id_attribute);
+        return true;
+    }
+    if (io.location < VARYING_SLOT_VAR0 || io.num_slots != 1)
+        return false;
+    const unsigned location = io.location - VARYING_SLOT_VAR0;
+    if (location >= PSBC_MAX_SEMANTICS || state->modes[location] != 3)
+        return false;
+    nir_intrinsic_set_base(intrinsic, state->flat_attribute[location]);
+    return true;
+}
+
+static bool split_ps5_mixed_inputs(nir_shader* nir,
+                                   struct radv_shader_info* info,
+                                   bool primitive_id_per_primitive) {
+    Ps5MixedInputState state = {.primitive_id_attribute = UINT8_MAX};
+    memset(state.flat_attribute, UINT8_MAX, sizeof(state.flat_attribute));
+    nir_shader_instructions_pass(nir, classify_ps5_input,
+                                 nir_metadata_all, &state);
+    const bool per_primitive_id = primitive_id_per_primitive && info->ps.prim_id_input;
+    unsigned next = info->ps.num_inputs - per_primitive_id;
+    for (unsigned location = 0; location < PSBC_MAX_SEMANTICS; ++location) {
+        if (state.modes[location] != 3)
+            continue;
+        if (next >= PSBC_MAX_SEMANTICS)
+            return false;
+        state.flat_attribute[location] = next++;
+    }
+    /* GFX10.3 requires per-primitive inputs after every per-vertex input,
+     * including the extra flat aliases created above. */
+    if (per_primitive_id) {
+        if (next >= PSBC_MAX_SEMANTICS)
+            return false;
+        state.primitive_id_attribute = next++;
+    }
+    if (next == info->ps.num_inputs)
+        return true;
+    nir_shader_instructions_pass(nir, remap_ps5_flat_input,
+                                 nir_metadata_all, &state);
+    info->ps.num_inputs = next;
+    return true;
+}
+
+#define PSBC_CX_OFFSET(reg) ((uint16_t)(((reg) - SI_CONTEXT_REG_OFFSET) / 4))
+#define PSBC_SH_OFFSET(reg) ((uint16_t)(((reg) - SI_SH_REG_OFFSET) / 4))
+#define PSBC_UC_OFFSET(reg) ((uint16_t)(((reg) - CIK_UCONFIG_REG_OFFSET) / 4))
+
+static void metadata_add_register(PsbcRegisterWrite* registers,
+                                  uint32_t* count, uint32_t limit,
+                                  uint16_t offset, uint32_t value) {
+    if (*count >= limit)
+        return;
+    registers[*count] = (PsbcRegisterWrite) {
+        .offset = offset,
+        .value = value,
+    };
+    *count += 1;
+}
+
+/*
+ * AGC semantic words use the low byte as the producer/consumer match key.
+ * Generic user varyings start at semantic 15, matching both Sony-produced
+ * AGC packages and the legacy GNM/PSSL metadata convention.
+ * A producer additionally stores its parameter-export index in bits 8..12.
+ * Pixel consumer bit 22 selects flat shading in PS5 AGC semantics.  This is
+ * the PS5 counterpart of GnmPixelInputSemantic.isflatshaded and is consumed
+ * by sceAgcLinkShaders when it builds SPI_PS_INPUT_CNTL_i.
+ */
+static bool build_input_semantics(const nir_shader* nir,
+                                  const struct radv_shader_info* info,
+                                  bool primitive_id_per_primitive,
+                                  PsbcInputSemantics* result) {
+    memset(result, 0, sizeof(*result));
+    const uint32_t generic_count = info->ps.num_inputs;
+    if (generic_count > PSBC_MAX_SEMANTICS)
+        return false;
+    if (info->ps.input_per_primitive_mask ||
+        info->ps.explicit_shaded_mask || info->ps.explicit_strict_shaded_mask ||
+        info->ps.float16_shaded_mask || info->ps.float16_hi_shaded_mask)
+        return false;
+
+    uint32_t words_by_attribute[PSBC_MAX_SEMANTICS] = {0};
+    bool seen[PSBC_MAX_SEMANTICS] = {false};
+    nir_foreach_function_impl(impl, nir) {
+        nir_foreach_block(block, impl) {
+            nir_foreach_instr(instr, block) {
+                if (instr->type != nir_instr_type_intrinsic)
+                    continue;
+                const nir_intrinsic_instr* intrin = nir_instr_as_intrinsic(instr);
+                const unsigned mode = ps5_input_interpolation_mode(intrin);
+                if (!mode)
+                    continue;
+                const nir_io_semantics io = nir_intrinsic_io_semantics(intrin);
+                const bool primitive_id = io.location == VARYING_SLOT_PRIMITIVE_ID;
+                if (primitive_id && (io.num_slots != 1 || mode != 1))
+                    return false;
+                if (!primitive_id && io.location < VARYING_SLOT_VAR0)
+                    continue;
+                for (uint32_t slot = 0; slot < io.num_slots; ++slot) {
+                    const uint32_t location =
+                        primitive_id ? 0 : io.location - VARYING_SLOT_VAR0 + slot;
+                    const uint32_t attribute =
+                        nir_intrinsic_base(intrin) + slot;
+                    if (location >= PSBC_MAX_SEMANTICS ||
+                        attribute >= generic_count)
+                        return false;
+                    uint32_t word = primitive_id ? PSBC_SEMANTIC_PRIMITIVE_ID : 15u + location;
+                    if (mode == 1 && !(primitive_id && primitive_id_per_primitive))
+                        word |= BITFIELD_BIT(22);
+                    if (seen[attribute] &&
+                        words_by_attribute[attribute] != word)
+                        return false;
+                    words_by_attribute[attribute] = word;
+                    seen[attribute] = true;
+                }
+            }
+        }
+    }
+
+    for (uint32_t attribute = 0; attribute < generic_count; ++attribute) {
+        if (!seen[attribute])
+            return false;
+        result->words[result->count++] = words_by_attribute[attribute];
+    }
+    result->valid = true;
+    return true;
+}
+
+static bool fill_output_semantics(const struct radv_shader_info* info,
+                                  PsbcShaderMetadata* metadata) {
+    for (unsigned semantic = 0; semantic < PSBC_MAX_SEMANTICS; ++semantic) {
+        const uint8_t parameter =
+            info->outinfo.vs_output_param_offset[VARYING_SLOT_VAR0 + semantic];
+        if (parameter < PSBC_MAX_SEMANTICS) {
+            metadata->output_semantics[metadata->output_semantic_count++] =
+                (15u + semantic) | ((uint32_t)parameter << 8);
+        }
+    }
+    const uint8_t primitive_id =
+        info->outinfo.vs_output_param_offset[VARYING_SLOT_PRIMITIVE_ID];
+    if (primitive_id < PSBC_MAX_SEMANTICS) {
+        if (metadata->output_semantic_count >= PSBC_MAX_SEMANTICS)
+            return false;
+        metadata->output_semantics[metadata->output_semantic_count++] =
+            PSBC_SEMANTIC_PRIMITIVE_ID | ((uint32_t)primitive_id << 8);
+    }
+    return metadata->output_semantic_count ==
+        info->outinfo.param_exports + info->outinfo.prim_param_exports;
+}
+
+static uint32_t build_pa_cl_vs_out_cntl(const BuildContext* ctx,
+                                        unsigned num_pos_exports) {
+    unsigned clip_dist_mask = 0, cull_dist_mask = 0;
+    get_num_pos_exports(ctx->rinfo, &clip_dist_mask, &cull_dist_mask);
+    const uint32_t total_mask = clip_dist_mask | cull_dist_mask;
+    const bool misc_vec_ena =
+        ctx->rinfo->outinfo.writes_pointsize ||
+        ctx->rinfo->outinfo.writes_layer ||
+        ctx->rinfo->outinfo.writes_viewport_index ||
+        ctx->rinfo->outinfo.writes_primitive_shading_rate;
+
+    return S_02881C_USE_VTX_POINT_SIZE(ctx->rinfo->outinfo.writes_pointsize) |
+           S_02881C_USE_VTX_RENDER_TARGET_INDX(ctx->rinfo->outinfo.writes_layer) |
+           S_02881C_USE_VTX_VIEWPORT_INDX(ctx->rinfo->outinfo.writes_viewport_index) |
+           S_02881C_USE_VTX_VRS_RATE(ctx->rinfo->outinfo.writes_primitive_shading_rate) |
+           S_02881C_VS_OUT_MISC_VEC_ENA(misc_vec_ena) |
+           S_02881C_VS_OUT_MISC_SIDE_BUS_ENA(
+               misc_vec_ena || (ctx->gfx_level >= GFX10_3 && num_pos_exports > 1)) |
+           S_02881C_VS_OUT_CCDIST0_VEC_ENA((total_mask & 0x0f) != 0) |
+           S_02881C_VS_OUT_CCDIST1_VEC_ENA((total_mask & 0xf0) != 0) |
+           total_mask << 8 | clip_dist_mask;
+}
+
+static uint32_t build_spi_shader_pos_format(unsigned num_pos_exports) {
+    return S_02870C_POS0_EXPORT_FORMAT(V_02870C_SPI_SHADER_4COMP) |
+           S_02870C_POS1_EXPORT_FORMAT(num_pos_exports > 1
+                                          ? V_02870C_SPI_SHADER_4COMP
+                                          : V_02870C_SPI_SHADER_NONE) |
+           S_02870C_POS2_EXPORT_FORMAT(num_pos_exports > 2
+                                          ? V_02870C_SPI_SHADER_4COMP
+                                          : V_02870C_SPI_SHADER_NONE) |
+           S_02870C_POS3_EXPORT_FORMAT(num_pos_exports > 3
+                                          ? V_02870C_SPI_SHADER_4COMP
+                                          : V_02870C_SPI_SHADER_NONE);
+}
+
+static void fill_shader_metadata(const BuildContext* ctx,
+                                 PsbcShaderMetadata* metadata) {
+    memset(metadata, 0, sizeof(*metadata));
+    metadata->version = PSBC_SHADER_METADATA_VERSION;
+    metadata->target = ctx->target;
+    metadata->source_stage = ctx->psbc_stage;
+    metadata->unresolved_fields = PSBC_UNRESOLVED_PROGRAM_CHECKSUM;
+    metadata->clip_distance_mask = ctx->rinfo->outinfo.clip_dist_mask;
+    metadata->cull_distance_mask = ctx->rinfo->outinfo.cull_dist_mask;
+    metadata->address32_hi = ctx->address32_hi;
+    metadata->user_sgpr_count = ctx->rargs->num_user_sgprs;
+    if (ctx->ngg && ctx->rargs->ngg_lds_layout.used) {
+        metadata->ngg_lds_layout_valid = true;
+        metadata->ngg_lds_layout_user_data_dword =
+            ctx->rargs->user_sgprs_locs.shader_data[AC_UD_NGG_LDS_LAYOUT].sgpr_idx;
+        metadata->ngg_lds_layout = ctx->rinfo->ngg_info.esgs_ring_size;
+    }
+    if (ctx->config->scratch_bytes_per_wave) {
+        metadata->scratch_valid = true;
+        metadata->scratch_bytes_per_wave =
+            ctx->config->scratch_bytes_per_wave;
+        metadata->scratch_size_per_thread = ctx->nir->scratch_size;
+        metadata->scratch_buffer_table_user_data_dword =
+            ctx->rargs->user_sgprs_locs
+                .shader_data[AC_UD_SCRATCH_RING_OFFSETS].sgpr_idx;
+    }
+    if (ctx->rargs->descriptors[0].used &&
+        ctx->rargs->user_sgprs_locs.descriptor_sets[0].sgpr_idx !=
+            UINT32_MAX) {
+        metadata->descriptor_set0_valid = true;
+        metadata->descriptor_set0_user_data_dword =
+            ctx->rargs->user_sgprs_locs.descriptor_sets[0].sgpr_idx;
+    }
+    if ((ctx->stage == MESA_SHADER_VERTEX ||
+         (ctx->stage == MESA_SHADER_GEOMETRY && ctx->ngg)) &&
+        ctx->rargs->ac.vertex_buffers.used) {
+        metadata->vertex_buffer_table_valid = true;
+        metadata->vertex_buffer_table_user_data_dword =
+            ctx->rargs->user_sgprs_locs
+                .shader_data[AC_UD_VS_VERTEX_BUFFERS].sgpr_idx;
+    }
+    if ((ctx->stage == MESA_SHADER_VERTEX ||
+         (ctx->stage == MESA_SHADER_GEOMETRY && ctx->ngg)) &&
+        ctx->rargs->ac.base_vertex.used) {
+        metadata->base_vertex_valid = true;
+        metadata->base_vertex_user_data_dword =
+            ctx->rargs->user_sgprs_locs
+                .shader_data[AC_UD_VS_BASE_VERTEX_START_INSTANCE].sgpr_idx;
+    }
+    if ((ctx->stage == MESA_SHADER_VERTEX ||
+         (ctx->stage == MESA_SHADER_GEOMETRY && ctx->ngg)) &&
+        ctx->rargs->ac.start_instance.used) {
+        const struct ac_shader_args* args = &ctx->rargs->ac;
+        metadata->start_instance_valid = true;
+        metadata->start_instance_user_data_dword =
+            metadata->base_vertex_user_data_dword +
+            args->args[args->start_instance.arg_index].offset -
+            args->args[args->base_vertex.arg_index].offset;
+    }
+    if (ctx->rinfo->so.enabled_stream_buffers_mask &&
+        ctx->rargs->streamout_buffers.used &&
+        (ctx->ngg || (ctx->rargs->ac.streamout_config.used &&
+                      ctx->rargs->ac.streamout_write_index.used))) {
+        const struct ac_shader_args* args = &ctx->rargs->ac;
+        metadata->streamout_valid = true;
+        metadata->streamout_buffer_table_user_data_dword =
+            ctx->rargs->user_sgprs_locs
+                .shader_data[AC_UD_STREAMOUT_BUFFERS].sgpr_idx;
+        metadata->streamout_enabled_stream_buffers_mask =
+            ctx->rinfo->so.enabled_stream_buffers_mask;
+        if (!ctx->ngg) {
+            metadata->streamout_config_sgpr =
+                args->args[args->streamout_config.arg_index].offset;
+            metadata->streamout_write_index_sgpr =
+                args->args[args->streamout_write_index.arg_index].offset;
+        }
+        for (unsigned i = 0; i < 4; ++i) {
+            metadata->streamout_strides_dwords[i] =
+                ctx->rinfo->so.strides[i];
+            if (!ctx->ngg && args->streamout_offset[i].used)
+                metadata->streamout_offset_sgprs[i] =
+                    args->args[args->streamout_offset[i].arg_index].offset;
+        }
+    }
+    metadata->descriptor_binding_count =
+        ctx->options->descriptor_binding_count;
+    memcpy(metadata->descriptor_bindings, ctx->options->descriptor_bindings,
+           metadata->descriptor_binding_count *
+               sizeof(metadata->descriptor_bindings[0]));
+
+    PsbcRegisterWrite* cx = metadata->context_registers;
+    PsbcRegisterWrite* sh = metadata->shader_registers;
+    uint32_t* cx_count = &metadata->context_register_count;
+    uint32_t* sh_count = &metadata->shader_register_count;
+
+    if (ctx->stage == MESA_SHADER_FRAGMENT) {
+        const unsigned per_primitive_inputs = ctx->target == PSBC_TARGET_PS5 &&
+            ctx->options->primitive_id_per_primitive && ctx->rinfo->ps.prim_id_input;
+        const bool param_gen = ctx->gfx_level >= GFX11 &&
+                               !ctx->rinfo->ps.num_inputs &&
+                               ctx->config->lds_size;
+        metadata->hardware_stage = PSBC_HW_STAGE_PIXEL;
+        if (!ctx->input_semantics || !ctx->input_semantics->valid)
+            metadata->unresolved_fields |= PSBC_UNRESOLVED_AGC_LINKAGE;
+        else {
+            metadata->input_semantic_count = ctx->input_semantics->count;
+            memcpy(metadata->input_semantics, ctx->input_semantics->words,
+                   metadata->input_semantic_count *
+                       sizeof(metadata->input_semantics[0]));
+        }
+        metadata_add_register(cx, cx_count, PSBC_MAX_CONTEXT_REGISTERS,
+            PSBC_CX_OFFSET(R_028710_SPI_SHADER_Z_FORMAT),
+            ac_get_spi_shader_z_format(ctx->rinfo->ps.writes_z,
+                ctx->rinfo->ps.writes_stencil,
+                ctx->rinfo->ps.writes_sample_mask,
+                ctx->rinfo->ps.writes_mrt0_alpha));
+        metadata_add_register(cx, cx_count, PSBC_MAX_CONTEXT_REGISTERS,
+            PSBC_CX_OFFSET(R_028714_SPI_SHADER_COL_FORMAT),
+            compact_spi_shader_col_format(ctx->rinfo->ps.spi_shader_col_format));
+        metadata_add_register(cx, cx_count, PSBC_MAX_CONTEXT_REGISTERS,
+            PSBC_CX_OFFSET(R_0286CC_SPI_PS_INPUT_ENA),
+            ctx->config->spi_ps_input_ena);
+        metadata_add_register(cx, cx_count, PSBC_MAX_CONTEXT_REGISTERS,
+            PSBC_CX_OFFSET(R_0286D0_SPI_PS_INPUT_ADDR),
+            ctx->config->spi_ps_input_addr);
+        metadata_add_register(cx, cx_count, PSBC_MAX_CONTEXT_REGISTERS,
+            PSBC_CX_OFFSET(R_0286D8_SPI_PS_IN_CONTROL),
+            /* RADV normally leaves NUM_INTERP for its GFX10.3 pipeline linker
+             * because per-primitive inputs use a separate count.  AGC's
+             * standalone linker does not fill the per-vertex count for our
+             * generated package, so carry the compiler-proven count here. */
+            S_0286D8_NUM_INTERP(ctx->rinfo->ps.num_inputs - per_primitive_inputs) |
+            S_0286D8_NUM_PRIM_INTERP(per_primitive_inputs) |
+            S_0286D8_PS_W32_EN(ctx->rinfo->wave_size == 32) |
+            S_0286D8_PARAM_GEN(param_gen));
+        metadata_add_register(cx, cx_count, PSBC_MAX_CONTEXT_REGISTERS,
+            PSBC_CX_OFFSET(R_0286E0_SPI_BARYC_CNTL),
+            S_0286E0_FRONT_FACE_ALL_BITS(0));
+        metadata_add_register(cx, cx_count, PSBC_MAX_CONTEXT_REGISTERS,
+            PSBC_CX_OFFSET(R_02880C_DB_SHADER_CONTROL),
+            compute_db_shader_control(ctx->rinfo));
+        metadata_add_register(cx, cx_count, PSBC_MAX_CONTEXT_REGISTERS,
+            PSBC_CX_OFFSET(R_02823C_CB_SHADER_MASK),
+            ac_get_cb_shader_mask(ctx->rinfo->ps.spi_shader_col_format));
+        metadata_add_register(cx, cx_count, PSBC_MAX_CONTEXT_REGISTERS,
+            PSBC_CX_OFFSET(R_028C40_PA_SC_SHADER_CONTROL), 0);
+
+        metadata_add_register(sh, sh_count, PSBC_MAX_SHADER_REGISTERS,
+            PSBC_SH_OFFSET(R_00B020_SPI_SHADER_PGM_LO_PS), 0);
+        metadata_add_register(sh, sh_count, PSBC_MAX_SHADER_REGISTERS,
+            PSBC_SH_OFFSET(R_00B024_SPI_SHADER_PGM_HI_PS), 0);
+        metadata_add_register(sh, sh_count, PSBC_MAX_SHADER_REGISTERS,
+            PSBC_SH_OFFSET(R_00B028_SPI_SHADER_PGM_RSRC1_PS),
+            ctx->config->rsrc1);
+        metadata_add_register(sh, sh_count, PSBC_MAX_SHADER_REGISTERS,
+            PSBC_SH_OFFSET(R_00B02C_SPI_SHADER_PGM_RSRC2_PS),
+            ctx->config->rsrc2);
+        return;
+    }
+
+    if ((ctx->stage == MESA_SHADER_VERTEX ||
+         ctx->stage == MESA_SHADER_GEOMETRY) && ctx->ngg) {
+        const bool has_geometry = ctx->stage == MESA_SHADER_GEOMETRY;
+        const uint32_t nparams = MAX2(ctx->rinfo->outinfo.param_exports, 1);
+        const bool no_pc_export = ctx->rinfo->outinfo.param_exports == 0 &&
+                                  ctx->rinfo->outinfo.prim_param_exports == 0;
+        const unsigned num_prim_params = ctx->rinfo->outinfo.prim_param_exports;
+        const unsigned num_pos_exports = get_num_pos_exports(ctx->rinfo, NULL, NULL);
+        const uint32_t gs_num_invocations =
+            ctx->rinfo->stage == MESA_SHADER_GEOMETRY
+                ? ctx->rinfo->gs.invocations : 1;
+
+        metadata->hardware_stage = PSBC_HW_STAGE_NGG;
+        metadata->unresolved_fields |=
+            PSBC_UNRESOLVED_NGG_ESGS_RING_ITEMSIZE;
+        if (!fill_output_semantics(ctx->rinfo, metadata))
+            metadata->unresolved_fields |= PSBC_UNRESOLVED_AGC_LINKAGE;
+
+        metadata->linkage_valid = true;
+        metadata->linkage_ge_cntl = (PsbcRegisterWrite) {
+            .offset = PSBC_UC_OFFSET(R_03096C_GE_CNTL),
+            .value = S_03096C_PRIM_GRP_SIZE_GFX10(
+                         ctx->rinfo->ngg_info.max_gsprims) |
+                     S_03096C_VERT_GRP_SIZE(
+                         ctx->rinfo->ngg_info.hw_max_esverts),
+        };
+        metadata->linkage_stages_en = (PsbcRegisterWrite) {
+            .offset = PSBC_CX_OFFSET(R_028B54_VGT_SHADER_STAGES_EN),
+            /* Match RADV's GFX10 VGT shader-stage programming.  NGG runs
+             * through the ES/GS hardware path even without an API geometry
+             * shader.  A real GS must enable GS and cannot use NGG
+             * passthrough; otherwise its emitted primitives are skipped. */
+            .value = S_028B54_ES_EN(V_028B54_ES_STAGE_REAL) |
+                     S_028B54_GS_EN(has_geometry) |
+                     S_028B54_PRIMGEN_EN(1) |
+                     S_028B54_MAX_PRIMGRP_IN_WAVE(2) |
+                     S_028B54_GS_W32_EN(ctx->rinfo->wave_size == 32) |
+                     S_028B54_VS_W32_EN(!has_geometry &&
+                                        ctx->rinfo->wave_size == 32) |
+                     S_028B54_NGG_WAVE_ID_EN(
+                         ctx->rinfo->ngg_wave_id_en) |
+                     S_028B54_PRIMGEN_PASSTHRU_EN(
+                         ctx->rinfo->is_ngg_passthrough),
+        };
+        metadata->linkage_user_vgpr_en = (PsbcRegisterWrite) {
+            .offset = PSBC_UC_OFFSET(R_030988_GE_USER_VGPR_EN),
+            .value = 0,
+        };
+        metadata_add_register(cx, cx_count, PSBC_MAX_CONTEXT_REGISTERS,
+            PSBC_CX_OFFSET(R_0286C4_SPI_VS_OUT_CONFIG),
+            S_0286C4_VS_EXPORT_COUNT(nparams - 1) |
+            S_0286C4_PRIM_EXPORT_COUNT(num_prim_params) |
+            S_0286C4_NO_PC_EXPORT(no_pc_export));
+        metadata_add_register(cx, cx_count, PSBC_MAX_CONTEXT_REGISTERS,
+            PSBC_CX_OFFSET(R_028A84_VGT_PRIMITIVEID_EN),
+            S_028A84_NGG_DISABLE_PROVOK_REUSE(
+                ctx->stage == MESA_SHADER_VERTEX && ctx->rinfo->outinfo.export_prim_id));
+        metadata_add_register(cx, cx_count, PSBC_MAX_CONTEXT_REGISTERS,
+            PSBC_CX_OFFSET(R_02870C_SPI_SHADER_POS_FORMAT),
+            build_spi_shader_pos_format(num_pos_exports));
+        metadata_add_register(cx, cx_count, PSBC_MAX_CONTEXT_REGISTERS,
+            PSBC_CX_OFFSET(R_028708_SPI_SHADER_IDX_FORMAT),
+            S_028708_IDX0_EXPORT_FORMAT(V_028708_SPI_SHADER_1COMP));
+        metadata_add_register(cx, cx_count, PSBC_MAX_CONTEXT_REGISTERS,
+            PSBC_CX_OFFSET(R_02881C_PA_CL_VS_OUT_CNTL),
+            build_pa_cl_vs_out_cntl(ctx, num_pos_exports));
+        metadata_add_register(cx, cx_count, PSBC_MAX_CONTEXT_REGISTERS,
+            PSBC_CX_OFFSET(R_028B4C_GE_NGG_SUBGRP_CNTL),
+            S_028B4C_PRIM_AMP_FACTOR(ctx->rinfo->ngg_info.prim_amp_factor) |
+            S_028B4C_THDS_PER_SUBGRP(0));
+        metadata_add_register(cx, cx_count, PSBC_MAX_CONTEXT_REGISTERS,
+            PSBC_CX_OFFSET(R_028B90_VGT_GS_INSTANCE_CNT),
+            S_028B90_CNT(gs_num_invocations) |
+            S_028B90_ENABLE(gs_num_invocations > 1) |
+            S_028B90_EN_MAX_VERT_OUT_PER_GS_INSTANCE(
+                ctx->rinfo->ngg_info.max_vert_out_per_gs_instance));
+        metadata_add_register(cx, cx_count, PSBC_MAX_CONTEXT_REGISTERS,
+            PSBC_CX_OFFSET(R_028A44_VGT_GS_ONCHIP_CNTL),
+            S_028A44_ES_VERTS_PER_SUBGRP(ctx->rinfo->ngg_info.hw_max_esverts) |
+            S_028A44_GS_PRIMS_PER_SUBGRP(ctx->rinfo->ngg_info.max_gsprims) |
+            S_028A44_GS_INST_PRIMS_IN_SUBGRP(
+                ctx->rinfo->ngg_info.max_gsprims * gs_num_invocations));
+        metadata_add_register(cx, cx_count, PSBC_MAX_CONTEXT_REGISTERS,
+            PSBC_CX_OFFSET(R_0287FC_GE_MAX_OUTPUT_PER_SUBGROUP),
+            S_0287FC_MAX_VERTS_PER_SUBGROUP(
+                ctx->rinfo->ngg_info.max_out_verts));
+        metadata_add_register(cx, cx_count, PSBC_MAX_CONTEXT_REGISTERS,
+            PSBC_CX_OFFSET(R_028AAC_VGT_ESGS_RING_ITEMSIZE),
+            ctx->rinfo->ngg_info.vgt_esgs_ring_itemsize);
+        metadata_add_register(cx, cx_count, PSBC_MAX_CONTEXT_REGISTERS,
+            PSBC_CX_OFFSET(R_028B38_VGT_GS_MAX_VERT_OUT),
+            ctx->rinfo->gs.vertices_out);
+        if (has_geometry) {
+            uint32_t output_primitive = V_028A6C_TRISTRIP;
+
+            if (ctx->rinfo->gs.output_prim == MESA_PRIM_POINTS)
+                output_primitive = V_028A6C_POINTLIST;
+            else if (ctx->rinfo->gs.output_prim == MESA_PRIM_LINE_STRIP)
+                output_primitive = V_028A6C_LINESTRIP;
+
+            metadata_add_register(cx, cx_count, PSBC_MAX_CONTEXT_REGISTERS,
+                PSBC_CX_OFFSET(R_028A6C_VGT_GS_OUT_PRIM_TYPE),
+                S_028A6C_OUTPRIM_TYPE(output_primitive));
+        }
+
+        metadata_add_register(sh, sh_count, PSBC_MAX_SHADER_REGISTERS,
+            PSBC_SH_OFFSET(R_00B320_SPI_SHADER_PGM_LO_ES), 0);
+        metadata_add_register(sh, sh_count, PSBC_MAX_SHADER_REGISTERS,
+            PSBC_SH_OFFSET(R_00B324_SPI_SHADER_PGM_HI_ES), 0);
+        metadata_add_register(sh, sh_count, PSBC_MAX_SHADER_REGISTERS,
+            PSBC_SH_OFFSET(R_00B228_SPI_SHADER_PGM_RSRC1_GS),
+            ctx->config->rsrc1);
+        metadata_add_register(sh, sh_count, PSBC_MAX_SHADER_REGISTERS,
+            PSBC_SH_OFFSET(R_00B22C_SPI_SHADER_PGM_RSRC2_GS),
+            ctx->config->rsrc2);
+        if (ctx->target == PSBC_TARGET_PS5) {
+            /* GFX10 programs these for every NGG shader.  Keep late
+             * allocation disabled until the console CU topology is known;
+             * this is the conservative ac_compute_late_alloc fallback. */
+            metadata_add_register(sh, sh_count, PSBC_MAX_SHADER_REGISTERS,
+                PSBC_SH_OFFSET(R_00B21C_SPI_SHADER_PGM_RSRC3_GS),
+                S_00B21C_CU_EN(0xffff) | S_00B21C_WAVE_LIMIT(0x3f));
+            metadata_add_register(sh, sh_count, PSBC_MAX_SHADER_REGISTERS,
+                PSBC_SH_OFFSET(R_00B204_SPI_SHADER_PGM_RSRC4_GS),
+                S_00B204_CU_EN_GFX10(0xffff) |
+                S_00B204_SPI_SHADER_LATE_ALLOC_GS_GFX10(0));
+        }
+        return;
+    }
+
+    if (ctx->stage == MESA_SHADER_GEOMETRY) {
+        /* A standalone legacy GS proves NIR/ACO support, but it is not a
+         * complete GFX9+ pipeline: the pre-raster stage must be merged and
+         * the legacy path also needs a copy shader.  Do not mislabel this
+         * diagnostic artifact as a directly loadable vertex package. */
+        metadata->hardware_stage = PSBC_HW_STAGE_UNKNOWN;
+        metadata->unresolved_fields |= PSBC_UNRESOLVED_AGC_LINKAGE;
+        return;
+    }
+
+    if (ctx->stage == MESA_SHADER_VERTEX) {
+        const uint32_t nparams = MAX2(ctx->rinfo->outinfo.param_exports, 1);
+        const unsigned num_pos_exports =
+            get_num_pos_exports(ctx->rinfo, NULL, NULL);
+
+        metadata->hardware_stage = PSBC_HW_STAGE_VERTEX;
+        metadata->linkage_valid = true;
+        metadata->linkage_ge_cntl = (PsbcRegisterWrite) {
+            .offset = PSBC_UC_OFFSET(R_03096C_GE_CNTL),
+            .value = S_03096C_PRIM_GRP_SIZE_GFX10(128) |
+                     S_03096C_VERT_GRP_SIZE(256),
+        };
+        metadata->linkage_stages_en = (PsbcRegisterWrite) {
+            .offset = PSBC_CX_OFFSET(R_028B54_VGT_SHADER_STAGES_EN),
+            .value = S_028B54_MAX_PRIMGRP_IN_WAVE(2) |
+                     S_028B54_VS_W32_EN(ctx->rinfo->wave_size == 32),
+        };
+        metadata->linkage_user_vgpr_en = (PsbcRegisterWrite) {
+            .offset = PSBC_UC_OFFSET(R_030988_GE_USER_VGPR_EN),
+            .value = 0,
+        };
+
+        metadata_add_register(cx, cx_count, PSBC_MAX_CONTEXT_REGISTERS,
+            PSBC_CX_OFFSET(R_0286C4_SPI_VS_OUT_CONFIG),
+            S_0286C4_VS_EXPORT_COUNT(nparams - 1) |
+            S_0286C4_NO_PC_EXPORT(ctx->rinfo->outinfo.param_exports == 0));
+        metadata_add_register(cx, cx_count, PSBC_MAX_CONTEXT_REGISTERS,
+            PSBC_CX_OFFSET(R_02870C_SPI_SHADER_POS_FORMAT),
+            build_spi_shader_pos_format(num_pos_exports));
+        metadata_add_register(cx, cx_count, PSBC_MAX_CONTEXT_REGISTERS,
+            PSBC_CX_OFFSET(R_02881C_PA_CL_VS_OUT_CNTL),
+            build_pa_cl_vs_out_cntl(ctx, num_pos_exports));
+
+        metadata_add_register(sh, sh_count, PSBC_MAX_SHADER_REGISTERS,
+            PSBC_SH_OFFSET(R_00B120_SPI_SHADER_PGM_LO_VS), 0);
+        metadata_add_register(sh, sh_count, PSBC_MAX_SHADER_REGISTERS,
+            PSBC_SH_OFFSET(R_00B124_SPI_SHADER_PGM_HI_VS), 0);
+        metadata_add_register(sh, sh_count, PSBC_MAX_SHADER_REGISTERS,
+            PSBC_SH_OFFSET(R_00B128_SPI_SHADER_PGM_RSRC1_VS),
+            ctx->config->rsrc1);
+        metadata_add_register(sh, sh_count, PSBC_MAX_SHADER_REGISTERS,
+            PSBC_SH_OFFSET(R_00B12C_SPI_SHADER_PGM_RSRC2_VS),
+            ctx->config->rsrc2);
+        return;
+    }
+}
 
 /* Build the shader binary into a memory buffer instead of a file. */
 static PsbcResult buildshaderbinary(
@@ -287,7 +1010,7 @@ static PsbcResult buildshaderbinary(
             outputswritten * sizeof(GnmVertexExportSemantic);
         break;
     case MESA_SHADER_FRAGMENT:
-        shspecificsize += util_bitcount64(ctx->nir->info.inputs_read) *
+        shspecificsize += ctx->input_semantics->count *
                           sizeof(GnmPixelInputSemantic);
         break;
     case MESA_SHADER_GEOMETRY:
@@ -433,7 +1156,7 @@ static PsbcResult buildshaderbinary(
                         clip_dist_mask,
                 },
             .numinputsemantics =
-                util_bitcount64(ctx->nir->info.inputs_read),
+                ctx->input_semantics->count,
             .numexportsemantics = outputswritten,
         };
         memcpy(buf + offset, &vsh, sizeof(vsh));
@@ -465,18 +1188,16 @@ static PsbcResult buildshaderbinary(
                         ctx->rinfo->ps.writes_mrt0_alpha
                     ),
                     .spishadercolformat =
-                        ctx->rinfo->ps.spi_shader_col_format,
+                        compact_spi_shader_col_format(ctx->rinfo->ps.spi_shader_col_format),
                     .spipsinputena = ctx->config->spi_ps_input_ena,
                     .spipsinputaddr = ctx->config->spi_ps_input_addr,
                     .spipsincontrol =
-                        (ctx->gfx_level != GFX10_3
-                             ? S_0286D8_NUM_INTERP(ctx->rinfo->ps.num_inputs)
-                             : 0) |
+                        S_0286D8_NUM_INTERP(ctx->rinfo->ps.num_inputs) |
                         S_0286D8_PS_W32_EN(
                             ctx->rinfo->wave_size == 32
                         ) |
                         S_0286D8_PARAM_GEN(param_gen),
-                    .spibaryccntl = S_0286E0_FRONT_FACE_ALL_BITS(1),
+                    .spibaryccntl = S_0286E0_FRONT_FACE_ALL_BITS(0),
                     .dbshadercontrol = compute_db_shader_control(ctx->rinfo),
                     .cbshadermask = ac_get_cb_shader_mask(
                         ctx->rinfo->ps.spi_shader_col_format
@@ -524,8 +1245,8 @@ static PsbcResult buildshaderbinary(
         uint32_t gs_out_prim;
         switch (ctx->nir->info.gs.output_primitive) {
         case MESA_PRIM_POINTS:       gs_out_prim = V_028A6C_POINTLIST; break;
-        case MESA_PRIM_LINES:        gs_out_prim = V_028A6C_LINESTRIP; break;
-        case MESA_PRIM_TRIANGLES:    gs_out_prim = V_028A6C_TRISTRIP;  break;
+        case MESA_PRIM_LINE_STRIP:     gs_out_prim = V_028A6C_LINESTRIP; break;
+        case MESA_PRIM_TRIANGLE_STRIP: gs_out_prim = V_028A6C_TRISTRIP;  break;
         default:                     gs_out_prim = V_028A6C_TRISTRIP;  break;
         }
 
@@ -736,10 +1457,11 @@ static PsbcResult buildshaderbinary(
         }
         break;
     case MESA_SHADER_FRAGMENT:
-        for (uint32_t i = 0;
-             i < util_bitcount64(ctx->nir->info.inputs_read); i += 1) {
+        for (uint32_t i = 0; i < ctx->input_semantics->count; i += 1) {
+            const uint32_t word = ctx->input_semantics->words[i];
             const GnmPixelInputSemantic input = {
-                .semantic = 15 + i,
+                .semantic = word & 0xffu,
+                .isflatshaded = (word >> 22) & 1u,
             };
             memcpy(buf + offset, &input, sizeof(input));
             offset += sizeof(input);
@@ -852,19 +1574,21 @@ static PsbcResult buildshaderbinary(
 
 static void setup_ac_info(struct ac_compiler_info* ac_info, enum amd_gfx_level gfxlevel) {
     ac_info->gfx_level = gfxlevel;
+    ac_info->lds_size_per_workgroup = gfxlevel >= GFX7 ? 64 * 1024 : 32 * 1024;
 
     if (gfxlevel >= GFX10_3) {
         ac_info->max_waves_per_simd = 16;
-        ac_info->num_physical_sgprs_per_simd = 128 * 16;
-        ac_info->num_physical_wave64_vgprs_per_simd = 256;
+        ac_info->num_physical_sgprs_per_simd = 108 * 16;
+        ac_info->num_physical_wave64_vgprs_per_simd = 512;
         ac_info->num_simd_per_compute_unit = 2;
-        ac_info->min_sgpr_alloc = 1;
-        ac_info->max_sgpr_alloc = 128;
-        ac_info->sgpr_alloc_granularity = 1;
-        ac_info->min_wave64_vgpr_alloc = 4;
+        ac_info->min_sgpr_alloc = 108;
+        ac_info->max_sgpr_alloc = 108;
+        ac_info->sgpr_alloc_granularity = 108;
+        ac_info->min_wave64_vgpr_alloc = 8;
         ac_info->max_vgpr_alloc = 256;
-        ac_info->wave64_vgpr_alloc_granularity = 4;
+        ac_info->wave64_vgpr_alloc_granularity = 8;
         ac_info->has_packed_math_16bit = true;
+        /* PS5/GFX1013 does not implement accelerated integer dot products. */
         ac_info->has_fma_mix = true;
     } else if (gfxlevel == GFX10) {
         ac_info->max_waves_per_simd = 20;
@@ -928,26 +1652,173 @@ static void setup_target(PsbcTarget target,
     }
 }
 
+static pthread_once_t g_ps5_nir_options_once = PTHREAD_ONCE_INIT;
+static struct ac_compiler_info g_ps5_nir_ac_info;
+static struct radv_compiler_info g_ps5_nir_compiler_info;
+
+static void init_ps5_nir_options(void) {
+    setup_ac_info(&g_ps5_nir_ac_info, GFX10_3);
+    g_ps5_nir_compiler_info.ac = &g_ps5_nir_ac_info;
+    g_ps5_nir_compiler_info.key.family = CHIP_NAVI21;
+    g_ps5_nir_compiler_info.key.ge_wave_size = 64;
+    g_ps5_nir_compiler_info.key.ps_wave_size = 32;
+    g_ps5_nir_compiler_info.key.cs_wave_size = 32;
+    g_ps5_nir_compiler_info.key.rt_wave_size = 64;
+    radv_get_nir_options(&g_ps5_nir_compiler_info);
+}
+
+const struct nir_shader_compiler_options*
+psbc_get_nir_options(PsbcStage stage) {
+    const mesa_shader_stage mesa_stage = psbc_to_mesa_stage(stage);
+
+    if (mesa_stage == MESA_SHADER_NONE ||
+        mesa_stage >= MESA_VULKAN_SHADER_STAGES)
+        return NULL;
+    pthread_once(&g_ps5_nir_options_once, init_ps5_nir_options);
+    return &g_ps5_nir_compiler_info.nir_options[mesa_stage];
+}
+
 /* === Main compilation function === */
 
-PsbcResult psbc_compile_shader(
+static bool psbc_licm_speculatable(nir_instr* instr, nir_loop* loop,
+                                   bool instr_block_dominates_exit) {
+    (void)loop;
+    (void)instr_block_dominates_exit;
+    return nir_instr_can_speculate(instr);
+}
+
+static nir_shader* prepare_stage_nir(
+    const struct radv_compiler_info* compiler_info,
+    struct radv_shader_stage* stage,
+    const uint32_t* spirv,
+    size_t spirv_size,
+    const nir_shader* input_nir,
+    const PsbcCompileOptions* opts
+) {
+    stage->spirv.data = (const char*)spirv;
+    stage->spirv.size = spirv_size;
+    stage->entrypoint = opts->entrypoint ? opts->entrypoint : "main";
+    stage->key.optimisations_disabled = !opts->optimise;
+
+    if (input_nir)
+        stage->internal_nir = (nir_shader*)input_nir;
+
+    const struct radv_spirv_to_nir_options spirv_options = {
+        .lower_view_index_to_zero = true,
+        .lower_view_index_to_device_index = false,
+    };
+    nir_shader* nir = radv_shader_spirv_to_nir(
+        compiler_info, stage, &spirv_options, false
+    );
+    if (!nir)
+        return NULL;
+
+    if (input_nir) {
+        if (opts->descriptor_binding_count)
+            nir_shader_instructions_pass(nir, lower_gallium_ubo_index,
+                                         nir_metadata_control_flow, NULL);
+
+        /* radv_shader_spirv_to_nir() normalizes these only on its SPIR-V
+         * path.  Gallium supplies internal NIR, while ACO accepts only the
+         * normalized 2*pi operations. */
+        NIR_PASS(_, nir, nir_normalize_sin_cos);
+    }
+
+    radv_optimize_nir(nir, !opts->optimise);
+
+    bool indirect_derefs_lowered = false;
+    NIR_PASS(indirect_derefs_lowered, nir, ac_nir_lower_indirect_derefs);
+    NIR_PASS(_, nir, nir_lower_vars_to_ssa);
+    if (indirect_derefs_lowered) {
+        NIR_PASS(_, nir, nir_lower_undef_to_zero, NULL);
+        const nir_opt_peephole_select_options flatten_indirect_arrays = {
+            .limit = 10,
+            .indirect_load_ok = true,
+            .expensive_alu_ok = true,
+            .discard_ok = true,
+        };
+        NIR_PASS(_, nir, nir_opt_peephole_select,
+                 &flatten_indirect_arrays);
+        if (opts->optimise)
+            radv_optimize_nir(nir, false);
+    }
+    nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+    radv_nir_lower_io(nir);
+    stage->nir = nir;
+    return nir;
+}
+
+static PsbcResult psbc_compile_impl(
     const uint32_t*       spirv,
     size_t                spirv_size,
+    const nir_shader*     input_nir,
+    const uint32_t*       previous_spirv,
+    size_t                previous_spirv_size,
+    const nir_shader*     previous_input_nir,
     const PsbcCompileOptions* opts,
     PsbcShaderOutput*     out
 ) {
-    if (!spirv || !opts || !out)
+    if ((!spirv && !input_nir) || !opts || !out)
         return PSBC_RESULT_INTERNAL_ERROR;
 
     memset(out, 0, sizeof(*out));
 
-    /* Validate SPIR-V header */
-    if (spirv_size < 4 || spirv[0] != 0x07230203u)
+    /* Validate SPIR-V header when the caller did not supply NIR. */
+    if (!input_nir && (spirv_size < 4 || spirv[0] != 0x07230203u))
         return PSBC_RESULT_INVALID_SPIRV;
 
+    const bool paired_geometry = previous_spirv || previous_input_nir;
     mesa_shader_stage mesa_stage = psbc_to_mesa_stage(opts->stage);
     if (mesa_stage == MESA_SHADER_NONE)
         return PSBC_RESULT_UNSUPPORTED_STAGE;
+    if (paired_geometry &&
+        (mesa_stage != MESA_SHADER_GEOMETRY || !opts->ngg ||
+         opts->target != PSBC_TARGET_PS5))
+        return PSBC_RESULT_UNSUPPORTED_STAGE;
+    if (opts->ps5_global_streamout && !paired_geometry)
+        return PSBC_RESULT_UNSUPPORTED_STAGE;
+    if (opts->primitive_id_per_primitive &&
+        (opts->target != PSBC_TARGET_PS5 || mesa_stage != MESA_SHADER_FRAGMENT))
+        return PSBC_RESULT_UNSUPPORTED_STAGE;
+    if (previous_input_nir &&
+        previous_input_nir->info.stage != MESA_SHADER_VERTEX)
+        return PSBC_RESULT_UNSUPPORTED_STAGE;
+    if (previous_spirv &&
+        (previous_spirv_size < 4 || previous_spirv[0] != 0x07230203u))
+        return PSBC_RESULT_INVALID_SPIRV;
+    if (opts->ngg &&
+        (opts->target != PSBC_TARGET_PS5 ||
+         (mesa_stage != MESA_SHADER_VERTEX && !paired_geometry)))
+        return PSBC_RESULT_UNSUPPORTED_STAGE;
+    if (opts->descriptor_binding_count > PSBC_MAX_DESCRIPTOR_BINDINGS)
+        return PSBC_RESULT_INTERNAL_ERROR;
+    if ((opts->color_is_int8 | opts->color_is_int10) & ~UINT32_C(0xff))
+        return PSBC_RESULT_INTERNAL_ERROR;
+    for (unsigned i = 0; i < 8; ++i)
+        if (((opts->spi_shader_col_format >> (4 * i)) & 0xf) >
+            V_028714_SPI_SHADER_32_ABGR)
+            return PSBC_RESULT_INTERNAL_ERROR;
+    for (uint32_t i = 0; i < opts->descriptor_binding_count; ++i) {
+        const PsbcDescriptorBinding* binding = &opts->descriptor_bindings[i];
+        const bool valid_type =
+            binding->type == PSBC_DESCRIPTOR_UNIFORM_BUFFER ||
+            binding->type == PSBC_DESCRIPTOR_COMBINED_IMAGE_SAMPLER ||
+            binding->type == PSBC_DESCRIPTOR_STORAGE_BUFFER;
+        const uint32_t expected_stride =
+            binding->type == PSBC_DESCRIPTOR_COMBINED_IMAGE_SAMPLER ? 48u : 16u;
+        if (binding->set != 0 || binding->binding >= PSBC_MAX_DESCRIPTOR_BINDINGS ||
+            !valid_type || !binding->array_size ||
+            binding->stride != expected_stride ||
+            (binding->offset & 15u) ||
+            (uint64_t)binding->offset +
+                    (uint64_t)binding->array_size * binding->stride >
+                UINT32_MAX)
+            return PSBC_RESULT_INTERNAL_ERROR;
+        for (uint32_t j = 0; j < i; ++j)
+            if (opts->descriptor_bindings[j].set == binding->set &&
+                opts->descriptor_bindings[j].binding == binding->binding)
+                return PSBC_RESULT_INTERNAL_ERROR;
+    }
 
     /* Ensure library is initialized */
     psbc_init();
@@ -961,17 +1832,39 @@ PsbcResult psbc_compile_shader(
     /* Construct ac_compiler_info for the target GPU */
     struct ac_compiler_info ac_info = {0};
     setup_ac_info(&ac_info, gfxlevel);
+    if (opts->force_accelerated_dot)
+        ac_info.has_accelerated_dot_product = true;
 
     /* Construct radv_compiler_info */
     struct radv_compiler_info compiler_info = {0};
     compiler_info.ac = &ac_info;
-    compiler_info.hw.address32_hi = 0;
+    compiler_info.spirv_caps.Shader = true;
+    compiler_info.spirv_caps.Geometry = true;
+    compiler_info.spirv_caps.TransformFeedback = true;
+    compiler_info.spirv_caps.DotProduct = true;
+    compiler_info.spirv_caps.DotProductInput4x8BitPacked = true;
+    if (opts->force_accelerated_dot) {
+        compiler_info.spirv_caps.Int16 = true;
+        compiler_info.spirv_caps.DotProductInputAll = true;
+    }
+    compiler_info.hw.address32_hi = opts->address32_hi;
+    compiler_info.sampled_image_desc_size = 32;
+    compiler_info.combined_image_sampler_desc_size = 48;
+    compiler_info.combined_image_sampler_offset = 32;
+    compiler_info.sampler_descriptor_size = 16;
+    compiler_info.sampler_descriptor_alignment = 16;
+    compiler_info.image_descriptor_size = 32;
+    compiler_info.image_descriptor_alignment = 16;
+    compiler_info.buffer_descriptor_size = 16;
+    compiler_info.buffer_descriptor_alignment = 16;
     compiler_info.key.ge_wave_size = 64;
     compiler_info.key.ps_wave_size = (gfxlevel >= GFX10_3) ? 32 : 64;
     compiler_info.key.cs_wave_size = (gfxlevel >= GFX10_3) ? 32 : 64;
     compiler_info.key.rt_wave_size = 64;
     compiler_info.key.family = chipfamily;
     compiler_info.key.load_grid_size_from_user_sgpr = (gfxlevel >= GFX10_3);
+    compiler_info.key.use_ngg = opts->ngg;
+    compiler_info.key.ps5_global_streamout = opts->ps5_global_streamout;
     /* ACO uses debug.family for disassembly and init_program assertion */
     compiler_info.debug.family = chipfamily;
 
@@ -981,6 +1874,7 @@ PsbcResult psbc_compile_shader(
     /* Construct radv_shader_stage */
     struct radv_shader_stage stage = {0};
     stage.stage = mesa_stage;
+    stage.key.keep_executable_info = getenv("PSBC_DEBUG_DISASM") != NULL;
     /* Set next_stage based on the pipeline graph.
      * For standalone compilation we assume the simplest pipeline:
      *   VS → FS, VS → HS → DS → FS, VS → GS → FS
@@ -992,46 +1886,363 @@ PsbcResult psbc_compile_shader(
     case MESA_SHADER_GEOMETRY:  stage.next_stage = MESA_SHADER_FRAGMENT;     break;
     default:                    stage.next_stage = MESA_SHADER_NONE;         break;
     }
-    stage.spirv.data = (const char*)spirv;
-    stage.spirv.size = spirv_size;
-    stage.entrypoint = opts->entrypoint ? opts->entrypoint : "main";
-    stage.key.optimisations_disabled = !opts->optimise;
-
-    /* SPIR-V to NIR */
-    const struct radv_spirv_to_nir_options spirv_options = {
-        .lower_view_index_to_zero = true,
-        .lower_view_index_to_device_index = false,
-    };
-
-    nir_shader* nir = radv_shader_spirv_to_nir(
-        &compiler_info, &stage, &spirv_options, false
+    if (input_nir && input_nir->info.stage != mesa_stage) {
+        psbc_shutdown();
+        return PSBC_RESULT_UNSUPPORTED_STAGE;
+    }
+    debug_stage(input_nir ? "import-nir-begin" : "import-spirv-begin");
+    nir_shader* nir = prepare_stage_nir(
+        &compiler_info, &stage, spirv, spirv_size, input_nir, opts
     );
-
     if (!nir) {
         psbc_shutdown();
         return PSBC_RESULT_COMPILE_NIR;
     }
+    debug_stage(input_nir ? "import-nir-end" : "import-spirv-end");
+    debug_shader_io(input_nir ? "input-NIR" : "SPIR-V", nir, NULL);
+    debug_shader_io("lowered-io", nir, NULL);
 
-    /* Optimize NIR */
-    radv_optimize_nir(nir, !opts->optimise);
-
-    /* Gather info again — outputs_read can be out-of-date */
-    nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
-    radv_nir_lower_io(nir);
+    const bool dual_source_blend =
+        mesa_stage == MESA_SHADER_FRAGMENT &&
+        (nir->info.outputs_written &
+         BITFIELD64_BIT(FRAG_RESULT_DUAL_SRC_BLEND));
+    struct radv_shader_stage previous = {0};
+    nir_shader* previous_nir = NULL;
+    if (paired_geometry) {
+        previous.stage = MESA_SHADER_VERTEX;
+        previous.next_stage = MESA_SHADER_GEOMETRY;
+        previous_nir = prepare_stage_nir(
+            &compiler_info, &previous, previous_spirv, previous_spirv_size,
+            previous_input_nir, opts
+        );
+        if (!previous_nir) {
+            ralloc_free(nir);
+            psbc_shutdown();
+            return PSBC_RESULT_COMPILE_NIR;
+        }
+        debug_shader_io(previous_input_nir ? "previous-NIR" :
+                                               "previous-SPIR-V",
+                        previous_nir, NULL);
+    }
 
     /* Shader info + args + postprocess */
+    stage.nir = nir;
     radv_nir_shader_info_init(stage.stage, stage.next_stage, &stage.info);
+    stage.info.is_ngg = opts->ngg;
+    if (paired_geometry) {
+        radv_nir_shader_info_init(previous.stage, previous.next_stage,
+                                  &previous.info);
+        previous.info.is_ngg = true;
+        NIR_PASS(_, nir, nir_lower_gs_intrinsics,
+                 nir_lower_gs_intrinsics_per_stream |
+                 nir_lower_gs_intrinsics_count_primitives |
+                 nir_lower_gs_intrinsics_count_vertices_per_primitive |
+                 nir_lower_gs_intrinsics_overwrite_incomplete);
+        NIR_PASS(_, nir, nir_lower_vars_to_ssa);
+
+        /* Both shaders are passed to ACO as one merged program.  Mark their
+         * existing shared driver-location interface accordingly; otherwise
+         * RADV selects the ABI for independently compiled merged halves. */
+        const unsigned linked_slots = util_bitcount64(nir->info.inputs_read);
+        previous.info.vs.num_linked_outputs = linked_slots;
+        previous.info.outputs_linked = true;
+        stage.info.gs.num_linked_inputs = linked_slots;
+        stage.info.inputs_linked = true;
+    }
 
     struct radv_shader_layout layout = {0};
+    _Alignas(struct radv_descriptor_set_layout)
+        uint8_t descriptor_set0_storage[
+            sizeof(struct radv_descriptor_set_layout) +
+            PSBC_MAX_DESCRIPTOR_BINDINGS *
+                sizeof(struct radv_descriptor_set_binding_layout)] = {0};
+    if (opts->descriptor_binding_count) {
+        struct radv_descriptor_set_layout* set_layout =
+            (struct radv_descriptor_set_layout*)descriptor_set0_storage;
+        uint32_t binding_count = 0;
+        uint32_t set_size = 0;
+        for (uint32_t i = 0; i < opts->descriptor_binding_count; ++i) {
+            const PsbcDescriptorBinding* source =
+                &opts->descriptor_bindings[i];
+            struct radv_descriptor_set_binding_layout* target =
+                &set_layout->binding[source->binding];
+            target->type = source->type == PSBC_DESCRIPTOR_UNIFORM_BUFFER
+                               ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
+                           : source->type == PSBC_DESCRIPTOR_STORAGE_BUFFER
+                               ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
+                               : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            target->array_size = source->array_size;
+            target->offset = source->offset;
+            target->size = source->stride;
+            binding_count = MAX2(binding_count, source->binding + 1u);
+            set_size = MAX2(set_size, source->offset +
+                                      source->array_size * source->stride);
+        }
+        set_layout->binding_count = binding_count;
+        set_layout->size = set_size;
+        layout.num_sets = 1;
+        layout.set[0].layout = set_layout;
+    }
+    stage.layout = layout;
+    if (paired_geometry)
+        previous.layout = layout;
     struct radv_graphics_state_key gfx_state = {0};
-    gfx_state.ps.epilog.spi_shader_col_format = V_028714_SPI_SHADER_FP16_ABGR;
-    gfx_state.ps.epilog.color_is_int8 = 0xff;
+    gfx_state.rs.provoking_vtx_last = opts->provoking_vtx_last;
+    if (opts->rasterization_samples != 0 &&
+        opts->rasterization_samples != 1 &&
+        opts->rasterization_samples != 2 &&
+        opts->rasterization_samples != 4 &&
+        opts->rasterization_samples != 8) {
+        if (previous_nir)
+            ralloc_free(previous_nir);
+        ralloc_free(nir);
+        psbc_shutdown();
+        return PSBC_RESULT_INTERNAL_ERROR;
+    }
+    gfx_state.ms.rasterization_samples = opts->rasterization_samples;
+    switch (opts->primitive_type) {
+    case 0:
+        break;
+    case 1:
+        gfx_state.ia.topology = V_008958_DI_PT_POINTLIST;
+        break;
+    case 2:
+        gfx_state.ia.topology = V_008958_DI_PT_LINELIST;
+        break;
+    case 3:
+        gfx_state.ia.topology = V_008958_DI_PT_LINESTRIP;
+        break;
+    case 4:
+        gfx_state.ia.topology = V_008958_DI_PT_TRILIST;
+        break;
+    case 5:
+        gfx_state.ia.topology = V_008958_DI_PT_TRIFAN;
+        break;
+    case 6:
+        gfx_state.ia.topology = V_008958_DI_PT_TRISTRIP;
+        break;
+    case 10:
+        gfx_state.ia.topology = V_008958_DI_PT_LINELIST_ADJ;
+        break;
+    case 11:
+        gfx_state.ia.topology = V_008958_DI_PT_LINESTRIP_ADJ;
+        break;
+    case 12:
+        gfx_state.ia.topology = V_008958_DI_PT_TRILIST_ADJ;
+        break;
+    case 13:
+        gfx_state.ia.topology = V_008958_DI_PT_TRISTRIP_ADJ;
+        break;
+    default:
+        if (previous_nir)
+            ralloc_free(previous_nir);
+        ralloc_free(nir);
+        psbc_shutdown();
+        return PSBC_RESULT_INTERNAL_ERROR;
+    }
+    /* The frontend keys these exports by framebuffer format. Keep the legacy
+     * defaults for standalone callers that do not provide framebuffer state. */
+    gfx_state.ps.epilog.spi_shader_col_format = opts->spi_shader_col_format
+        ? opts->spi_shader_col_format : UINT32_C(0x99999999);
+    gfx_state.ps.epilog.color_is_int8 = opts->spi_shader_col_format
+        ? opts->color_is_int8 : 0xff;
+    gfx_state.ps.epilog.color_is_int10 = opts->spi_shader_col_format
+        ? opts->color_is_int10 : 0;
     gfx_state.ps.has_epilog = false;
+    if (dual_source_blend) {
+        gfx_state.ps.epilog.mrt0_is_dual_src = true;
+        /* Both sources feed MRT0, including its precision and clamp rules. */
+        unsigned format = opts->spi_shader_col_format
+            ? opts->spi_shader_col_format & 0xf : V_028714_SPI_SHADER_FP16_ABGR;
+        gfx_state.ps.epilog.spi_shader_col_format = format * 0x11;
+        gfx_state.ps.epilog.color_is_int8 = opts->spi_shader_col_format
+            ? (opts->color_is_int8 & 1) * 3 : 0;
+        gfx_state.ps.epilog.color_is_int10 = opts->spi_shader_col_format
+            ? (opts->color_is_int10 & 1) * 3 : 0;
+    }
+    for (uint32_t i = 0; i < opts->vertex_attribute_count; ++i) {
+        const PsbcVertexAttribute* attribute = &opts->vertex_attributes[i];
+        enum pipe_format format = PIPE_FORMAT_NONE;
+        switch (attribute->format) {
+        case PSBC_VERTEX_FORMAT_R32_FLOAT:
+            format = PIPE_FORMAT_R32_FLOAT;
+            break;
+        case PSBC_VERTEX_FORMAT_R32G32_FLOAT:
+            format = PIPE_FORMAT_R32G32_FLOAT;
+            break;
+        case PSBC_VERTEX_FORMAT_R32G32B32_FLOAT:
+            format = PIPE_FORMAT_R32G32B32_FLOAT;
+            break;
+        case PSBC_VERTEX_FORMAT_R32G32B32A32_FLOAT:
+            format = PIPE_FORMAT_R32G32B32A32_FLOAT;
+            break;
+        case PSBC_VERTEX_FORMAT_B8G8R8A8_UNORM:
+            format = PIPE_FORMAT_B8G8R8A8_UNORM;
+            break;
+        case PSBC_VERTEX_FORMAT_R8G8B8A8_UNORM:
+            format = PIPE_FORMAT_R8G8B8A8_UNORM;
+            break;
+        case PSBC_VERTEX_FORMAT_R10G10B10A2_UNORM:
+            format = PIPE_FORMAT_R10G10B10A2_UNORM;
+            break;
+        case PSBC_VERTEX_FORMAT_B10G10R10A2_UNORM:
+            format = PIPE_FORMAT_B10G10R10A2_UNORM;
+            break;
+        case PSBC_VERTEX_FORMAT_R10G10B10A2_SNORM:
+            format = PIPE_FORMAT_R10G10B10A2_SNORM;
+            break;
+        case PSBC_VERTEX_FORMAT_B10G10R10A2_SNORM:
+            format = PIPE_FORMAT_B10G10R10A2_SNORM;
+            break;
+        case PSBC_VERTEX_FORMAT_R10G10B10A2_USCALED:
+            format = PIPE_FORMAT_R10G10B10A2_USCALED;
+            break;
+        case PSBC_VERTEX_FORMAT_B10G10R10A2_USCALED:
+            format = PIPE_FORMAT_B10G10R10A2_USCALED;
+            break;
+        case PSBC_VERTEX_FORMAT_R10G10B10A2_SSCALED:
+            format = PIPE_FORMAT_R10G10B10A2_SSCALED;
+            break;
+        case PSBC_VERTEX_FORMAT_B10G10R10A2_SSCALED:
+            format = PIPE_FORMAT_B10G10R10A2_SSCALED;
+            break;
+        case PSBC_VERTEX_FORMAT_R32_SINT:
+            format = PIPE_FORMAT_R32_SINT;
+            break;
+        case PSBC_VERTEX_FORMAT_R32G32_SINT:
+            format = PIPE_FORMAT_R32G32_SINT;
+            break;
+        case PSBC_VERTEX_FORMAT_R32G32B32_SINT:
+            format = PIPE_FORMAT_R32G32B32_SINT;
+            break;
+        case PSBC_VERTEX_FORMAT_R32G32B32A32_SINT:
+            format = PIPE_FORMAT_R32G32B32A32_SINT;
+            break;
+        case PSBC_VERTEX_FORMAT_R32_UINT:
+            format = PIPE_FORMAT_R32_UINT;
+            break;
+        case PSBC_VERTEX_FORMAT_R32G32_UINT:
+            format = PIPE_FORMAT_R32G32_UINT;
+            break;
+        case PSBC_VERTEX_FORMAT_R32G32B32_UINT:
+            format = PIPE_FORMAT_R32G32B32_UINT;
+            break;
+        case PSBC_VERTEX_FORMAT_R32G32B32A32_UINT:
+            format = PIPE_FORMAT_R32G32B32A32_UINT;
+            break;
+        default:
+            if (previous_nir)
+                ralloc_free(previous_nir);
+            ralloc_free(nir);
+            psbc_shutdown();
+            return PSBC_RESULT_INTERNAL_ERROR;
+        }
+        if (attribute->location >= PSBC_MAX_VERTEX_ATTRIBUTES ||
+            attribute->binding >= MAX_VBS ||
+            (!attribute->stride && opts->target != PSBC_TARGET_PS5) ||
+            !attribute->alignment) {
+            if (previous_nir)
+                ralloc_free(previous_nir);
+            ralloc_free(nir);
+            psbc_shutdown();
+            return PSBC_RESULT_INTERNAL_ERROR;
+        }
+        const uint32_t location = attribute->location;
+        gfx_state.vi.attributes_valid |= BITFIELD_BIT(location);
+        gfx_state.vi.vertex_attribute_formats[location] = format;
+        gfx_state.vi.vertex_attribute_bindings[location] =
+            attribute->binding;
+        gfx_state.vi.vertex_attribute_offsets[location] = attribute->offset;
+        gfx_state.vi.vertex_attribute_strides[location] = attribute->stride;
+        gfx_state.vi.vertex_binding_align[attribute->binding] =
+            attribute->alignment;
+        if (attribute->instance_divisor) {
+            gfx_state.vi.instance_rate_inputs |= BITFIELD_BIT(location);
+            gfx_state.vi.instance_rate_divisors[location] =
+                attribute->instance_divisor;
+        }
+    }
+
+    /* RADV normally lowers fragment coordinates before collecting shader
+     * info.  Keep standalone compilation in that order so the PS argument
+     * map enables POS_FIXED_PT when the optimization selects it. */
+    if (mesa_stage == MESA_SHADER_FRAGMENT &&
+        !gfx_state.ms.sample_shading_enable &&
+        !nir->info.fs.uses_sample_shading)
+        NIR_PASS(_, nir, radv_nir_lower_opt_fs_frag_pos,
+                 gfx_state.vrs_may_be_enabled,
+                 gfx_state.ms.sample_shading_enable ||
+                    nir->info.fs.uses_sample_shading);
 
     radv_nir_shader_info_pass(
         &compiler_info, nir, &layout, &stage.key, &gfx_state,
         RADV_PIPELINE_GRAPHICS, false, &stage.info
     );
+    if (paired_geometry) {
+        radv_nir_shader_info_pass(
+            &compiler_info, previous_nir, &layout, &previous.key, &gfx_state,
+            RADV_PIPELINE_GRAPHICS, false, &previous.info
+        );
+    }
+    /* Legacy Gallium texture indices carry no Vulkan deref for RADV's info
+     * pass to discover. The explicit PSBC layout still requires set 0. */
+    if (opts->descriptor_binding_count)
+        stage.info.desc_set_used_mask |= 1u;
+    if (paired_geometry && opts->descriptor_binding_count)
+        previous.info.desc_set_used_mask |= 1u;
+    debug_stage("shader-info-end");
+    debug_shader_io("info", nir, &stage.info);
+    if (paired_geometry)
+        debug_shader_io("previous-info", previous_nir, &previous.info);
+
+    if (opts->ngg) {
+        struct radv_shader_stage stages[MESA_VULKAN_SHADER_STAGES] = {0};
+        stages[mesa_stage] = stage;
+        if (paired_geometry)
+            stages[MESA_SHADER_VERTEX] = previous;
+        radv_nir_shader_info_link(&compiler_info, &gfx_state, stages);
+        stage.info = stages[mesa_stage].info;
+        if (paired_geometry)
+            previous.info = stages[MESA_SHADER_VERTEX].info;
+        /* Standalone linking conservatively adds PrimitiveID without an FS.
+         * Drop only the implicit, final per-primitive parameter when the
+         * caller has proved it dead. Keep explicit outputs and unknown
+         * consumers unchanged, and update both code lowering and metadata. */
+        if (mesa_stage == MESA_SHADER_VERTEX &&
+            !(nir->info.outputs_written & VARYING_BIT_PRIMITIVE_ID) &&
+            stage.info.outinfo.export_prim_id_per_primitive &&
+            stage.info.outinfo.prim_param_exports == 1 &&
+            stage.info.outinfo.vs_output_param_offset[VARYING_SLOT_PRIMITIVE_ID] ==
+                stage.info.outinfo.param_exports) {
+            if (opts->omit_implicit_primitive_id) {
+                stage.info.outinfo.export_prim_id_per_primitive = false;
+                stage.info.outinfo.prim_param_exports = 0;
+                stage.info.outinfo.vs_output_param_offset[VARYING_SLOT_PRIMITIVE_ID] =
+                    AC_EXP_PARAM_UNDEFINED;
+            } else if (opts->target == PSBC_TARGET_PS5) {
+                /* Native traces have correct counts/offsets but undefined
+                 * per-primitive ID values. Use Mesa's per-vertex LDS route:
+                 * retain the export slot, disable passthrough, and let the
+                 * existing NGG pass size LDS and insert its barrier. */
+                stage.info.outinfo.export_prim_id_per_primitive = false;
+                stage.info.outinfo.prim_param_exports = 0;
+                stage.info.outinfo.export_prim_id = true;
+                ++stage.info.outinfo.param_exports;
+                stage.info.is_ngg_passthrough = false;
+            }
+        }
+        debug_shader_io("linked", nir, &stage.info);
+    }
+
+    /* PSBC exposes one explicit set-0 table to its standalone caller.  Do not
+     * inherit RADV's pipeline-library indirection for merged shaders: the
+     * direct set pointer fits the PS5 merged user-SGPR budget and matches the
+     * public metadata/runtime ABI. */
+    if (opts->descriptor_binding_count) {
+        stage.info.force_indirect_descriptors = false;
+        if (paired_geometry)
+            previous.info.force_indirect_descriptors = false;
+    }
 
     /* Determine previous stage for shader args declaration.
      * HS/GS need previous_stage=VERTEX so that the merged-pipeline args
@@ -1049,10 +2260,16 @@ PsbcResult psbc_compile_shader(
     radv_declare_shader_args(
         &compiler_info, &gfx_state, &stage, previous_stage, NULL
     );
+    debug_stage("declare-args-end");
 
-    stage.nir = nir;
     stage.info.user_sgprs_locs = stage.args.user_sgprs_locs;
     stage.info.inline_push_constant_mask = stage.args.ac.inline_push_const_mask;
+    if (paired_geometry) {
+        previous.args = stage.args;
+        previous.info.user_sgprs_locs = stage.info.user_sgprs_locs;
+        previous.info.inline_push_constant_mask =
+            stage.info.inline_push_constant_mask;
+    }
 
     /* For geometry shaders, run the legacy GS lowering pass.
      * On GFX10.3 (PS5), NGG GS requires merging with the previous stage,
@@ -1080,16 +2297,72 @@ PsbcResult psbc_compile_shader(
             ralloc_free(gs_copy);
     }
 
-    radv_postprocess_nir(
-        &compiler_info, &gfx_state, &stage
-    );
+    if (paired_geometry)
+        radv_postprocess_nir(&compiler_info, &gfx_state, &previous);
+    radv_postprocess_nir(&compiler_info, &gfx_state, &stage);
+    if (mesa_stage == MESA_SHADER_FRAGMENT &&
+        opts->target == PSBC_TARGET_PS5 && opts->provoking_vtx_last) {
+        unsigned vertex_id =
+            ps5_last_provoking_vertex(opts->primitive_type);
+        if (vertex_id)
+            nir_shader_intrinsics_pass(nir, lower_flat_input_vertex,
+                                       nir_metadata_control_flow,
+                                       (void*)opts);
+    }
+    if (mesa_stage == MESA_SHADER_FRAGMENT &&
+        opts->target == PSBC_TARGET_PS5 &&
+        !split_ps5_mixed_inputs(nir, &stage.info, opts->primitive_id_per_primitive)) {
+        if (previous_nir)
+            ralloc_free(previous_nir);
+        ralloc_free(nir);
+        psbc_shutdown();
+        return PSBC_RESULT_INTERNAL_ERROR;
+    }
+    NIR_PASS(_, nir, nir_opt_licm, psbc_licm_speculatable);
+    debug_stage("postprocess-end");
+    debug_shader_io("postprocess", nir, &stage.info);
+    if (getenv("PSBC_DEBUG_NIR"))
+        nir_print_shader(nir, stderr);
+
+    /* Snapshot the final flat/interpolated input forms before ACO consumes
+     * and may rewrite the NIR. */
+    PsbcInputSemantics input_semantics = {.valid = true};
+    if (mesa_stage == MESA_SHADER_FRAGMENT &&
+        !build_input_semantics(nir, &stage.info, opts->primitive_id_per_primitive,
+                               &input_semantics) && stage.info.ps.prim_id_input) {
+        /* Never package a live PrimitiveID consumer with incomplete linkage. */
+        ralloc_free(nir);
+        psbc_shutdown();
+        return PSBC_RESULT_INTERNAL_ERROR;
+    }
+
+    if (opts->ngg) {
+        gfx10_get_ngg_info(&compiler_info,
+                           paired_geometry ? &previous.info : &stage.info,
+                           paired_geometry ? &stage.info : NULL,
+                           &stage.info.ngg_info);
+        stage.info.nir_shared_size = stage.info.ngg_info.lds_size;
+    }
 
     /* Compile NIR to GCN ISA via ACO */
+    nir_shader* shaders[2] = {nir, NULL};
+    unsigned shader_count = 1;
+    if (paired_geometry) {
+        shaders[0] = previous_nir;
+        shaders[1] = nir;
+        shader_count = 2;
+    }
+    if (getenv("PSBC_DEBUG_DISASM"))
+        stage.key.keep_executable_info = true;
     struct radv_shader_binary* binary = radv_shader_nir_to_asm(
-        &compiler_info, &stage, &nir, 1, &gfx_state
+        &compiler_info, &stage, shaders, shader_count, &gfx_state
     );
+    debug_stage("aco-end");
 
     if (!binary) {
+        if (previous_nir)
+            ralloc_free(previous_nir);
+        ralloc_free(nir);
         psbc_shutdown();
         return PSBC_RESULT_COMPILE_ACO;
     }
@@ -1097,6 +2370,22 @@ PsbcResult psbc_compile_shader(
     /* Extract code from radv_shader_binary_legacy */
     struct radv_shader_binary_legacy* legacy =
         (struct radv_shader_binary_legacy*)binary;
+
+    if (getenv("PSBC_DEBUG_DISASM")) {
+        fprintf(stderr, "PSBC executable code=%u ir=%u disasm=%u\n",
+                legacy->code_size, legacy->ir_size, legacy->disasm_size);
+        if (legacy->ir_size) {
+            const char* ir = (const char*)legacy->data + legacy->stats_size +
+                             legacy->code_size;
+            fprintf(stderr, "%.*s\n", (int)legacy->ir_size, ir);
+        }
+    }
+    if (getenv("PSBC_DEBUG_DISASM") && legacy->disasm_size) {
+        const uint8_t* disasm = legacy->data + legacy->stats_size +
+                                legacy->code_size + legacy->ir_size;
+        fwrite(disasm, 1, legacy->disasm_size, stderr);
+        fputc('\n', stderr);
+    }
 
     /* The data layout in radv_shader_binary_legacy is:
      * [stats | code | ir | disasm | debug_info]
@@ -1116,28 +2405,103 @@ PsbcResult psbc_compile_shader(
         .psbc_stage = opts->stage,
         .spirv_data = spirv,
         .spirv_size = spirv_size,
+        .target = opts->target,
+        .ngg = opts->ngg,
         .neo = neo,
+        .address32_hi = opts->address32_hi,
+        .options = opts,
+        .input_semantics = &input_semantics,
     };
 
     uint8_t* output_data = NULL;
     size_t output_size = 0;
     PsbcResult result = buildshaderbinary(&buildctx, code, code_dw,
                                           &output_data, &output_size);
+    if (result != PSBC_RESULT_OK) {
+        free(binary);
+        if (previous_nir)
+            ralloc_free(previous_nir);
+        ralloc_free(nir);
+        psbc_shutdown();
+        return result;
+    }
+
+    void* machine_code = malloc(legacy->code_size);
+    if (!machine_code) {
+        free(output_data);
+        free(binary);
+        if (previous_nir)
+            ralloc_free(previous_nir);
+        ralloc_free(nir);
+        psbc_shutdown();
+        return PSBC_RESULT_OUT_OF_MEMORY;
+    }
+    memcpy(machine_code, code, legacy->code_size);
+
     out->data = output_data;
     out->size = output_size;
+    out->machine_code = machine_code;
+    out->machine_code_size = legacy->code_size;
+    fill_shader_metadata(&buildctx, &out->metadata);
 
     free(binary);
+    if (previous_nir)
+        ralloc_free(previous_nir);
+    ralloc_free(nir);
     psbc_shutdown();
 
     return result;
 }
 
+PsbcResult psbc_compile_shader(
+    const uint32_t* spirv,
+    size_t spirv_size,
+    const PsbcCompileOptions* opts,
+    PsbcShaderOutput* out
+) {
+    return psbc_compile_impl(spirv, spirv_size, NULL, NULL, 0, NULL,
+                             opts, out);
+}
+
+PsbcResult psbc_compile_nir(
+    const struct nir_shader* nir,
+    const PsbcCompileOptions* opts,
+    PsbcShaderOutput* out
+) {
+    return psbc_compile_impl(NULL, 0, nir, NULL, 0, NULL, opts, out);
+}
+
+PsbcResult psbc_compile_geometry_pipeline(
+    const uint32_t* vertex_spirv,
+    size_t vertex_spirv_size,
+    const uint32_t* geometry_spirv,
+    size_t geometry_spirv_size,
+    const PsbcCompileOptions* opts,
+    PsbcShaderOutput* out
+) {
+    return psbc_compile_impl(geometry_spirv, geometry_spirv_size, NULL,
+                             vertex_spirv, vertex_spirv_size, NULL,
+                             opts, out);
+}
+
+PsbcResult psbc_compile_nir_geometry_pipeline(
+    const struct nir_shader* vertex_nir,
+    const struct nir_shader* geometry_nir,
+    const PsbcCompileOptions* opts,
+    PsbcShaderOutput* out
+) {
+    return psbc_compile_impl(NULL, 0, geometry_nir, NULL, 0, vertex_nir,
+                             opts, out);
+}
+
 void psbc_free_output(PsbcShaderOutput* out) {
-    if (out && out->data) {
+    if (!out)
+        return;
+    if (out->data)
         free(out->data);
-        out->data = NULL;
-        out->size = 0;
-    }
+    if (out->machine_code)
+        free(out->machine_code);
+    memset(out, 0, sizeof(*out));
 }
 
 const char* psbc_result_string(PsbcResult result) {

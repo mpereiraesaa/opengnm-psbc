@@ -4844,8 +4844,18 @@ visit_intrinsic(isel_context* ctx, nir_intrinsic_instr* instr)
          if (write_mask & (1 << i)) {
             Temp chan_counter = emit_extract_vector(ctx, counter, i, v1);
 
-            ds_instr = bld.ds(aco_opcode::ds_add_gs_reg_rtn, bld.def(v1), Operand(), chan_counter,
-                              i * 4, 0u, true);
+            if (ctx->options->gfx_level < GFX11) {
+               /* GFX10 NGG streamout keeps its four dword counters in GDS
+                * memory.  This is Mesa's pre-GFX11 implementation; m0=0x100
+                * selects the process GDS partition for the atomic return.
+                */
+               m = bld.m0((Temp)bld.copy(bld.def(s1, m0), Operand::c32(0x100u)));
+               ds_instr = bld.ds(aco_opcode::ds_add_rtn_u32, bld.def(v1), gds_base,
+                                  chan_counter, m, i * 4, 0u, true);
+            } else {
+               ds_instr = bld.ds(aco_opcode::ds_add_gs_reg_rtn, bld.def(v1), Operand(),
+                                  chan_counter, i * 4, 0u, true);
+            }
             ds_instr->ds().sync = memory_sync_info(storage_gds, semantic_atomicrmw);
 
             vec->operands[i] = Operand(ds_instr->definitions[0].getTemp());
@@ -4875,8 +4885,16 @@ visit_intrinsic(isel_context* ctx, nir_intrinsic_instr* instr)
          Temp chan_counter = emit_extract_vector(ctx, counter, i, v1);
          Instruction* ds_instr;
 
-         ds_instr = bld.ds(aco_opcode::ds_sub_gs_reg_rtn, bld.def(v1), Operand(), chan_counter,
-                           i * 4, 0u, true);
+         if (ctx->options->gfx_level < GFX11) {
+            Temp gds_base = bld.copy(bld.def(v1), Operand::c32(0u));
+            Operand m =
+               bld.m0((Temp)bld.copy(bld.def(s1, m0), Operand::c32(0x100u)));
+            ds_instr = bld.ds(aco_opcode::ds_sub_rtn_u32, bld.def(v1), gds_base,
+                               chan_counter, m, i * 4, 0u, true);
+         } else {
+            ds_instr = bld.ds(aco_opcode::ds_sub_gs_reg_rtn, bld.def(v1), Operand(),
+                               chan_counter, i * 4, 0u, true);
+         }
          ds_instr->ds().sync = memory_sync_info(storage_gds, semantic_atomicrmw);
       }
       break;

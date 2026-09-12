@@ -2870,8 +2870,18 @@ lower_to_hw_instr(Program* program)
                    */
                   bld.vop2_dpp(aco_opcode::v_cndmask_b32, Definition(dst0, v1), src1, src0,
                                src_even, dpp_row_xmask(1));
-                  bld.vop2_e64_dpp(aco_opcode::v_cndmask_b32, Definition(dst1, v1), src0, src1,
-                                   src_odd, dpp_row_xmask(1));
+                  if (ctx.program->gfx_level >= GFX11) {
+                     bld.vop2_e64_dpp(aco_opcode::v_cndmask_b32, Definition(dst1, v1), src0,
+                                      src1, src_odd, dpp_row_xmask(1));
+                  } else {
+                     /* VOP3+DPP is GFX11-only.  On PS5's GFX10.3 ISA, move
+                      * src0 from the adjacent lane first, then select it for
+                      * even lanes with the VCC mask already holding src_even. */
+                     bld.vop1_dpp(aco_opcode::v_mov_b32, Definition(dst1, v1), src0,
+                                  dpp_row_xmask(1));
+                     bld.vop2(aco_opcode::v_cndmask_b32, Definition(dst1, v1), src1,
+                              Operand(dst1, v1), src_even);
+                  }
 
                   mrt0[i] = Operand(dst0, v1);
                   mrt1[i] = Operand(dst1, v1);
@@ -2892,13 +2902,18 @@ lower_to_hw_instr(Program* program)
                   enabled_channels = 0xf;
 
                Instruction* exp[2];
+               /* GFX11 consumes the transposed values through MRT+21/+22.
+                * PS5's GFX10.3 path needs the same transpose but ordinary
+                * MRT0/MRT1 exports; special targets are ignored there. */
+               const unsigned dual_src_target =
+                  ctx.program->gfx_level >= GFX11 ? 21 : 0;
 
                exp[0] =
                   bld.exp(aco_opcode::exp, mrt0[0], mrt0[1], mrt0[2], mrt0[3], enabled_channels,
-                          V_008DFC_SQ_EXP_MRT + 21, false, false, false, disable_wqm);
+                          V_008DFC_SQ_EXP_MRT + dual_src_target, false, false, false, disable_wqm);
                exp[1] =
                   bld.exp(aco_opcode::exp, mrt1[0], mrt1[1], mrt1[2], mrt1[3], enabled_channels,
-                          V_008DFC_SQ_EXP_MRT + 22, false, false, false, disable_wqm);
+                          V_008DFC_SQ_EXP_MRT + dual_src_target + 1, false, false, false, disable_wqm);
 
                if (disable_wqm) {
                   for (unsigned i = 0; i < 2; i++) {

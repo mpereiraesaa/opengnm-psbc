@@ -225,12 +225,11 @@ UTIL_SRCS = $(filter-out \
 # Mesa util format sources
 UTIL_FORMAT_SRCS = $(wildcard src/util/format/*.c)
 
-# Blake3 hashing — need dispatch + portable + neon (ARM64)
+# Blake3 hashing — portable host implementation.
 BLAKE3_SRCS = \
 	src/util/blake3/blake3.c \
 	src/util/blake3/blake3_dispatch.c \
-	src/util/blake3/blake3_portable.c \
-	src/util/blake3/blake3_neon.c
+	src/util/blake3/blake3_portable.c
 
 # C11 threads compat (POSIX implementation)
 C11_THREADS_SRCS = src/c11/impl/threads_posix.c src/c11/impl/time.c
@@ -284,6 +283,10 @@ LIBPSBC_OBJS = \
 
 %.cpp.o: %.cpp | $(GENERATED)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+# These two objects share the public metadata ABI.  Keep the thin CLI in
+# lockstep with the library when its layout changes.
+cmd/psbc/main.o libpsbc/psbc_compile.o: libpsbc/psbc_compile.h
 
 ifndef OPENGNM_PSBC_ORBIS
 # === Static library (libpsbc.a) ===

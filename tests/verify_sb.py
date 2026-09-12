@@ -5,6 +5,8 @@ import sys
 import subprocess
 import os
 import zlib
+import json
+import hashlib
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # opengnm-psbc/
 PSBC = REPO  # opengnm-psbc/ is the build directory
@@ -91,6 +93,41 @@ def read_u32_le(data, off):
 
 def read_u16_le(data, off):
     return struct.unpack_from("<H", data, off)[0]
+
+def shader_words(sb_path):
+    with open(sb_path, "rb") as f:
+        data = f.read()
+    assert len(data) % 4 == 0
+    return struct.unpack(f"<{len(data) // 4}I", data)
+
+def shader_export_targets(sb_path):
+    with open(sb_path, "rb") as f:
+        data = f.read()
+    orbshdr_off = data.find(GNM_SHADER_BINARY_INFO_MAGIC)
+    assert orbshdr_off >= 0, "OrbShdr magic not found!"
+    length_field = read_u32_le(data, orbshdr_off + 8)
+    code_size = (length_field >> 8) & 0xffffff
+    code = data[orbshdr_off - code_size:orbshdr_off]
+    return [
+        (read_u32_le(code, off) >> 4) & 0x3f
+        for off in range(0, len(code) - 3, 4)
+        if read_u32_le(code, off) & 0xfc000000 == 0xf8000000
+    ]
+
+def shader_exports_are_compressed(sb_path):
+    with open(sb_path, "rb") as f:
+        data = f.read()
+    orbshdr_off = data.find(GNM_SHADER_BINARY_INFO_MAGIC)
+    assert orbshdr_off >= 0, "OrbShdr magic not found!"
+    length_field = read_u32_le(data, orbshdr_off + 8)
+    code_size = (length_field >> 8) & 0xffffff
+    code = data[orbshdr_off - code_size:orbshdr_off]
+    exports = [
+        read_u32_le(code, off)
+        for off in range(0, len(code) - 3, 4)
+        if read_u32_le(code, off) & 0xfc000000 == 0xf8000000
+    ]
+    return bool(exports) and all(word & (1 << 10) for word in exports)
 
 def verify_shader(sb_path, expected_type):
     with open(sb_path, "rb") as f:
@@ -222,17 +259,53 @@ def verify_shader(sb_path, expected_type):
     return True
 
 def main():
+    # PS5-private opcodes must not renumber the public NIR ABI used by Mesa.
+    with open(os.path.join(PSBC, "src/compiler/nir/nir_intrinsics.h"),
+              "r", encoding="utf-8") as f:
+        intrinsic_enum = [line.strip().rstrip(",") for line in f
+                          if line.strip().startswith("nir_intrinsic_") and
+                          line.strip().endswith(",")]
+    with open(os.path.join(PSBC, "src/compiler/nir/nir_intrinsics.c"),
+              "r", encoding="utf-8") as f:
+        intrinsic_info = [line.split('"')[1] for line in f
+                          if line.strip().startswith('.name = "')]
+    assert intrinsic_info == [name.removeprefix("nir_intrinsic_")
+                              for name in intrinsic_enum]
+    public_abi = hashlib.sha256("\n".join(intrinsic_enum).encode()).hexdigest()
+    assert len(intrinsic_enum) == 930
+    assert public_abi == \
+        "4cb1ff6f1ca3a584853d446295139029f72ed6fb4b25937d980d79d56b1746ed"
+    print("NIR ABI: public Mesa opcode table unchanged")
+
     # Build shaders if needed
     vert_spv = os.path.join(TESTS, "tri.vert.spv")
     frag_spv = os.path.join(TESTS, "tri.frag.spv")
     vert_sb = os.path.join(TESTS, "tri.vert.sb")
     frag_sb = os.path.join(TESTS, "tri.frag.sb")
+    vert_metadata = os.path.join(TESTS, "tri.vert.metadata.json")
 
     # Compile vertex shader
     psbc_bin = os.path.join(PSBC, "opengnm-psbc")
     if not os.path.exists(psbc_bin):
         print("Building opengnm-psbc...")
         subprocess.run(["make", "-C", PSBC, "-j4"], check=True)
+
+    indirect_glsl = os.path.join(TESTS, "indirect-array.frag")
+    indirect_spv = os.path.join(TESTS, "indirect-array.spv")
+    indirect_sb = os.path.join(TESTS, "indirect-array.sb")
+    subprocess.run(["glslangValidator", "-V", indirect_glsl,
+                    "-o", indirect_spv], check=True)
+    indirect_env = os.environ.copy()
+    indirect_env["PSBC_DEBUG_NIR"] = "1"
+    r = subprocess.run([
+        psbc_bin, "-f", indirect_spv, "-o", indirect_sb,
+        "-s", "fragment", "-vv",
+    ], capture_output=True, text=True, cwd=PSBC, env=indirect_env)
+    if r.returncode != 0:
+        print(f"Indirect-array fragment compile failed: {r.stderr}")
+        sys.exit(1)
+    assert "store_deref" not in r.stderr
+    print("Indirect array: dynamic function-temp dereferences lowered")
 
     # Generate SPIR-V if needed
     if not os.path.exists(vert_spv):
@@ -244,12 +317,253 @@ def main():
 
     # Compile to .sb
     print("Compiling vertex shader...")
-    r = subprocess.run([psbc_bin, "-f", vert_spv, "-o", vert_sb, "-s", "vertex", "-vv"],
+    r = subprocess.run([psbc_bin, "-f", vert_spv, "-o", vert_sb,
+                        "-s", "vertex", "--metadata", vert_metadata, "-vv"],
                        capture_output=True, text=True, cwd=PSBC)
     if r.returncode != 0:
         print(f"Vertex compile failed: {r.stderr}")
         sys.exit(1)
     print(r.stdout.strip())
+    with open(vert_metadata, "r", encoding="utf-8") as f:
+        metadata = json.load(f)
+    base_vertex_dword = metadata["base_vertex_user_data_dword"]
+    assert metadata["version"] == 6
+    assert isinstance(base_vertex_dword, int)
+    assert 0 <= base_vertex_dword < metadata["user_sgpr_count"]
+    assert metadata["start_instance_user_data_dword"] is None
+    print(f"Base-vertex metadata: ABI v6 dword={base_vertex_dword} "
+          f"user_sgprs={metadata['user_sgpr_count']}")
+
+    point_glsl = os.path.join(TESTS, "point-size.vert")
+    point_spv = os.path.join(TESTS, "point-size.vert.spv")
+    point_sb = os.path.join(TESTS, "point-size.vert.sb")
+    point_metadata = os.path.join(TESTS, "point-size.vert.metadata.json")
+    subprocess.run(["glslangValidator", "-V", point_glsl,
+                    "-o", point_spv], check=True)
+    r = subprocess.run([
+        psbc_bin, "-f", point_spv, "-o", point_sb, "-s", "vertex",
+        "--metadata", point_metadata, "-vv",
+    ], capture_output=True, text=True, cwd=PSBC)
+    if r.returncode != 0:
+        print(f"Point-size vertex compile failed: {r.stderr}")
+        sys.exit(1)
+    with open(point_metadata, "r", encoding="utf-8") as f:
+        point_info = json.load(f)
+    point_cx = {entry["offset"]: entry["value"]
+                for entry in point_info["context_registers"]}
+    assert point_cx[451] == 0x44
+    assert point_cx[519] & 0x01210000 == 0x01210000
+    print("Point size: POS1 export and PA_CL vertex-size controls enabled")
+
+    point_coord_glsl = os.path.join(TESTS, "point-coord.frag")
+    point_coord_spv = os.path.join(TESTS, "point-coord.spv")
+    point_coord_sb = os.path.join(TESTS, "point-coord.sb")
+    point_coord_metadata = os.path.join(TESTS, "point-coord.metadata.json")
+    subprocess.run(["glslangValidator", "-V", point_coord_glsl,
+                    "-o", point_coord_spv], check=True)
+    point_coord_env = os.environ.copy()
+    point_coord_env["PSBC_DEBUG_NIR"] = "1"
+    r = subprocess.run([
+        psbc_bin, "-f", point_coord_spv, "-o", point_coord_sb,
+        "-s", "fragment", "--metadata", point_coord_metadata, "-vv",
+    ], capture_output=True, text=True, cwd=PSBC, env=point_coord_env)
+    if r.returncode != 0:
+        print(f"Point-coordinate fragment compile failed: {r.stderr}")
+        sys.exit(1)
+    with open(point_coord_metadata, "r", encoding="utf-8") as f:
+        point_coord_info = json.load(f)
+    point_coord_cx = {entry["offset"]: entry["value"]
+                      for entry in point_coord_info["context_registers"]}
+    assert "io location=VARYING_SLOT_PNTC" in r.stderr
+    assert point_coord_info["input_semantics"] == []
+    assert point_coord_info["unresolved_fields"] == 5
+    assert point_coord_cx[0x1B3] == 0x2
+    assert point_coord_cx[0x1B4] == 0x2
+    assert point_coord_cx[0x1B6] == 0x8001
+    print("Point coordinate: PNTC interpolation input uses the hardware-generated "
+          "parameter slot")
+
+    front_glsl = os.path.join(TESTS, "front-facing.frag")
+    front_spv = os.path.join(TESTS, "front-facing.spv")
+    front_sb = os.path.join(TESTS, "front-facing.sb")
+    front_metadata = os.path.join(TESTS, "front-facing.metadata.json")
+    subprocess.run(["glslangValidator", "-V", front_glsl,
+                    "-o", front_spv], check=True)
+    front_env = os.environ.copy()
+    front_env["PSBC_DEBUG_NIR"] = "1"
+    r = subprocess.run([
+        psbc_bin, "-f", front_spv, "-o", front_sb,
+        "-s", "fragment", "--metadata", front_metadata, "-vv",
+    ], capture_output=True, text=True, cwd=PSBC, env=front_env)
+    if r.returncode != 0:
+        print(f"Front-facing fragment compile failed: {r.stderr}")
+        sys.exit(1)
+    with open(front_metadata, "r", encoding="utf-8") as f:
+        front_info = json.load(f)
+    front_cx = {entry["offset"]: entry["value"]
+                for entry in front_info["context_registers"]}
+    assert "@load_vector_arg_amd (base=15" in r.stderr
+    assert front_info["input_semantics"] == []
+    assert front_info["unresolved_fields"] == 1
+    assert front_cx[0x1B3] == 0x1080
+    assert front_cx[0x1B4] == 0x1080
+    assert front_cx[0x1B6] == 0x8000
+    assert front_cx[0x1B8] == 0
+    print("Front facing: hardware front-face VGPR uses floating-sign mode")
+
+    instance_glsl = os.path.join(TESTS, "instance.vert")
+    instance_spv = os.path.join(TESTS, "instance.vert.spv")
+    instance_sb = os.path.join(TESTS, "instance.vert.sb")
+    instance_metadata = os.path.join(TESTS, "instance.vert.metadata.json")
+    subprocess.run(["glslangValidator", "-V", instance_glsl,
+                    "-o", instance_spv], check=True)
+    r = subprocess.run([
+        psbc_bin, "-f", instance_spv, "-o", instance_sb, "-s", "vertex",
+        "--vertex-attribute", "0:r32g32_float:0:0:8:4",
+        "--vertex-attribute", "1:r32g32_float:1:0:8:4:2",
+        "--metadata", instance_metadata, "-vv",
+    ], capture_output=True, text=True, cwd=PSBC)
+    if r.returncode != 0:
+        print(f"Instanced vertex compile failed: {r.stderr}")
+        sys.exit(1)
+    with open(instance_metadata, "r", encoding="utf-8") as f:
+        instance_info = json.load(f)
+    start_instance_dword = instance_info["start_instance_user_data_dword"]
+    assert instance_info["version"] == 6
+    assert isinstance(start_instance_dword, int)
+    assert 0 <= start_instance_dword < instance_info["user_sgpr_count"]
+    assert start_instance_dword != instance_info["base_vertex_user_data_dword"]
+    print(f"Instancing metadata: start dword={start_instance_dword} "
+          f"user_sgprs={instance_info['user_sgpr_count']}")
+
+    packed_sb = os.path.join(TESTS, "packed-vertex.sb")
+    r = subprocess.run([
+        psbc_bin, "-f", instance_spv, "-o", packed_sb, "-s", "vertex",
+        "--vertex-attribute", "0:r10g10b10a2_snorm:0:0:8:4",
+        "--vertex-attribute", "1:b8g8r8a8_unorm:0:4:8:4",
+    ], capture_output=True, text=True, cwd=PSBC)
+    if r.returncode != 0:
+        print(f"Packed vertex compile failed: {r.stderr}")
+        sys.exit(1)
+    print("Packed vertex formats: 2_10_10_10 SNORM + BGRA8 UNORM")
+
+    integer_glsl = os.path.join(TESTS, "integer-vertex.vert")
+    integer_spv = os.path.join(TESTS, "integer-vertex.spv")
+    integer_sb = os.path.join(TESTS, "integer-vertex.sb")
+    subprocess.run(["glslangValidator", "-V", integer_glsl,
+                    "-o", integer_spv], check=True)
+    r = subprocess.run([
+        psbc_bin, "-f", integer_spv, "-o", integer_sb, "-s", "vertex",
+        "--vertex-attribute", "0:r32g32_sint:0:0:24:4",
+        "--vertex-attribute", "1:r32g32b32a32_uint:0:8:24:4",
+    ], capture_output=True, text=True, cwd=PSBC)
+    if r.returncode != 0:
+        print(f"Integer vertex compile failed: {r.stderr}")
+        sys.exit(1)
+    print("Integer vertex formats: R32G32 SINT + R32G32B32A32 UINT")
+
+    xfb_asm = os.path.join(TESTS, "xfb.spvasm")
+    xfb_spv = os.path.join(TESTS, "xfb.spv")
+    xfb_raw = os.path.join(TESTS, "xfb.raw.sb")
+    xfb_metadata = os.path.join(TESTS, "xfb.metadata.json")
+    subprocess.run([
+        "spirv-as", "--target-env", "spv1.3", xfb_asm, "-o", xfb_spv,
+    ], check=True)
+    subprocess.run([
+        "spirv-val", "--target-env", "vulkan1.1", xfb_spv,
+    ], check=True)
+    r = subprocess.run([
+        psbc_bin, "-f", xfb_spv, "-o", xfb_raw, "-s", "vertex",
+        "--raw", "--metadata", xfb_metadata, "-vv",
+    ], capture_output=True, text=True, cwd=PSBC)
+    if r.returncode != 0:
+        print(f"Transform-feedback compile failed: {r.stderr}")
+        sys.exit(1)
+    with open(xfb_metadata, "r", encoding="utf-8") as f:
+        xfb_info = json.load(f)
+    with open(xfb_raw, "rb") as f:
+        xfb_hash = hashlib.sha256(f.read()).hexdigest()
+    streamout = xfb_info["streamout"]
+    assert xfb_info["version"] == 6
+    assert xfb_info["hardware_stage"] == 1
+    assert xfb_info["machine_code_size"] == 136
+    assert xfb_hash == "53c2d31fe305d7ec4f0d404274e227183bebfbab51728855566889981022662d"
+    assert streamout["buffer_table_user_data_dword"] == 4
+    assert streamout["enabled_stream_buffers_mask"] == 1
+    assert streamout["strides_dwords"] == [4, 0, 0, 0]
+    assert streamout["config_sgpr"] == 5
+    assert streamout["write_index_sgpr"] == 6
+    assert streamout["offset_sgprs"] == [7, None, None, None]
+    assert xfb_info["linkage"] == {
+        "ge_cntl": {"offset": 0x25B, "value": 0x20080},
+        "stages_en": {"offset": 0x2D5, "value": 0x10000},
+        "user_vgpr_en": {"offset": 0x262, "value": 0},
+    }
+    assert xfb_info["context_registers"] == [
+        {"offset": 0x1B1, "value": 0x80},
+        {"offset": 0x1C3, "value": 0x4},
+        {"offset": 0x207, "value": 0},
+    ]
+    assert xfb_info["shader_registers"] == [
+        {"offset": 0x48, "value": 0},
+        {"offset": 0x49, "value": 0},
+        {"offset": 0x4A, "value": 0x082C0001},
+        {"offset": 0x4B, "value": 0x110A},
+    ]
+    assert "Unsupported SPIR-V capability" not in r.stderr
+    print("Transform-feedback metadata: buffer table dword=4, "
+          "system SGPRs=5/6/7, stride=4 dwords")
+
+    ngg_topologies = {
+        "point-list": (1, 300, "c019debc8d57279b7b234998a9bbe9af8327282ca4708ad7d42fac8a82c16d97"),
+        "line-list": (2, 308, "fc12e6b6c3f9523b1ffedc853f14d894cdb8ee7d1cc4b18ad376bc895499243c"),
+        "line-strip": (2, 308, "fc12e6b6c3f9523b1ffedc853f14d894cdb8ee7d1cc4b18ad376bc895499243c"),
+        "triangle-list": (3, 320, "d1eccd79fccdad73c4851e871e96dd5569a22cba4c5b5615befdb1f66383991f"),
+        "triangle-fan": (3, 320, "d1eccd79fccdad73c4851e871e96dd5569a22cba4c5b5615befdb1f66383991f"),
+        "triangle-strip": (3, 320, "d1eccd79fccdad73c4851e871e96dd5569a22cba4c5b5615befdb1f66383991f"),
+    }
+    for topology, (vertices_per_primitive, expected_size, expected_hash) in ngg_topologies.items():
+        xfb_ngg_raw = os.path.join(TESTS, f"xfb-ngg-{topology}.raw.sb")
+        xfb_ngg_metadata = os.path.join(TESTS, f"xfb-ngg-{topology}.metadata.json")
+        r = subprocess.run([
+            psbc_bin, "-f", xfb_spv, "-o", xfb_ngg_raw, "-s", "vertex",
+            "--ngg", "--raw", "--primitive-type", topology,
+            "--metadata", xfb_ngg_metadata, "-vv",
+        ], capture_output=True, text=True, cwd=PSBC)
+        if r.returncode != 0:
+            print(f"NGG {topology} transform-feedback compile failed: {r.stderr}")
+            sys.exit(1)
+        with open(xfb_ngg_metadata, "r", encoding="utf-8") as f:
+            xfb_ngg_info = json.load(f)
+        with open(xfb_ngg_raw, "rb") as f:
+            xfb_ngg_hash = hashlib.sha256(f.read()).hexdigest()
+        streamout = xfb_ngg_info["streamout"]
+        assert xfb_ngg_info["hardware_stage"] == 3
+        assert xfb_ngg_info["machine_code_size"] == expected_size
+        assert xfb_ngg_hash == expected_hash
+        assert streamout["buffer_table_user_data_dword"] == 2
+        assert streamout["enabled_stream_buffers_mask"] == 1
+        assert streamout["strides_dwords"] == [4, 0, 0, 0]
+        # NGG VS uses the ES/GS hardware path.  Stream output additionally
+        # needs wave IDs; passthrough remains enabled for the no-GS shader.
+        assert xfb_ngg_info["linkage"]["stages_en"]["value"] == 0x3012010
+        xfb_ngg_words = shader_words(xfb_ngg_raw)
+        ds_ops = [
+            (word >> 18) & 0xff
+            for word in xfb_ngg_words
+            if word >> 26 == 0x36 and word & (1 << 17)
+        ]
+        mubuf_ops = [
+            (word >> 18) & 0x7f
+            for word in xfb_ngg_words
+            if word >> 26 == 0x38
+        ]
+        assert 0x3f not in ds_ops       # no ds_ordered_count GDS lock
+        assert 0x20 not in ds_ops       # no ds_add_rtn_u32 GDS counter update
+        assert 0x21 not in ds_ops       # no ds_sub_rtn_u32 overflow correction
+        assert mubuf_ops.count(0x1e) >= vertices_per_primitive
+    print("NGG transform feedback: all six point/line/triangle topologies use "
+          "PrimitiveID offsets + capture stores, no GDS")
 
     print("Compiling fragment shader...")
     r = subprocess.run([psbc_bin, "-f", frag_spv, "-o", frag_sb, "-s", "fragment", "-vv"],
@@ -258,6 +572,80 @@ def main():
         print(f"Fragment compile failed: {r.stderr}")
         sys.exit(1)
     print(r.stdout.strip())
+
+    mixed_glsl = os.path.join(TESTS, "mixed-interpolation.frag")
+    mixed_spv = os.path.join(TESTS, "mixed-interpolation.spv")
+    mixed_sb = os.path.join(TESTS, "mixed-interpolation.sb")
+    mixed_metadata = os.path.join(TESTS, "mixed-interpolation.metadata.json")
+    subprocess.run(["glslangValidator", "-V", mixed_glsl,
+                    "-o", mixed_spv], check=True)
+    r = subprocess.run([
+        psbc_bin, "-f", mixed_spv, "-o", mixed_sb, "-s", "fragment",
+        "--metadata", mixed_metadata, "-vv",
+    ], capture_output=True, text=True, cwd=PSBC)
+    if r.returncode != 0:
+        print(f"Mixed-interpolation fragment compile failed: {r.stderr}")
+        sys.exit(1)
+    with open(mixed_metadata, "r", encoding="utf-8") as f:
+        mixed_info = json.load(f)
+    assert mixed_info["unresolved_fields"] == 1
+    assert mixed_info["input_semantics"] == [0x40000f, 0x10]
+    print("Pixel semantics: flat input carries PS5 AGC bit 22; smooth input does not")
+
+    mixed_last_sb = os.path.join(TESTS, "mixed-interpolation-last.sb")
+    mixed_last_metadata = os.path.join(
+        TESTS, "mixed-interpolation-last.metadata.json")
+    mixed_last_env = os.environ.copy()
+    mixed_last_env["PSBC_DEBUG_NIR"] = "1"
+    r = subprocess.run([
+        psbc_bin, "-f", mixed_spv, "-o", mixed_last_sb, "-s", "fragment",
+        "--primitive-type", "triangle-list", "--provoking-vertex-last",
+        "--metadata", mixed_last_metadata,
+    ], capture_output=True, text=True, cwd=PSBC, env=mixed_last_env)
+    if r.returncode != 0:
+        print(f"Last-provoking fragment compile failed: {r.stderr}")
+        sys.exit(1)
+    with open(mixed_sb, "rb") as f:
+        mixed_first_binary = f.read()
+    with open(mixed_last_sb, "rb") as f:
+        mixed_last_binary = f.read()
+    with open(mixed_last_metadata, "r", encoding="utf-8") as f:
+        mixed_last_info = json.load(f)
+    assert "@load_input_vertex" in r.stderr and "(0x2)" in r.stderr
+    assert mixed_last_binary != mixed_first_binary
+    assert mixed_last_info["input_semantics"] == [0x40000f, 0x10]
+    print("Last-provoking triangle flat input explicitly selects primitive vertex P2")
+
+    dual_source_glsl = os.path.join(TESTS, "dual-source.frag")
+    dual_source_spv = os.path.join(TESTS, "dual-source.spv")
+    dual_source_sb = os.path.join(TESTS, "dual-source.sb")
+    dual_source_metadata = os.path.join(TESTS, "dual-source.metadata.json")
+    subprocess.run(["glslangValidator", "-V", dual_source_glsl,
+                    "-o", dual_source_spv], check=True)
+    dual_source_env = os.environ.copy()
+    dual_source_env.update({"PSBC_DEBUG_IO": "1", "PSBC_DEBUG_NIR": "1"})
+    r = subprocess.run([
+        psbc_bin, "-f", dual_source_spv, "-o", dual_source_sb,
+        "-s", "fragment", "--metadata", dual_source_metadata, "-vv",
+    ], capture_output=True, text=True, cwd=PSBC, env=dual_source_env)
+    if r.returncode != 0:
+        print(f"Dual-source fragment compile failed: {r.stderr}")
+        sys.exit(1)
+    assert "color_is_dual_source: true" in r.stderr
+    assert "outputs_written: 4,12" in r.stderr
+    assert "api_subgroup_size: 32" in r.stderr
+    assert "@export_dual_src_blend_amd" not in r.stderr
+    assert shader_export_targets(dual_source_sb) == [0, 1]
+    assert shader_exports_are_compressed(dual_source_sb)
+    with open(dual_source_metadata, "r", encoding="utf-8") as f:
+        dual_metadata = json.load(f)
+    dual_registers = {entry["offset"]: entry["value"]
+                      for entry in dual_metadata["context_registers"]}
+    assert dual_registers[0x1B6] == 0x8000
+    assert dual_registers[0x1C5] == 0x44
+    assert dual_registers[0x08F] == 0xFF
+    print("Dual-source fragment: wave32, packed GFX10 MRT0/MRT1 exports, "
+          "COL_FORMAT=44, MASK=ff")
 
     # Compile compute shader
     comp_glsl = os.path.join(TESTS, "test.comp")
@@ -277,8 +665,7 @@ def main():
     geom_glsl = os.path.join(TESTS, "test.geom")
     geom_spv = os.path.join(TESTS, "test.geom.spv")
     geom_sb = os.path.join(TESTS, "test.geom.sb")
-    if not os.path.exists(geom_spv):
-        subprocess.run(["glslangValidator", "-V", geom_glsl, "-o", geom_spv], check=True)
+    subprocess.run(["glslangValidator", "-V", geom_glsl, "-o", geom_spv], check=True)
     print("Compiling geometry shader...")
     r = subprocess.run([psbc_bin, "-f", geom_spv, "-o", geom_sb, "-s", "geometry", "-vv"],
                        capture_output=True, text=True, cwd=PSBC)
@@ -286,6 +673,166 @@ def main():
         print(f"Geometry compile failed: {r.stderr}")
         sys.exit(1)
     print(r.stdout.strip())
+
+    # Compile a complete merged VS+GS shader and pin the GFX10 stage state.
+    # A real GS uses ES=REAL + GS=ON and must not enable NGG passthrough.
+    merged_geom_raw = os.path.join(TESTS, "test.merged-geometry.raw.sb")
+    merged_geom_metadata = os.path.join(TESTS, "test.merged-geometry.metadata.json")
+    print("Compiling merged NGG vertex+geometry pipeline...")
+    merged_geom_env = os.environ.copy()
+    merged_geom_env["PSBC_DEBUG_IO"] = "1"
+    r = subprocess.run([
+        psbc_bin, "-f", geom_spv, "-o", merged_geom_raw,
+        "-s", "geometry", "--previous", vert_spv, "--ngg", "--raw",
+        "--metadata", merged_geom_metadata, "-vv",
+    ], capture_output=True, text=True, cwd=PSBC, env=merged_geom_env)
+    if r.returncode != 0:
+        print(f"Merged geometry compile failed: {r.stderr}")
+        sys.exit(1)
+    with open(merged_geom_metadata, "r", encoding="utf-8") as f:
+        merged_geom_info = json.load(f)
+    assert merged_geom_info["hardware_stage"] == 3
+    assert merged_geom_info["linkage"]["stages_en"] == {
+        "offset": 0x2D5,
+        "value": 0x12030,
+    }
+    merged_geom_registers = {
+        entry["offset"]: entry["value"]
+        for entry in merged_geom_info["context_registers"]
+    }
+    assert merged_geom_registers[0x29B] == 2
+    merged_geom_shader_registers = {
+        entry["offset"]: entry["value"]
+        for entry in merged_geom_info["shader_registers"]
+    }
+    assert merged_geom_shader_registers[0x87] == 0x003FFFFF
+    assert merged_geom_shader_registers[0x81] == 0x0000FFFF
+    assert "PSBC IO previous-info:" in r.stderr
+    assert "linked=0/1 merged_separate=0 slots=1/0" in r.stderr
+    assert "PSBC IO info:" in r.stderr
+    assert "linked=1/0 merged_separate=0 slots=0/1" in r.stderr
+    print("Merged geometry stage state: ES=REAL, GS=ON, PRIMGEN=ON, "
+          "MAX_PRIMGRP=2, passthrough=OFF, output=TRISTRIP, "
+          "RSRC3/4=conservative")
+
+    adjacency_cases = {
+        "line-list-adjacency": "test-line-adjacency.geom",
+        "line-strip-adjacency": "test-line-adjacency.geom",
+        "triangle-list-adjacency": "test-adjacency.geom",
+        "triangle-strip-adjacency": "test-adjacency.geom",
+    }
+    for topology, source in adjacency_cases.items():
+        adjacency_geom_spv = os.path.join(TESTS, f"{topology}.geom.spv")
+        adjacency_geom_raw = os.path.join(TESTS, f"{topology}.merged.raw.sb")
+        adjacency_geom_metadata = os.path.join(
+            TESTS, f"{topology}.merged.metadata.json"
+        )
+        subprocess.run([
+            "glslangValidator", "-V", os.path.join(TESTS, source),
+            "-o", adjacency_geom_spv,
+        ], check=True)
+        r = subprocess.run([
+            psbc_bin, "-f", adjacency_geom_spv, "-o", adjacency_geom_raw,
+            "-s", "geometry", "--previous", vert_spv, "--ngg", "--raw",
+            "--primitive-type", topology,
+            "--metadata", adjacency_geom_metadata, "-vv",
+        ], capture_output=True, text=True, cwd=PSBC)
+        if r.returncode != 0:
+            print(f"Merged {topology} geometry compile failed: {r.stderr}")
+            sys.exit(1)
+        with open(adjacency_geom_metadata, "r", encoding="utf-8") as f:
+            adjacency_geom_info = json.load(f)
+        assert adjacency_geom_info["hardware_stage"] == 3
+        assert adjacency_geom_info["machine_code_size"] > 0
+    print("Merged geometry adjacency: all four native topology compiles")
+
+    varying32_geom_spv = os.path.join(TESTS, "varying32.geom.spv")
+    varying32_geom_raw = os.path.join(TESTS, "varying32.geom.raw.sb")
+    varying32_geom_metadata = os.path.join(TESTS, "varying32.geom.metadata.json")
+    varying32_frag_spv = os.path.join(TESTS, "varying32.frag.spv")
+    varying32_frag_raw = os.path.join(TESTS, "varying32.frag.raw.sb")
+    varying32_frag_metadata = os.path.join(TESTS, "varying32.frag.metadata.json")
+    for source, output in (
+        ("varying32.geom", varying32_geom_spv),
+        ("varying32.frag", varying32_frag_spv),
+    ):
+        subprocess.run([
+            "glslangValidator", "-V", os.path.join(TESTS, source),
+            "-o", output,
+        ], check=True)
+    r = subprocess.run([
+        psbc_bin, "-f", varying32_geom_spv, "-o", varying32_geom_raw,
+        "-s", "geometry", "--previous", vert_spv, "--ngg", "--raw",
+        "--metadata", varying32_geom_metadata, "-vv",
+    ], capture_output=True, text=True, cwd=PSBC)
+    if r.returncode != 0:
+        print(f"32-varying geometry compile failed: {r.stderr}")
+        sys.exit(1)
+    r = subprocess.run([
+        psbc_bin, "-f", varying32_frag_spv, "-o", varying32_frag_raw,
+        "-s", "fragment", "--raw", "--metadata", varying32_frag_metadata,
+        "-vv",
+    ], capture_output=True, text=True, cwd=PSBC)
+    if r.returncode != 0:
+        print(f"32-varying fragment compile failed: {r.stderr}")
+        sys.exit(1)
+    with open(varying32_geom_metadata, "r", encoding="utf-8") as f:
+        varying32_geom_info = json.load(f)
+    with open(varying32_frag_metadata, "r", encoding="utf-8") as f:
+        varying32_frag_info = json.load(f)
+    assert len(varying32_geom_info["output_semantics"]) == 32
+    assert len(varying32_frag_info["input_semantics"]) == 32
+    varying32_frag_registers = {
+        entry["offset"]: entry["value"]
+        for entry in varying32_frag_info["context_registers"]
+    }
+    assert varying32_frag_registers[0x1B6] & 0x3F == 32
+    print("Geometry/fragment interface: all 32 vec4 varying slots compile and package")
+
+    # Compile merged GS transform feedback with PS5's private global counters.
+    xfb_geom_asm = os.path.join(TESTS, "xfb.geom.spvasm")
+    xfb_geom_spv = os.path.join(TESTS, "xfb.geom.spv")
+    xfb_geom_raw = os.path.join(TESTS, "xfb.geom.raw.sb")
+    xfb_geom_metadata = os.path.join(TESTS, "xfb.geom.metadata.json")
+    subprocess.run([
+        "spirv-as", "--target-env", "spv1.3", xfb_geom_asm,
+        "-o", xfb_geom_spv,
+    ], check=True)
+    subprocess.run([
+        "spirv-val", "--target-env", "vulkan1.1", xfb_geom_spv,
+    ], check=True)
+    xfb_geom_env = os.environ.copy()
+    xfb_geom_env["PSBC_DEBUG_DISASM"] = "1"
+    r = subprocess.run([
+        psbc_bin, "-f", xfb_geom_spv, "-o", xfb_geom_raw,
+        "-s", "geometry", "--previous", vert_spv, "--ngg",
+        "--ps5-global-streamout", "--raw", "--metadata",
+        xfb_geom_metadata, "-vv",
+    ], capture_output=True, text=True, cwd=PSBC, env=xfb_geom_env)
+    if r.returncode != 0:
+        print(f"Merged geometry transform-feedback compile failed: {r.stderr}")
+        sys.exit(1)
+    with open(xfb_geom_metadata, "r", encoding="utf-8") as f:
+        xfb_geom_info = json.load(f)
+    with open(xfb_geom_raw, "rb") as f:
+        xfb_geom_hash = hashlib.sha256(f.read()).hexdigest()
+    xfb_geom_streamout = xfb_geom_info["streamout"]
+    assert xfb_geom_info["hardware_stage"] == 3
+    assert xfb_geom_info["machine_code_size"] == 2264
+    assert xfb_geom_hash == \
+        "9daf0caecd0f632b10fe1f46fce0c1f229a8d4af5f2a44ca765c628f51f57fb7"
+    assert xfb_geom_streamout["buffer_table_user_data_dword"] == 1
+    assert xfb_geom_streamout["enabled_stream_buffers_mask"] == 1
+    assert xfb_geom_streamout["strides_dwords"] == [2, 0, 0, 0]
+    assert "ds_ordered_count" not in r.stderr
+    assert r.stderr.count("global_atomic_add") == 4
+    assert "ds_add_u32" not in r.stderr
+    assert "ds_add_rtn_u32" not in r.stderr
+    final_atomic = r.stderr.rindex("global_atomic_add")
+    release_wait = r.stderr.index("s_waitcnt_vscnt", final_atomic)
+    assert final_atomic < release_wait
+    print("Merged geometry transform feedback: global offsets/queries, "
+          "release wait, no GDS instructions")
 
     # Compile tessellation control (hull) shader
     tesc_glsl = os.path.join(TESTS, "test.tesc")
@@ -339,12 +886,14 @@ def main():
     ok = True
     ok &= verify_shader(vert_sb, GNM_SHADER_VERTEX)
     ok &= verify_shader(frag_sb, GNM_SHADER_PIXEL)
+    ok &= verify_shader(dual_source_sb, GNM_SHADER_PIXEL)
     ok &= verify_shader(comp_sb, GNM_SHADER_COMPUTE)
     ok &= verify_shader(geom_sb, GNM_SHADER_GEOMETRY)
     ok &= verify_shader(tesc_sb, GNM_SHADER_HULL)
     ok &= verify_shader(tese_sb, GNM_SHADER_VERTEX)  # DS uses VS type
     ok &= verify_shader(es_sb, GNM_SHADER_VERTEX)    # ES is a VS variant
     ok &= verify_shader(ls_sb, GNM_SHADER_VERTEX)    # LS is a VS variant
+    ok &= verify_shader(instance_sb, GNM_SHADER_VERTEX)
 
     if ok:
         print("\n=== ALL TESTS PASSED ===")

@@ -312,6 +312,27 @@ get_sampler_desc(nir_builder *b, lower_descriptors_state *state, nir_deref_instr
 
       desc_ptr = load_desc_ptr(b, state, desc_set);
       plane_offset = state->combined_image_sampler_desc_size;
+   } else if (!index && tex && state->layout->num_sets &&
+              state->layout->set[0].layout) {
+      /* Gallium/OpenGL NIR can carry legacy numeric texture/sampler indices
+       * instead of Vulkan derefs. Map those indices to same-numbered set-0
+       * bindings at the standalone compiler boundary. */
+      const unsigned binding_index =
+         desc_type == AC_DESC_SAMPLER ? tex->sampler_index
+                                      : tex->texture_index;
+      struct radv_descriptor_set_layout *layout =
+         state->layout->set[0].layout;
+
+      if (binding_index >= layout->binding_count)
+         return nir_imm_ivec4(b, 0, 0, 0, 0);
+      struct radv_descriptor_set_binding_layout *binding =
+         &layout->binding[binding_index];
+      offset = binding->offset;
+      if (desc_type == AC_DESC_SAMPLER &&
+          binding->type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
+         offset += state->combined_image_sampler_offset;
+      desc_ptr = load_desc_ptr(b, state, 0);
+      plane_offset = state->combined_image_sampler_desc_size;
    } else {
       desc_ptr = load_heap_ptr(b, state, desc_type == AC_DESC_SAMPLER ? RADV_HEAP_SAMPLER : RADV_HEAP_RESOURCE);
       plane_offset = state->sampled_image_desc_size;
@@ -595,6 +616,8 @@ lower_descriptors_tex(nir_builder *b, lower_descriptors_state *state, nir_tex_in
    nir_def *texture_heap_offset = NULL;
    nir_def *sampler_heap_offset = NULL;
    int plane = -1;
+   bool legacy_texture;
+   bool legacy_sampler;
 
    nir_def *image = NULL;
    nir_def *sampler = NULL;
@@ -624,6 +647,14 @@ lower_descriptors_tex(nir_builder *b, lower_descriptors_state *state, nir_tex_in
       }
    }
 
+   legacy_texture = !texture_deref_instr && !texture_heap_offset &&
+                    nir_tex_instr_src_index(tex,
+                                            nir_tex_src_texture_handle) < 0;
+   legacy_sampler = !sampler_deref_instr && !sampler_heap_offset &&
+                    nir_tex_instr_src_index(tex,
+                                            nir_tex_src_sampler_handle) < 0 &&
+                    nir_tex_instr_need_sampler(tex);
+
    if (plane >= 0) {
       assert(tex->op != nir_texop_txf_ms && tex->op != nir_texop_samples_identical);
       assert(tex->sampler_dim != GLSL_SAMPLER_DIM_BUF);
@@ -640,7 +671,7 @@ lower_descriptors_tex(nir_builder *b, lower_descriptors_state *state, nir_tex_in
                                tex->texture_non_uniform, tex, false);
    }
 
-   if (sampler_deref_instr || sampler_heap_offset) {
+   if (sampler_deref_instr || sampler_heap_offset || legacy_sampler) {
       assert(!sampler);
       sampler = get_sampler_desc(b, state, sampler_deref_instr, sampler_heap_offset, AC_DESC_SAMPLER,
                                  tex->sampler_non_uniform, tex, false);
@@ -698,6 +729,10 @@ lower_descriptors_tex(nir_builder *b, lower_descriptors_state *state, nir_tex_in
          break;
       }
    }
+   if (legacy_texture)
+      nir_tex_instr_add_src(tex, nir_tex_src_texture_handle, image);
+   if (legacy_sampler)
+      nir_tex_instr_add_src(tex, nir_tex_src_sampler_handle, sampler);
 
    return true;
 }
