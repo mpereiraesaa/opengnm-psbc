@@ -704,6 +704,7 @@ ngg_gs_build_streamout(nir_builder *b, lower_ngg_gs_state *s)
       nir_iadd_imm_nuw(b, s->lds_addr_gs_out_vtx, num_streams * scratch_stride + scratch_base_off);
    ac_nir_ngg_build_streamout_buffer_info(b, info, s->ac->gfx_level, s->options->has_xfb_prim_query,
                                           s->options->use_gfx12_xfb_intrinsic,
+                                          s->options->use_ps5_global_streamout,
                                           buffer_info_scratch_base, tid_in_tg, gen_prim, so_buffer,
                                           buffer_offsets, emit_prim);
 

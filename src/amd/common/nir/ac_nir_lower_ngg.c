@@ -1354,6 +1354,64 @@ ngg_nogs_build_streamout(nir_builder *b, lower_ngg_nogs_state *s)
 {
    nir_xfb_info *info = ac_nir_get_sorted_xfb_info(b->shader);
 
+   if (s->options->use_primitive_id_streamout) {
+      nir_def *num_vert_per_prim = nir_load_num_vertices_per_primitive_amd(b);
+      nir_def *primitive_id = nir_load_primitive_id(b);
+      nir_def *buffer_offsets[4] = {0};
+      nir_def *so_buffer[4] = {0};
+      nir_def *emit = has_input_primitive(b);
+
+      u_foreach_bit(buffer, info->buffers_written) {
+         nir_def *primitive_stride =
+            nir_imul_imm(b, num_vert_per_prim, info->buffers[buffer].stride);
+         nir_def *buffer_size;
+         nir_def *remaining;
+
+         so_buffer[buffer] = nir_load_streamout_buffer_amd(b, .base = buffer);
+         buffer_offsets[buffer] = nir_imul(b, primitive_id, primitive_stride);
+         buffer_size = nir_channel(b, so_buffer[buffer], 2);
+         remaining = nir_isub(b, buffer_size, buffer_offsets[buffer]);
+         emit = nir_iand(b, emit,
+                         nir_iand(b,
+                                  nir_uge(b, buffer_size,
+                                          buffer_offsets[buffer]),
+                                  nir_uge(b, remaining,
+                                          primitive_stride)));
+      }
+
+      nir_if *if_emit = nir_push_if(b, emit);
+      {
+         if (s->options->has_xfb_prim_query) {
+            nir_if *if_shader_query =
+               nir_push_if(b, nir_load_prim_xfb_query_enabled_amd(b));
+            nir_atomic_add_xfb_prim_count_amd(b, nir_imm_int(b, 1),
+                                              .stream_id = 0);
+            nir_pop_if(b, if_shader_query);
+         }
+
+         for (unsigned i = 0; i < s->options->num_vertices_per_primitive; i++) {
+            nir_if *if_valid_vertex =
+               nir_push_if(b, nir_igt_imm(b, num_vert_per_prim, i));
+            {
+               nir_def *vtx_lds_idx =
+                  nir_load_var(b, s->gs_vtx_indices_vars[i]);
+               nir_def *vtx_lds_addr =
+                  pervertex_lds_addr(b, s, vtx_lds_idx,
+                                     s->pervertex_lds_bytes);
+               ac_nir_ngg_build_streamout_vertex(b, info, 0, so_buffer,
+                                                  buffer_offsets, i,
+                                                  vtx_lds_addr, &s->out);
+            }
+            nir_pop_if(b, if_valid_vertex);
+         }
+      }
+      nir_pop_if(b, if_emit);
+
+      nir_scoped_memory_barrier(b, SCOPE_DEVICE, NIR_MEMORY_RELEASE,
+                                nir_var_mem_ssbo);
+      return;
+   }
+
    /* Get global buffer offset where this workgroup will stream out data to. */
    nir_def *generated_prim = nir_load_workgroup_num_input_primitives_amd(b);
    nir_def *gen_prim_per_stream[4] = {generated_prim, 0, 0, 0};
@@ -1362,7 +1420,8 @@ ngg_nogs_build_streamout(nir_builder *b, lower_ngg_nogs_state *s)
    nir_def *so_buffer[4] = {0};
    nir_def *tid_in_tg = nir_load_local_invocation_index(b);
    ac_nir_ngg_build_streamout_buffer_info(b, info, s->ac->gfx_level, s->options->has_xfb_prim_query,
-                                          s->options->use_gfx12_xfb_intrinsic, nir_imm_int(b, 0),
+                                          s->options->use_gfx12_xfb_intrinsic,
+                                          s->options->use_ps5_global_streamout, nir_imm_int(b, 0),
                                           tid_in_tg, gen_prim_per_stream, so_buffer, buffer_offsets,
                                           emit_prim_per_stream);
 

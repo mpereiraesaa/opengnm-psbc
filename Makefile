@@ -15,11 +15,26 @@ include $(CONFIG)
 
 PSBC ?= opengnm-psbc
 LIBPSBC ?= libpsbc.a
+GLSLANG ?= glslangValidator
 
-.PHONY: all clean install generated libpsbc
+.PHONY: all clean install generated libpsbc test-runtime-parameters test-storage-widths
 .DEFAULT_GOAL := all
 
 all: $(PSBC)
+
+test-runtime-parameters: $(LIBPSBC)
+	$(GLSLANG) -V --target-env vulkan1.0 tests/runtime_parameters.comp -o tests/runtime_parameters.spv
+	$(CC) -std=c11 -Wall -Wextra -Werror -Ilibpsbc tests/test_runtime_parameters.c $(LIBPSBC) -lstdc++ -lm -lpthread -o tests/test_runtime_parameters
+	./tests/test_runtime_parameters tests/runtime_parameters.spv
+
+test-storage-widths: $(LIBPSBC)
+	# Vulkan 1.1 makes the StorageBuffer storage class core, which lets this
+	# source isolate StorageBuffer8BitAccess instead of the broader legacy
+	# UniformAndStorageBuffer8BitAccess capability emitted for Vulkan 1.0 GLSL.
+	$(GLSLANG) -V --target-env vulkan1.1 tests/storage8.comp -o tests/storage8.spv
+	$(GLSLANG) -V --target-env vulkan1.0 tests/storage16.comp -o tests/storage16.spv
+	$(CC) -std=c11 -Wall -Wextra -Werror -Ilibpsbc tests/test_storage_widths.c $(LIBPSBC) -lstdc++ -lm -lpthread -o tests/test_storage_widths
+	./tests/test_storage_widths
 
 # === AMD register JSON files (for codegen) ===
 # Include all GPU generations so all register fields are available
@@ -225,12 +240,11 @@ UTIL_SRCS = $(filter-out \
 # Mesa util format sources
 UTIL_FORMAT_SRCS = $(wildcard src/util/format/*.c)
 
-# Blake3 hashing — need dispatch + portable + neon (ARM64)
+# Blake3 hashing — portable host implementation.
 BLAKE3_SRCS = \
 	src/util/blake3/blake3.c \
 	src/util/blake3/blake3_dispatch.c \
-	src/util/blake3/blake3_portable.c \
-	src/util/blake3/blake3_neon.c
+	src/util/blake3/blake3_portable.c
 
 # C11 threads compat (POSIX implementation)
 C11_THREADS_SRCS = src/c11/impl/threads_posix.c src/c11/impl/time.c
@@ -284,6 +298,10 @@ LIBPSBC_OBJS = \
 
 %.cpp.o: %.cpp | $(GENERATED)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+# These two objects share the public metadata ABI.  Keep the thin CLI in
+# lockstep with the library when its layout changes.
+cmd/psbc/main.o libpsbc/psbc_compile.o: libpsbc/psbc_compile.h
 
 ifndef OPENGNM_PSBC_ORBIS
 # === Static library (libpsbc.a) ===

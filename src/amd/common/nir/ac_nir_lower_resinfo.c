@@ -362,6 +362,24 @@ static bool lower_resinfo(nir_builder *b, nir_instr *instr, void *data)
             }
          }
 
+         /* Gallium can represent fixed texture units solely with the legacy
+          * texture_index field.  Preserve that form in a descriptor query;
+          * radv_nir_lower_descriptors resolves it against set 0 below. */
+         if (!desc) {
+            new_tex = nir_tex_instr_create(b->shader, 0);
+            new_tex->op = nir_texop_descriptor_amd;
+            new_tex->sampler_dim = tex->sampler_dim;
+            new_tex->is_array = tex->is_array;
+            new_tex->texture_index = tex->texture_index;
+            new_tex->sampler_index = tex->sampler_index;
+            new_tex->can_speculate = tex->can_speculate;
+            new_tex->dest_type = nir_type_int32;
+            nir_def_init(&new_tex->instr, &new_tex->def,
+                         nir_tex_instr_dest_size(new_tex), 32);
+            nir_builder_instr_insert(b, &new_tex->instr);
+            desc = &new_tex->def;
+         }
+
          switch (tex->op) {
          case nir_texop_txs:
             result = lower_query_size(b, desc, lod, tex->sampler_dim, tex->is_array,

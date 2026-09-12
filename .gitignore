@@ -57,6 +57,7 @@ config.mak
 # Test artifacts
 tests/*.spv
 tests/*.sb
+tests/*.metadata.json
 
 # Editor / OS
 .DS_Store

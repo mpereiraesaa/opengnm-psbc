@@ -1,0 +1,144 @@
+; SPIR-V
+; Version: 1.3
+; Generator: Khronos Glslang Reference Front End; 11
+; Bound: 75
+; Schema: 0
+               OpCapability Geometry
+               OpCapability TransformFeedback
+               OpExtension "SPV_EXT_transform_feedback"
+          %1 = OpExtInstImport "GLSL.std.450"
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Geometry %main "main" %_ %gl_in %captured
+               OpExecutionMode %main Triangles
+               OpExecutionMode %main Invocations 1
+               OpExecutionMode %main OutputTriangleStrip
+               OpExecutionMode %main OutputVertices 6
+               OpExecutionMode %main Xfb
+               OpSource GLSL 450
+               OpName %main "main"
+               OpName %primitive "primitive"
+               OpName %offset "offset"
+               OpName %i "i"
+               OpName %gl_PerVertex "gl_PerVertex"
+               OpMemberName %gl_PerVertex 0 "gl_Position"
+               OpMemberName %gl_PerVertex 1 "gl_PointSize"
+               OpMemberName %gl_PerVertex 2 "gl_ClipDistance"
+               OpMemberName %gl_PerVertex 3 "gl_CullDistance"
+               OpName %_ ""
+               OpName %gl_PerVertex_0 "gl_PerVertex"
+               OpMemberName %gl_PerVertex_0 0 "gl_Position"
+               OpMemberName %gl_PerVertex_0 1 "gl_PointSize"
+               OpMemberName %gl_PerVertex_0 2 "gl_ClipDistance"
+               OpMemberName %gl_PerVertex_0 3 "gl_CullDistance"
+               OpName %gl_in "gl_in"
+               OpName %captured "captured"
+               OpDecorate %gl_PerVertex Block
+               OpMemberDecorate %gl_PerVertex 0 BuiltIn Position
+               OpMemberDecorate %gl_PerVertex 1 BuiltIn PointSize
+               OpMemberDecorate %gl_PerVertex 2 BuiltIn ClipDistance
+               OpMemberDecorate %gl_PerVertex 3 BuiltIn CullDistance
+               OpDecorate %gl_PerVertex_0 Block
+               OpMemberDecorate %gl_PerVertex_0 0 BuiltIn Position
+               OpMemberDecorate %gl_PerVertex_0 1 BuiltIn PointSize
+               OpMemberDecorate %gl_PerVertex_0 2 BuiltIn ClipDistance
+               OpMemberDecorate %gl_PerVertex_0 3 BuiltIn CullDistance
+               OpDecorate %captured Location 0
+               OpDecorate %captured XfbBuffer 0
+               OpDecorate %captured XfbStride 8
+               OpDecorate %captured Offset 0
+       %void = OpTypeVoid
+          %3 = OpTypeFunction %void
+        %int = OpTypeInt 32 1
+%_ptr_Function_int = OpTypePointer Function %int
+      %int_0 = OpConstant %int 0
+      %int_2 = OpConstant %int 2
+       %bool = OpTypeBool
+      %float = OpTypeFloat 32
+    %v2float = OpTypeVector %float 2
+%_ptr_Function_v2float = OpTypePointer Function %v2float
+ %float_0_25 = OpConstant %float 0.25
+  %float_0_5 = OpConstant %float 0.5
+      %int_3 = OpConstant %int 3
+    %v4float = OpTypeVector %float 4
+       %uint = OpTypeInt 32 0
+     %uint_1 = OpConstant %uint 1
+%_arr_float_uint_1 = OpTypeArray %float %uint_1
+%gl_PerVertex = OpTypeStruct %v4float %float %_arr_float_uint_1 %_arr_float_uint_1
+%_ptr_Output_gl_PerVertex = OpTypePointer Output %gl_PerVertex
+          %_ = OpVariable %_ptr_Output_gl_PerVertex Output
+%gl_PerVertex_0 = OpTypeStruct %v4float %float %_arr_float_uint_1 %_arr_float_uint_1
+     %uint_3 = OpConstant %uint 3
+%_arr_gl_PerVertex_0_uint_3 = OpTypeArray %gl_PerVertex_0 %uint_3
+%_ptr_Input__arr_gl_PerVertex_0_uint_3 = OpTypePointer Input %_arr_gl_PerVertex_0_uint_3
+      %gl_in = OpVariable %_ptr_Input__arr_gl_PerVertex_0_uint_3 Input
+%_ptr_Input_v4float = OpTypePointer Input %v4float
+    %float_0 = OpConstant %float 0
+%_ptr_Output_v4float = OpTypePointer Output %v4float
+%_ptr_Output_v2float = OpTypePointer Output %v2float
+   %captured = OpVariable %_ptr_Output_v2float Output
+      %int_1 = OpConstant %int 1
+       %main = OpFunction %void None %3
+          %5 = OpLabel
+  %primitive = OpVariable %_ptr_Function_int Function
+     %offset = OpVariable %_ptr_Function_v2float Function
+          %i = OpVariable %_ptr_Function_int Function
+               OpStore %primitive %int_0
+               OpBranch %10
+         %10 = OpLabel
+               OpLoopMerge %12 %13 None
+               OpBranch %14
+         %14 = OpLabel
+         %15 = OpLoad %int %primitive
+         %18 = OpSLessThan %bool %15 %int_2
+               OpBranchConditional %18 %11 %12
+         %11 = OpLabel
+         %23 = OpLoad %int %primitive
+         %24 = OpConvertSToF %float %23
+         %26 = OpFMul %float %24 %float_0_25
+         %27 = OpLoad %int %primitive
+         %28 = OpConvertSToF %float %27
+         %30 = OpFMul %float %28 %float_0_5
+         %31 = OpCompositeConstruct %v2float %26 %30
+               OpStore %offset %31
+               OpStore %i %int_0
+               OpBranch %33
+         %33 = OpLabel
+               OpLoopMerge %35 %36 None
+               OpBranch %37
+         %37 = OpLabel
+         %38 = OpLoad %int %i
+         %40 = OpSLessThan %bool %38 %int_3
+               OpBranchConditional %40 %34 %35
+         %34 = OpLabel
+         %53 = OpLoad %int %i
+         %55 = OpAccessChain %_ptr_Input_v4float %gl_in %53 %int_0
+         %56 = OpLoad %v4float %55
+         %57 = OpLoad %v2float %offset
+         %59 = OpCompositeExtract %float %57 0
+         %60 = OpCompositeExtract %float %57 1
+         %61 = OpCompositeConstruct %v4float %59 %60 %float_0 %float_0
+         %62 = OpFAdd %v4float %56 %61
+         %64 = OpAccessChain %_ptr_Output_v4float %_ %int_0
+               OpStore %64 %62
+         %67 = OpAccessChain %_ptr_Output_v4float %_ %int_0
+         %68 = OpLoad %v4float %67
+         %69 = OpVectorShuffle %v2float %68 %68 0 1
+               OpStore %captured %69
+               OpEmitVertex
+               OpBranch %36
+         %36 = OpLabel
+         %70 = OpLoad %int %i
+         %72 = OpIAdd %int %70 %int_1
+               OpStore %i %72
+               OpBranch %33
+         %35 = OpLabel
+               OpEndPrimitive
+               OpBranch %13
+         %13 = OpLabel
+         %73 = OpLoad %int %primitive
+         %74 = OpIAdd %int %73 %int_1
+               OpStore %primitive %74
+               OpBranch %10
+         %12 = OpLabel
+               OpReturn
+               OpFunctionEnd

@@ -362,14 +362,20 @@ for src_t in [tint, tuint, tfloat, tbool]:
               # an uint.", but we define the NIR opcodes the SPIRV way.
               if dst_t == tuint:
                    min = "0.0"
-                   max = "u_uintN_max({})".format(dst_bit_size)
+                   # 2^dst_bit_size is a power of 2 and exactly representable
+                   # in float, avoiding the rounding issue with u_uintN_max().
+                   max = "{}.0".format(2 ** dst_bit_size)
               else:
                    min = "u_intN_min({})".format(dst_bit_size)
-                   max = "u_intN_max({})".format(dst_bit_size)
+                   # 2^(dst_bit_size-1) is exactly representable in float,
+                   # unlike i_intN_max() which rounds up when converted.
+                   max = "{}.0".format(2 ** (dst_bit_size - 1))
               conv_expr = f"""
-                dst = src0;
-                if (src0 < {min} || src0 > {max}) {{
+                if (isnan(src0) || src0 < {min} || src0 >= {max}) {{
                    poison = true;
+                   dst = 0;
+                }} else {{
+                   dst = src0;
                 }}
               """
               unop_numeric_convert("{0}2{1}{2}".format(src_t[0], dst_t[0],
@@ -506,10 +512,10 @@ dst.x = (src0.x & 0xffff) | (src0.y << 16);
 """)
 
 unop_horiz("pack_uvec4_to_uint", 1, tuint32, 4, tuint32, """
-dst.x = (src0.x <<  0) |
-        (src0.y <<  8) |
-        (src0.z << 16) |
-        (src0.w << 24);
+dst.x = ((src0.x & 0xff) <<  0) |
+        ((src0.y & 0xff) <<  8) |
+        ((src0.z & 0xff) << 16) |
+        ((src0.w & 0xff) << 24);
 """)
 
 unop_horiz("pack_32_4x8", 1, tuint32, 4, tuint8,
@@ -1378,6 +1384,17 @@ if (bits == 0) {
 }
 """)
 
+# Etnaviv-specific bitfield insert. The hardware bit_insert reads the bit offset
+# and bit count from the two channels of the third source, so they are packed
+# into one vec2.
+opcode("bitfield_insert_etna", 0, tuint, [0, 0, 2],
+       [tuint, tuint, tint32], False, "", """
+unsigned base = src0, insert = src1;
+int offset = src2.x, bits = src2.y;
+unsigned mask = ((1ull << bits) - 1) << offset;
+dst = (base & ~mask) | ((insert << offset) & mask);
+""")
+
 quadop_horiz("vec4", 4, 1, 1, 1, 1, """
 dst.x = src0.x;
 dst.y = src1.x;
@@ -1464,6 +1481,24 @@ triop_shift_ir3("shlm_ir3", "<<", "&")
 triop_shift_ir3("shrg_ir3", ">>", "|")
 triop_shift_ir3("shlg_ir3", "<<", "|")
 triop("andg_ir3", tuint, _2src_commutative, "(src0 & src1) | src2")
+
+def triop_shift_pan(name, type0, shift_expr):
+    shift_decl = "uint8_t shift_mask = (bit_size - 1); \
+                  uint8_t shift = src1 & shift_mask;"
+    opcode(name + '_and_pan', 0, type0, [0, 0, 0], [type0, tuint8, tuint],
+           False, "", f"{shift_decl}; dst = ({shift_expr}) & src2;")
+    opcode(name + '_or_pan', 0, type0, [0, 0, 0], [type0, tuint8, tuint],
+           False, "", f"{shift_decl}; dst = ({shift_expr}) | src2;")
+    opcode(name + '_xor_pan', 0, type0, [0, 0, 0], [type0, tuint8, tuint],
+           False, "", f"{shift_decl}; dst = ({shift_expr}) ^ src2;")
+
+triop_shift_pan("arshift", tint, "src0 >> shift")
+triop_shift_pan("lshift", tuint, "src0 << shift")
+triop_shift_pan("rshift", tuint, "src0 >> shift")
+triop_shift_pan("lrot", tuint, "(src0 << shift) |\
+                                (src0 >> ((-shift) & shift_mask))")
+triop_shift_pan("rrot", tuint, "(src0 >> shift) |\
+                                (src0 << ((-shift) & shift_mask))")
 
 # r600/gcn specific instruction that evaluates unnormalized cube texture coordinates
 # and face index

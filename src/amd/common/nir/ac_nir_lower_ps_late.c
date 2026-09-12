@@ -741,7 +741,9 @@ ac_nir_lower_ps_late(nir_shader *nir, const ac_nir_lower_ps_late_options *option
    lower_ps_state state = {
       .options = options,
       .has_dual_src_blending = options->dual_src_blend,
-      .dual_src_blend_swizzle = options->dual_src_blend && options->gfx_level >= GFX11,
+      .dual_src_blend_swizzle =
+         options->dual_src_blend &&
+         (options->gfx_level >= GFX11 || options->force_dual_src_blend_swizzle),
       .spi_shader_col_format = options->spi_shader_col_format,
    };
 
