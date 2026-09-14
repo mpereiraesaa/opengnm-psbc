@@ -22,6 +22,12 @@ GLSLANG ?= glslangValidator
 
 all: $(PSBC)
 
+.PHONY: test-fragment-input-bases
+test-fragment-input-bases: $(LIBPSBC)
+	$(GLSLANG) -V --target-env vulkan1.0 tests/fragment-input-bases.frag -o tests/fragment-input-bases.spv
+	$(CC) -std=c11 -Wall -Wextra -Werror -Ilibpsbc tests/test_fragment_input_bases.c $(LIBPSBC) -lstdc++ -lm -lpthread -o tests/test_fragment_input_bases
+	./tests/test_fragment_input_bases tests/fragment-input-bases.spv
+
 .PHONY: test-vertex-bindings
 test-vertex-bindings: $(LIBPSBC)
 	$(GLSLANG) -V --target-env vulkan1.0 tests/vertex-bindings.vert -o tests/vertex-bindings.spv

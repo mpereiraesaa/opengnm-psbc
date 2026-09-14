@@ -1783,6 +1783,14 @@ static nir_shader* prepare_stage_nir(
     }
     nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
     radv_nir_lower_io(nir);
+    /* Standalone SPIR-V has not gone through graphics-pipeline IO linking.
+     * Its variables can all have driver_location zero. Canonicalize fragment
+     * input bases from semantic locations before RADV gathers input masks and
+     * ACO assigns interpolation attributes; otherwise distinct varyings alias.
+     * Keep VS input bases alone: vertex descriptor locations are externally
+     * specified. Later PS5 mixed-interpolation alias splitting still applies. */
+    if (nir->info.stage == MESA_SHADER_FRAGMENT)
+        NIR_PASS(_, nir, nir_recompute_io_bases, nir_var_shader_in);
     stage->nir = nir;
     return nir;
 }
