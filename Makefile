@@ -17,7 +17,7 @@ PSBC ?= opengnm-psbc
 LIBPSBC ?= libpsbc.a
 GLSLANG ?= glslangValidator
 
-.PHONY: all clean install generated libpsbc test-runtime-parameters test-storage-widths
+.PHONY: all clean install generated libpsbc test-runtime-parameters test-storage-widths test-core-vertex-formats
 .DEFAULT_GOAL := all
 
 all: $(PSBC)
@@ -35,6 +35,9 @@ test-storage-widths: $(LIBPSBC)
 	$(GLSLANG) -V --target-env vulkan1.0 tests/storage16.comp -o tests/storage16.spv
 	$(CC) -std=c11 -Wall -Wextra -Werror -Ilibpsbc tests/test_storage_widths.c $(LIBPSBC) -lstdc++ -lm -lpthread -o tests/test_storage_widths
 	./tests/test_storage_widths
+
+test-core-vertex-formats: $(PSBC)
+	$(PYTHON) tests/verify_core_vertex_formats.py --psbc ./$(PSBC) --glslang $(GLSLANG)
 
 # === AMD register JSON files (for codegen) ===
 # Include all GPU generations so all register fields are available

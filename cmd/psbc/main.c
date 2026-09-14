@@ -63,6 +63,33 @@ static PsbcVertexFormat parse_vertex_format(const char* name) {
 	if (!strcmp(name, "r32g32_uint")) return PSBC_VERTEX_FORMAT_R32G32_UINT;
 	if (!strcmp(name, "r32g32b32_uint")) return PSBC_VERTEX_FORMAT_R32G32B32_UINT;
 	if (!strcmp(name, "r32g32b32a32_uint")) return PSBC_VERTEX_FORMAT_R32G32B32A32_UINT;
+	if (!strcmp(name, "r8_unorm")) return PSBC_VERTEX_FORMAT_R8_UNORM;
+	if (!strcmp(name, "r8_snorm")) return PSBC_VERTEX_FORMAT_R8_SNORM;
+	if (!strcmp(name, "r8_uint")) return PSBC_VERTEX_FORMAT_R8_UINT;
+	if (!strcmp(name, "r8_sint")) return PSBC_VERTEX_FORMAT_R8_SINT;
+	if (!strcmp(name, "r8g8_unorm")) return PSBC_VERTEX_FORMAT_R8G8_UNORM;
+	if (!strcmp(name, "r8g8_snorm")) return PSBC_VERTEX_FORMAT_R8G8_SNORM;
+	if (!strcmp(name, "r8g8_uint")) return PSBC_VERTEX_FORMAT_R8G8_UINT;
+	if (!strcmp(name, "r8g8_sint")) return PSBC_VERTEX_FORMAT_R8G8_SINT;
+	if (!strcmp(name, "r8g8b8a8_unorm")) return PSBC_VERTEX_FORMAT_R8G8B8A8_UNORM;
+	if (!strcmp(name, "r8g8b8a8_snorm")) return PSBC_VERTEX_FORMAT_R8G8B8A8_SNORM;
+	if (!strcmp(name, "r8g8b8a8_uint")) return PSBC_VERTEX_FORMAT_R8G8B8A8_UINT;
+	if (!strcmp(name, "r8g8b8a8_sint")) return PSBC_VERTEX_FORMAT_R8G8B8A8_SINT;
+	if (!strcmp(name, "r16_unorm")) return PSBC_VERTEX_FORMAT_R16_UNORM;
+	if (!strcmp(name, "r16_snorm")) return PSBC_VERTEX_FORMAT_R16_SNORM;
+	if (!strcmp(name, "r16_uint")) return PSBC_VERTEX_FORMAT_R16_UINT;
+	if (!strcmp(name, "r16_sint")) return PSBC_VERTEX_FORMAT_R16_SINT;
+	if (!strcmp(name, "r16_float")) return PSBC_VERTEX_FORMAT_R16_FLOAT;
+	if (!strcmp(name, "r16g16_unorm")) return PSBC_VERTEX_FORMAT_R16G16_UNORM;
+	if (!strcmp(name, "r16g16_snorm")) return PSBC_VERTEX_FORMAT_R16G16_SNORM;
+	if (!strcmp(name, "r16g16_uint")) return PSBC_VERTEX_FORMAT_R16G16_UINT;
+	if (!strcmp(name, "r16g16_sint")) return PSBC_VERTEX_FORMAT_R16G16_SINT;
+	if (!strcmp(name, "r16g16_float")) return PSBC_VERTEX_FORMAT_R16G16_FLOAT;
+	if (!strcmp(name, "r16g16b16a16_unorm")) return PSBC_VERTEX_FORMAT_R16G16B16A16_UNORM;
+	if (!strcmp(name, "r16g16b16a16_snorm")) return PSBC_VERTEX_FORMAT_R16G16B16A16_SNORM;
+	if (!strcmp(name, "r16g16b16a16_uint")) return PSBC_VERTEX_FORMAT_R16G16B16A16_UINT;
+	if (!strcmp(name, "r16g16b16a16_sint")) return PSBC_VERTEX_FORMAT_R16G16B16A16_SINT;
+	if (!strcmp(name, "r16g16b16a16_float")) return PSBC_VERTEX_FORMAT_R16G16B16A16_FLOAT;
 	return PSBC_VERTEX_FORMAT_NONE;
 }
 
