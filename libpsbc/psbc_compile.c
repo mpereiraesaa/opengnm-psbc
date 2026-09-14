@@ -646,6 +646,8 @@ static void fill_shader_metadata(const BuildContext* ctx,
          (ctx->stage == MESA_SHADER_GEOMETRY && ctx->ngg)) &&
         ctx->rargs->ac.vertex_buffers.used) {
         metadata->vertex_buffer_table_valid = true;
+        metadata->vertex_buffer_usage_mask = ctx->rinfo->vs.vb_desc_usage_mask;
+        metadata->vertex_buffer_per_attribute = ctx->rinfo->vs.use_per_attribute_vb_descs;
         metadata->vertex_buffer_table_user_data_dword =
             ctx->rargs->user_sgprs_locs
                 .shader_data[AC_UD_VS_VERTEX_BUFFERS].sgpr_idx;

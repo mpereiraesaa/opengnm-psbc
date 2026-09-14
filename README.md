@@ -34,6 +34,10 @@ The PS5 GPU is RDNA2 (GFX10.3). Legacy PS4 (GFX7) and PS4 Pro
 - Vulkan specialization constants and an indirect push-constant pointer ABI
   are available through `PsbcCompileOptions`; emitted metadata reports the
   compiler-selected user-SGPR slot and the required push-constant byte range.
+- Metadata version 11 includes the optimized vertex-buffer descriptor usage
+  mask and whether it indexes bindings or attributes. Descriptor tables must
+  be packed in increasing set-bit order; unused inputs can disappear during
+  optimization. All library consumers must rebuild against the updated header.
 - Narrow integer and storage capabilities are explicit `PsbcCompileOptions`
   opt-ins. SPIR-V requiring 8/16-bit arithmetic or storage is rejected before
   lowering unless the caller enables the matching logical-device capability;

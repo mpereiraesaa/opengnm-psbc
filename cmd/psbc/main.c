@@ -362,6 +362,10 @@ static void write_metadata(const char* path, const PsbcShaderOutput* output) {
 		fprintf(h, "%u", metadata->vertex_buffer_table_user_data_dword);
 	else
 		fprintf(h, "null");
+	fprintf(h, ",\n  \"vertex_buffer_usage_mask\": %u,\n"
+	           "  \"vertex_buffer_per_attribute\": %s",
+	        metadata->vertex_buffer_usage_mask,
+	        metadata->vertex_buffer_per_attribute ? "true" : "false");
 	fprintf(h, ",\n  \"descriptor_set0_user_data_dword\": ");
 	if (metadata->descriptor_set0_valid)
 		fprintf(h, "%u", metadata->descriptor_set0_user_data_dword);

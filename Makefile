@@ -22,6 +22,12 @@ GLSLANG ?= glslangValidator
 
 all: $(PSBC)
 
+.PHONY: test-vertex-bindings
+test-vertex-bindings: $(LIBPSBC)
+	$(GLSLANG) -V --target-env vulkan1.0 tests/vertex-bindings.vert -o tests/vertex-bindings.spv
+	$(CC) -std=c11 -Wall -Wextra -Werror -Ilibpsbc tests/test_vertex_bindings.c $(LIBPSBC) -lstdc++ -lm -lpthread -o tests/test_vertex_bindings
+	./tests/test_vertex_bindings tests/vertex-bindings.spv
+
 test-runtime-parameters: $(LIBPSBC)
 	$(GLSLANG) -V --target-env vulkan1.0 tests/runtime_parameters.comp -o tests/runtime_parameters.spv
 	$(CC) -std=c11 -Wall -Wextra -Werror -Ilibpsbc tests/test_runtime_parameters.c $(LIBPSBC) -lstdc++ -lm -lpthread -o tests/test_runtime_parameters
