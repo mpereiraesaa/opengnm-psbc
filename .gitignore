@@ -59,6 +59,7 @@ tests/*.spv
 tests/*.sb
 tests/*.metadata.json
 tests/test_vertex_bindings
+tests/test_fragment_input_bases
 
 # Editor / OS
 .DS_Store

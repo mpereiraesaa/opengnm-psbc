@@ -133,6 +133,14 @@ applications. The `vulkan-ps4` ICD links it to provide
 
 ## Dependencies
 
+Standalone fragment compilation recomputes NIR input bases from semantic
+locations after lowering IO. This prevents multiple SPIR-V varyings from
+aliasing attribute zero when no graphics-pipeline linker assigned driver
+locations. Vertex input locations are not renumbered. Run
+`make test-fragment-input-bases` to check sparse smooth and flat float/int/uint
+inputs, their AGC semantic metadata, and both provoking-vertex modes. This
+compiler test alone does not establish rendered-pixel correctness.
+
 - **Mesa 26.2.0** — NIR, SPIRV-to-NIR, ACO, radv shader info (vendored in `src/`)
 - **opengnm** — GNM shader binary format types (`GnmShaderFileHeader`, etc.)
 - **OpenOrbis PS4 Toolchain** — for PS4 cross-compilation (optional)
