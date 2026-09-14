@@ -58,6 +58,7 @@ config.mak
 tests/*.spv
 tests/*.sb
 tests/*.metadata.json
+tests/test_vertex_bindings
 
 # Editor / OS
 .DS_Store

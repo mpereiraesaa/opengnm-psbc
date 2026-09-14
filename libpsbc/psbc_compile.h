@@ -20,7 +20,7 @@
 extern "C" {
 #endif
 
-#define PSBC_SHADER_METADATA_VERSION 10u
+#define PSBC_SHADER_METADATA_VERSION 11u
 
 struct nir_shader;
 struct nir_shader_compiler_options;
@@ -232,6 +232,12 @@ typedef struct {
     bool                 ngg_lds_layout_valid;
     uint32_t             ngg_lds_layout_user_data_dword;
     uint32_t             ngg_lds_layout; /* GS output base in bytes, after ES inputs. */
+    /* Optimized RADV vertex-buffer SRD usage. Descriptors are densely packed
+     * in increasing set-bit order. The mask indexes bindings unless the
+     * per-attribute flag is true, in which case it indexes attribute locations.
+     * Both fields are zero when vertex_buffer_table_valid is false. */
+    uint32_t             vertex_buffer_usage_mask;
+    bool                 vertex_buffer_per_attribute;
 } PsbcShaderMetadata;
 
 typedef struct {
