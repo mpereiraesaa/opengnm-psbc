@@ -23,7 +23,7 @@ int main(int argc,char **argv)
         options.specialization_constants[0].size=4;
         PsbcShaderOutput output={0};
         assert(psbc_compile_shader(words,(size_t)length,&options,&output)==PSBC_RESULT_OK);
-        assert(output.metadata.version==11 && output.metadata.vertex_buffer_table_valid);
+        assert(output.metadata.version==PSBC_SHADER_METADATA_VERSION && output.metadata.vertex_buffer_table_valid);
         assert(output.metadata.vertex_buffer_usage_mask==(variant?0x8000u:0xffffu));
         assert(!output.metadata.vertex_buffer_per_attribute);
         assert(output.metadata.vertex_buffer_table_user_data_dword<output.metadata.user_sgpr_count);

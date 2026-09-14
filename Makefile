@@ -48,6 +48,12 @@ test-storage-widths: $(LIBPSBC)
 	$(CC) -std=c11 -Wall -Wextra -Werror -Ilibpsbc tests/test_storage_widths.c $(LIBPSBC) -lstdc++ -lm -lpthread -o tests/test_storage_widths
 	./tests/test_storage_widths
 
+.PHONY: test-descriptor-static-use
+test-descriptor-static-use: $(LIBPSBC)
+	$(GLSLANG) -V --target-env vulkan1.0 tests/descriptor-static-use.frag -o tests/descriptor-static-use.spv
+	$(CC) -std=c11 -Wall -Wextra -Werror -Ilibpsbc tests/test_descriptor_static_use.c $(LIBPSBC) -lstdc++ -lm -lpthread -o tests/test_descriptor_static_use
+	./tests/test_descriptor_static_use
+
 test-core-vertex-formats: $(PSBC)
 	$(PYTHON) tests/verify_core_vertex_formats.py --psbc ./$(PSBC) --glslang $(GLSLANG)
 
