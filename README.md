@@ -109,6 +109,7 @@ make                    # builds opengnm-psbc CLI + libpsbc.a
 python3 tests/verify_sb.py  # compile + verify all 8 shader stage test shaders
 make test-runtime-parameters # verify specialization + push metadata/codegen
 make test-storage-widths # verify fail-closed 8/16-bit capability gates + lowering
+make test-core-vertex-formats # compile all exposed 8/16-bit vertex families
 make install DESTDIR=/usr/local
 ```
 
