@@ -20,7 +20,7 @@
 extern "C" {
 #endif
 
-#define PSBC_SHADER_METADATA_VERSION 11u
+#define PSBC_SHADER_METADATA_VERSION 12u
 
 struct nir_shader;
 struct nir_shader_compiler_options;
@@ -214,6 +214,13 @@ typedef struct {
     uint32_t             push_constant_size;
     uint32_t             descriptor_binding_count;
     PsbcDescriptorBinding descriptor_bindings[PSBC_MAX_DESCRIPTOR_BINDINGS];
+    /* Bindings this stage statically uses, per descriptor set, derived from the
+     * optimized NIR that ACO consumes. Bit B of entry S means (set S, binding B)
+     * is dereferenced by the compiled stage; a set the NIR uses whose binding
+     * cannot be identified falls back to every layout binding of that set so a
+     * consumer cannot treat an unknown entry as unused. All entries are zero
+     * unless the caller asked for static descriptor use. */
+    uint64_t             descriptor_used_binding_mask[PSBC_MAX_DESCRIPTOR_SETS];
     bool                 base_vertex_valid;
     uint32_t             base_vertex_user_data_dword;
     bool                 start_instance_valid;
@@ -284,6 +291,11 @@ typedef struct {
     bool        enable_uniform_and_storage_buffer_8bit_access;
     bool        enable_storage_buffer_16bit_access;
     bool        enable_uniform_and_storage_buffer_16bit_access;
+    /* Derive the used descriptor sets, and the used bindings inside them, from
+     * the optimized NIR instead of treating every layout binding as used.  A
+     * caller that supplies legacy texture indices carrying no Vulkan deref must
+     * leave this false and keep the conservative layout fallback. */
+    bool        static_descriptor_use;
 } PsbcCompileOptions;
 
 /* === API === */

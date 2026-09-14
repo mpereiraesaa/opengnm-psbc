@@ -319,6 +319,9 @@ typedef struct {
     uint32_t address32_hi;
     const PsbcCompileOptions* options;
     const PsbcInputSemantics* input_semantics;
+    /* Bindings the compiled stage statically uses, per set; zero when the caller
+     * did not request static descriptor use. */
+    uint64_t descriptor_used_binding_mask[PSBC_MAX_DESCRIPTOR_SETS];
 } BuildContext;
 
 static unsigned ps5_last_provoking_vertex(uint32_t primitive_type) {
@@ -596,6 +599,76 @@ static uint32_t build_spi_shader_pos_format(unsigned num_pos_exports) {
                                           : V_02870C_SPI_SHADER_NONE);
 }
 
+/* Record one statically used descriptor binding. Sets and binding numbers
+ * outside the metadata ABI cannot be represented, so they are reported through
+ * the caller-visible set mask instead (see gather_static_descriptor_use). */
+static void record_descriptor_use(uint32_t set, uint32_t binding,
+                                  uint32_t *set_mask,
+                                  uint64_t binding_mask[PSBC_MAX_DESCRIPTOR_SETS])
+{
+    if (set >= PSBC_MAX_DESCRIPTOR_SETS)
+        return;
+    *set_mask |= 1u << set;
+    if (binding < 64u)
+        binding_mask[set] |= 1ull << binding;
+}
+
+/* Walk the optimized NIR that ACO consumes and record the descriptor bindings
+ * the stage really dereferences. RADV's own info pass records the same sources
+ * as a set mask; the standalone ABI also needs the binding identity so a
+ * consumer can tell a required descriptor from a declared-but-unused one. */
+static void gather_static_descriptor_use(
+    const nir_shader *nir, uint32_t *set_mask,
+    uint64_t binding_mask[PSBC_MAX_DESCRIPTOR_SETS])
+{
+    nir_foreach_function_impl(impl, nir) {
+        nir_foreach_block(block, impl) {
+            nir_foreach_instr(instr, block) {
+                if (instr->type == nir_instr_type_intrinsic) {
+                    nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
+                    switch (intrin->intrinsic) {
+                    case nir_intrinsic_vulkan_resource_index:
+                        record_descriptor_use(nir_intrinsic_desc_set(intrin),
+                                              nir_intrinsic_binding(intrin),
+                                              set_mask, binding_mask);
+                        break;
+                    case nir_intrinsic_image_deref_load:
+                    case nir_intrinsic_image_deref_sparse_load:
+                    case nir_intrinsic_image_deref_store:
+                    case nir_intrinsic_image_deref_atomic:
+                    case nir_intrinsic_image_deref_atomic_swap:
+                    case nir_intrinsic_image_deref_size:
+                    case nir_intrinsic_image_deref_samples: {
+                        const nir_variable *var = nir_deref_instr_get_variable(
+                            nir_def_as_deref(intrin->src[0].ssa));
+                        if (var)
+                            record_descriptor_use(var->data.descriptor_set,
+                                                  var->data.binding,
+                                                  set_mask, binding_mask);
+                        break;
+                    }
+                    default:
+                        break;
+                    }
+                } else if (instr->type == nir_instr_type_tex) {
+                    nir_tex_instr *tex = nir_instr_as_tex(instr);
+                    for (unsigned i = 0; i < tex->num_srcs; ++i) {
+                        if (tex->src[i].src_type != nir_tex_src_texture_deref &&
+                            tex->src[i].src_type != nir_tex_src_sampler_deref)
+                            continue;
+                        const nir_variable *var = nir_deref_instr_get_variable(
+                            nir_src_as_deref(tex->src[i].src));
+                        if (var)
+                            record_descriptor_use(var->data.descriptor_set,
+                                                  var->data.binding,
+                                                  set_mask, binding_mask);
+                    }
+                }
+            }
+        }
+    }
+}
+
 static void fill_shader_metadata(const BuildContext* ctx,
                                  PsbcShaderMetadata* metadata) {
     memset(metadata, 0, sizeof(*metadata));
@@ -700,6 +773,28 @@ static void fill_shader_metadata(const BuildContext* ctx,
     memcpy(metadata->descriptor_bindings, ctx->options->descriptor_bindings,
            metadata->descriptor_binding_count *
                sizeof(metadata->descriptor_bindings[0]));
+    /* The per-binding use mask backs the "required" side of the runtime
+     * delivery contract. With static descriptor use it comes from the optimized
+     * NIR; a set RADV reports as used whose binding the walk could not name
+     * falls back to every declared binding of that set so an unknown entry can
+     * never look unused. Without the option the whole declaration is reported,
+     * which is the conservative legacy behaviour. */
+    if (ctx->options->descriptor_binding_count &&
+        ctx->options->static_descriptor_use) {
+        memcpy(metadata->descriptor_used_binding_mask,
+               ctx->descriptor_used_binding_mask,
+               sizeof(metadata->descriptor_used_binding_mask));
+    } else {
+        for (uint32_t i = 0; i < metadata->descriptor_binding_count; ++i) {
+            const PsbcDescriptorBinding* declared =
+                &metadata->descriptor_bindings[i];
+            if (declared->set >= PSBC_MAX_DESCRIPTOR_SETS ||
+                declared->binding >= 64u)
+                continue;
+            metadata->descriptor_used_binding_mask[declared->set] |=
+                1ull << declared->binding;
+        }
+    }
 
     PsbcRegisterWrite* cx = metadata->context_registers;
     PsbcRegisterWrite* sh = metadata->shader_registers;
@@ -2402,14 +2497,35 @@ static PsbcResult psbc_compile_impl(
         );
     }
     /* Legacy Gallium texture indices carry no Vulkan deref for RADV's info
-     * pass to discover. The explicit PSBC layout still requires set 0. */
-    if (opts->descriptor_binding_count) {
+     * pass to discover; that caller keeps the explicit PSBC layout. A caller
+     * that asserts static descriptor use leaves RADV's NIR-derived set mask
+     * exactly as the optimized shader produced it, so a layout binding the NIR
+     * never dereferences cannot acquire a native descriptor dependency. */
+    uint64_t static_binding_mask[PSBC_MAX_DESCRIPTOR_SETS] = {0};
+    if (opts->descriptor_binding_count && !opts->static_descriptor_use) {
         uint32_t descriptor_set_mask = 0;
         for (uint32_t i = 0; i < opts->descriptor_binding_count; ++i)
             descriptor_set_mask |= 1u << opts->descriptor_bindings[i].set;
         stage.info.desc_set_used_mask |= descriptor_set_mask;
         if (paired_geometry)
             previous.info.desc_set_used_mask |= descriptor_set_mask;
+    } else if (opts->descriptor_binding_count) {
+        /* The deref form is only visible before the descriptor lowering that
+         * precedes ACO, so record the used bindings here, next to the info pass
+         * that records the used sets from the same sources. */
+        uint32_t used_set_mask = 0;
+        gather_static_descriptor_use(nir, &used_set_mask, static_binding_mask);
+        for (uint32_t i = 0; i < opts->descriptor_binding_count; ++i) {
+            const PsbcDescriptorBinding *declared = &opts->descriptor_bindings[i];
+            uint32_t set = declared->set;
+            if (set >= PSBC_MAX_DESCRIPTOR_SETS || declared->binding >= 64u ||
+                !(stage.info.desc_set_used_mask & (1u << set)) ||
+                static_binding_mask[set] != 0)
+                continue;
+            /* A set the NIR uses whose binding the walk could not name must not
+             * look unused: fall back to this set's whole declaration. */
+            static_binding_mask[set] |= 1ull << declared->binding;
+        }
     }
     /* The native PS5 runtime uploads one bounded block and supplies its low
      * gfx1013 address. Prevent RADV from replacing any fields with inline
@@ -2628,7 +2744,7 @@ static PsbcResult psbc_compile_impl(
     uint32_t code_dw = legacy->code_size / sizeof(uint32_t);
 
     /* Build the PS4/PS5 shader binary */
-    const BuildContext buildctx = {
+    BuildContext buildctx = {
         .rinfo = &binary->info,
         .rargs = &stage.args,
         .config = &binary->config,
@@ -2646,6 +2762,8 @@ static PsbcResult psbc_compile_impl(
         .options = opts,
         .input_semantics = &input_semantics,
     };
+    memcpy(buildctx.descriptor_used_binding_mask, static_binding_mask,
+           sizeof(buildctx.descriptor_used_binding_mask));
 
     uint8_t* output_data = NULL;
     size_t output_size = 0;
