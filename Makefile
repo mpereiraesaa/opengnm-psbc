@@ -48,6 +48,16 @@ test-storage-widths: $(LIBPSBC)
 	$(CC) -std=c11 -Wall -Wextra -Werror -Ilibpsbc tests/test_storage_widths.c $(LIBPSBC) -lstdc++ -lm -lpthread -o tests/test_storage_widths
 	./tests/test_storage_widths
 
+.PHONY: test-draw-id
+test-draw-id: $(LIBPSBC)
+	# DrawIndex is a Vulkan 1.1 feature; the positive source reads it and the
+	# negative source (tri.vert) does not, so the two runs pin the slot's
+	# presence and its absence from the same options.
+	$(GLSLANG) -V --target-env vulkan1.1 tests/draw-id.vert -o tests/draw-id.spv
+	$(GLSLANG) -V --target-env vulkan1.0 tests/tri.vert -o tests/tri.spv
+	$(CC) -std=c11 -Wall -Wextra -Werror -Ilibpsbc tests/test_draw_id.c $(LIBPSBC) -lstdc++ -lm -lpthread -o tests/test_draw_id
+	./tests/test_draw_id
+
 .PHONY: test-descriptor-static-use
 test-descriptor-static-use: $(LIBPSBC)
 	$(GLSLANG) -V --target-env vulkan1.0 tests/descriptor-static-use.frag -o tests/descriptor-static-use.spv
