@@ -38,6 +38,12 @@ The PS5 GPU is RDNA2 (GFX10.3). Legacy PS4 (GFX7) and PS4 Pro
   mask and whether it indexes bindings or attributes. Descriptor tables must
   be packed in increasing set-bit order; unused inputs can disappear during
   optimization. All library consumers must rebuild against the updated header.
+- Metadata version 13 adds the DrawIndex user-data slot (`draw_id_valid` and
+  `draw_id_user_data_dword`) for stages that read the built-in. It is reported
+  only when the optimized shader really reads DrawIndex, and it names a dword
+  inside the same user-SGPR block that already carries the base-vertex and
+  start-instance slots, so a consumer that writes the block from the reported
+  offsets delivers the built-in without a second ABI.
 - Narrow integer and storage capabilities are explicit `PsbcCompileOptions`
   opt-ins. SPIR-V requiring 8/16-bit arithmetic or storage is rejected before
   lowering unless the caller enables the matching logical-device capability;
@@ -114,6 +120,7 @@ python3 tests/verify_sb.py  # compile + verify all 8 shader stage test shaders
 make test-runtime-parameters # verify specialization + push metadata/codegen
 make test-storage-widths # verify fail-closed 8/16-bit capability gates + lowering
 make test-core-vertex-formats # compile all exposed 8/16-bit vertex families
+make test-draw-id # verify the DrawIndex user-data slot and its absence
 make install DESTDIR=/usr/local
 ```
 

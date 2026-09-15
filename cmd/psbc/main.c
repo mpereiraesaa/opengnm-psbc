@@ -386,6 +386,11 @@ static void write_metadata(const char* path, const PsbcShaderOutput* output) {
 		fprintf(h, "%u", metadata->base_vertex_user_data_dword);
 	else
 		fprintf(h, "null");
+	fprintf(h, ",\n  \"draw_id_user_data_dword\": ");
+	if (metadata->draw_id_valid)
+		fprintf(h, "%u", metadata->draw_id_user_data_dword);
+	else
+		fprintf(h, "null");
 	fprintf(h, ",\n  \"start_instance_user_data_dword\": ");
 	if (metadata->start_instance_valid)
 		fprintf(h, "%u", metadata->start_instance_user_data_dword);

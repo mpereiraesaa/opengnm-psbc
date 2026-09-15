@@ -735,6 +735,21 @@ static void fill_shader_metadata(const BuildContext* ctx,
     }
     if ((ctx->stage == MESA_SHADER_VERTEX ||
          (ctx->stage == MESA_SHADER_GEOMETRY && ctx->ngg)) &&
+        ctx->rargs->ac.base_vertex.used && ctx->rargs->ac.draw_id.used) {
+        /* DrawIndex lands in the same user-data block as the base vertex, so
+         * the slot is that arg's dword offset relative to base_vertex. The
+         * base_vertex argument is required for the arithmetic to mean
+         * anything: if it were absent the pair is left invalid rather than
+         * reported at a guessed offset. */
+        const struct ac_shader_args* args = &ctx->rargs->ac;
+        metadata->draw_id_valid = true;
+        metadata->draw_id_user_data_dword =
+            metadata->base_vertex_user_data_dword +
+            args->args[args->draw_id.arg_index].offset -
+            args->args[args->base_vertex.arg_index].offset;
+    }
+    if ((ctx->stage == MESA_SHADER_VERTEX ||
+         (ctx->stage == MESA_SHADER_GEOMETRY && ctx->ngg)) &&
         ctx->rargs->ac.start_instance.used) {
         const struct ac_shader_args* args = &ctx->rargs->ac;
         metadata->start_instance_valid = true;

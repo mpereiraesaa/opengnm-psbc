@@ -20,7 +20,7 @@
 extern "C" {
 #endif
 
-#define PSBC_SHADER_METADATA_VERSION 12u
+#define PSBC_SHADER_METADATA_VERSION 13u
 
 struct nir_shader;
 struct nir_shader_compiler_options;
@@ -223,6 +223,15 @@ typedef struct {
     uint64_t             descriptor_used_binding_mask[PSBC_MAX_DESCRIPTOR_SETS];
     bool                 base_vertex_valid;
     uint32_t             base_vertex_user_data_dword;
+    /* DrawIndex, the Vulkan DrawIndex built-in (gl_DrawID). RADV declares
+     * ac.draw_id in the same ABI user-data dword block as the base vertex
+     * (AC_UD_VS_BASE_VERTEX_START_INSTANCE), so the slot reported here is an
+     * offset inside that block exactly like start_instance_user_data_dword.
+     * It is valid only when the compiled stage really reads the built-in; a
+     * caller that sees draw_id_valid false has no DrawIndex value to deliver
+     * and must not invent one. Version 13 added these two fields. */
+    bool                 draw_id_valid;
+    uint32_t             draw_id_user_data_dword;
     bool                 start_instance_valid;
     uint32_t             start_instance_user_data_dword;
     bool                 streamout_valid;
