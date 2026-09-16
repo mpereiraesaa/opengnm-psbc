@@ -391,6 +391,11 @@ static void write_metadata(const char* path, const PsbcShaderOutput* output) {
 		fprintf(h, "%u", metadata->draw_id_user_data_dword);
 	else
 		fprintf(h, "null");
+	fprintf(h, ",\n  \"view_index_user_data_dword\": ");
+	if (metadata->view_index_valid)
+		fprintf(h, "%u", metadata->view_index_user_data_dword);
+	else
+		fprintf(h, "null");
 	fprintf(h, ",\n  \"start_instance_user_data_dword\": ");
 	if (metadata->start_instance_valid)
 		fprintf(h, "%u", metadata->start_instance_user_data_dword);

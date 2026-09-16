@@ -758,6 +758,21 @@ static void fill_shader_metadata(const BuildContext* ctx,
             args->args[args->start_instance.arg_index].offset -
             args->args[args->base_vertex.arg_index].offset;
     }
+    if (ctx->stage == MESA_SHADER_VERTEX && ctx->rargs->ac.view_index.used) {
+        /* ViewIndex is declared as its own user-data location (AC_UD_VIEW_INDEX,
+         * added by RADV's vertex argument setup when the stage reads
+         * SYSTEM_VALUE_VIEW_INDEX), so its slot is that location's SGPR index in
+         * the block - not an offset inside another argument's dwords, which is
+         * what separates it from draw_id and start_instance. The stage check
+         * matches the lowering exactly: the vertex stage is the one that reads
+         * the argument, so every other stage reports no slot rather than one
+         * nothing fills. The argument is also only declared when the built-in
+         * is really read, so a vertex stage that never reads it stays invalid
+         * too. */
+        metadata->view_index_valid = true;
+        metadata->view_index_user_data_dword =
+            ctx->rargs->user_sgprs_locs.shader_data[AC_UD_VIEW_INDEX].sgpr_idx;
+    }
     if (ctx->rinfo->so.enabled_stream_buffers_mask &&
         ctx->rargs->streamout_buffers.used &&
         (ctx->ngg || (ctx->rargs->ac.streamout_config.used &&
@@ -1852,8 +1867,16 @@ static nir_shader* prepare_stage_nir(
     if (input_nir)
         stage->internal_nir = (nir_shader*)input_nir;
 
+    /* ViewIndex (gl_ViewIndex): the vertex stage is the one this profile
+     * delivers a view index to, so there the built-in must read the user-data
+     * location RADV declares for it (AC_UD_VIEW_INDEX) instead of having the
+     * read folded to zero - otherwise the exported slot would describe a value
+     * the shader never consumes. Every other stage keeps the conservative zero
+     * lowering, and the metadata reports no slot for them, so the two sides
+     * cannot disagree about which stages carry a view index. */
+    const bool deliver_view_index = stage->stage == MESA_SHADER_VERTEX;
     const struct radv_spirv_to_nir_options spirv_options = {
-        .lower_view_index_to_zero = true,
+        .lower_view_index_to_zero = !deliver_view_index,
         .lower_view_index_to_device_index = false,
     };
     nir_shader* nir = radv_shader_spirv_to_nir(
