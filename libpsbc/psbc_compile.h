@@ -244,7 +244,9 @@ typedef struct {
      * when the compiled stage really reads the built-in and only for the stages
      * this profile delivers a view index to; a caller that sees
      * view_index_valid false has no ViewIndex value to deliver and must not
-     * invent one. Version 14 added these two fields. */
+     * invent one. On PS5, vertex and fragment stages can declare this slot;
+     * the caller must fill each stage's independently assigned location for
+     * every replayed view. Version 14 added these two fields. */
     bool                 view_index_valid;
     uint32_t             view_index_user_data_dword;
     bool                 start_instance_valid;

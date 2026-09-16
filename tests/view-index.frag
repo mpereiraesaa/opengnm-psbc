@@ -1,9 +1,7 @@
 #version 450
 #extension GL_EXT_multiview : require
 
-/* The same built-in in a stage this profile does not deliver a view index to.
- * The compiler must keep lowering it to zero there and must not report a slot,
- * because nothing would write one. */
+/* PS5 replay delivers the current view through the fragment user-data slot. */
 
 layout(location = 0) in vec4 in_color;
 layout(location = 0) out vec4 out_color;
