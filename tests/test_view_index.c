@@ -8,9 +8,8 @@
  * inside the reported user-SGPR block, and it is its own location rather than a
  * dword shared with the base-vertex block DrawIndex uses.
  *
- * The negative cases keep the contract fail-closed: a shader that never reads
- * the built-in reports no slot, and a stage this profile does not deliver a
- * view index to must not be handed one even when it asks for it.
+ * Both vertex and PS5 fragment stages carry a real argument when read.
+ * Negative shaders that never read the built-in must report no slot.
  */
 #include "psbc_compile.h"
 #include <assert.h>
@@ -96,27 +95,23 @@ static void check_slot_stays_absent(void)
     free(spirv);
 }
 
-static void check_other_stages_stay_fail_closed(void)
+static void check_fragment_slot(void)
 {
     size_t bytes = 0;
     uint32_t *spirv = read_spirv("tests/view-index.frag.spv", &bytes);
-    /* The same built-in in a stage this profile does not deliver a view index
-     * to must not report a slot: the lowering keeps ViewIndex at zero there,
-     * and reporting a location nothing fills would be a fabricated value. A
-     * refusal from the frontend is just as fail-closed as a successful compile
-     * with no slot, so both outcomes are accepted and neither may produce a
-     * valid slot. */
-    PsbcCompileOptions options = {
-        .target = PSBC_TARGET_PS5, .stage = PSBC_STAGE_FRAGMENT,
-        .entrypoint = "main", .optimise = true, .address32_hi = 2,
-        .rasterization_samples = 1,
-    };
-    PsbcShaderOutput output = {0};
-    PsbcResult result = psbc_compile_shader(spirv, bytes, &options, &output);
-    if (result == PSBC_RESULT_OK) {
-        assert(!output.metadata.view_index_valid);
-        psbc_free_output(&output);
-    }
+    PsbcShaderOutput output = compile(spirv, bytes, PSBC_STAGE_FRAGMENT);
+    assert(output.metadata.view_index_valid);
+    assert(output.metadata.view_index_user_data_dword < output.metadata.user_sgpr_count);
+    assert(output.metadata.hardware_stage == PSBC_HW_STAGE_PIXEL);
+    assert(!output.metadata.base_vertex_valid && !output.metadata.draw_id_valid);
+    psbc_free_output(&output);
+    free(spirv);
+
+    spirv = read_spirv("tests/tri.frag.spv", &bytes);
+    output = compile(spirv, bytes, PSBC_STAGE_FRAGMENT);
+    assert(!output.metadata.view_index_valid);
+    assert(output.metadata.view_index_user_data_dword == 0);
+    psbc_free_output(&output);
     free(spirv);
 }
 
@@ -124,7 +119,7 @@ int main(void)
 {
     check_slot_is_declared();
     check_slot_stays_absent();
-    check_other_stages_stay_fail_closed();
+    check_fragment_slot();
     puts("ViewIndex user-data slot: declared only when read, at its own location in the user-SGPR block");
     return 0;
 }

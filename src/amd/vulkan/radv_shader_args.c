@@ -888,6 +888,12 @@ declare_shader_args(const struct radv_compiler_info *compiler_info, struct radv_
    case MESA_SHADER_FRAGMENT:
       declare_global_input_sgprs(state, gfx_level, info, user_sgpr_info);
 
+      /* PS5 standalone multiview replays each view with its own attachments.
+       * LayerID therefore cannot stand in for ViewIndex. Reserve real user
+       * data before hardware SGPRs in both argument-counting passes. */
+      if (compiler_info->key.ps5_fragment_view_index && info->uses_view_index)
+         RADV_ADD_UD_ARG(state, 1, AC_ARG_VALUE, ac.view_index, AC_UD_VIEW_INDEX);
+
       if (info->ps.has_epilog) {
          RADV_ADD_UD_ARG(state, 1, AC_ARG_VALUE, epilog_pc, AC_UD_EPILOG_PC);
       }

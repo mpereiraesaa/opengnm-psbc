@@ -758,17 +758,15 @@ static void fill_shader_metadata(const BuildContext* ctx,
             args->args[args->start_instance.arg_index].offset -
             args->args[args->base_vertex.arg_index].offset;
     }
-    if (ctx->stage == MESA_SHADER_VERTEX && ctx->rargs->ac.view_index.used) {
+    if ((ctx->stage == MESA_SHADER_VERTEX || ctx->stage == MESA_SHADER_FRAGMENT) &&
+        ctx->rargs->ac.view_index.used) {
         /* ViewIndex is declared as its own user-data location (AC_UD_VIEW_INDEX,
          * added by RADV's vertex argument setup when the stage reads
          * SYSTEM_VALUE_VIEW_INDEX), so its slot is that location's SGPR index in
          * the block - not an offset inside another argument's dwords, which is
          * what separates it from draw_id and start_instance. The stage check
-         * matches the lowering exactly: the vertex stage is the one that reads
-         * the argument, so every other stage reports no slot rather than one
-         * nothing fills. The argument is also only declared when the built-in
-         * is really read, so a vertex stage that never reads it stays invalid
-         * too. */
+         * matches the lowering: vertex and PS5 fragment stages read the
+         * argument. A stage that does not read it reports no slot. */
         metadata->view_index_valid = true;
         metadata->view_index_user_data_dword =
             ctx->rargs->user_sgprs_locs.shader_data[AC_UD_VIEW_INDEX].sgpr_idx;
@@ -1867,14 +1865,12 @@ static nir_shader* prepare_stage_nir(
     if (input_nir)
         stage->internal_nir = (nir_shader*)input_nir;
 
-    /* ViewIndex (gl_ViewIndex): the vertex stage is the one this profile
-     * delivers a view index to, so there the built-in must read the user-data
-     * location RADV declares for it (AC_UD_VIEW_INDEX) instead of having the
-     * read folded to zero - otherwise the exported slot would describe a value
-     * the shader never consumes. Every other stage keeps the conservative zero
-     * lowering, and the metadata reports no slot for them, so the two sides
-     * cannot disagree about which stages carry a view index. */
-    const bool deliver_view_index = stage->stage == MESA_SHADER_VERTEX;
+    /* Preserve the per-view value for both stages of PS5 replayed multiview.
+     * The fragment argument is declared explicitly instead of using LayerID:
+     * each replay already rebases its attachment to the selected array layer.
+     * Other targets keep their existing fragment lowering. */
+    const bool deliver_view_index = stage->stage == MESA_SHADER_VERTEX ||
+        (opts->target == PSBC_TARGET_PS5 && stage->stage == MESA_SHADER_FRAGMENT);
     const struct radv_spirv_to_nir_options spirv_options = {
         .lower_view_index_to_zero = !deliver_view_index,
         .lower_view_index_to_device_index = false,
@@ -2108,6 +2104,8 @@ static PsbcResult psbc_compile_impl(
     struct radv_compiler_info compiler_info = {0};
     compiler_info.ac = &ac_info;
     compiler_info.spirv_caps.Shader = true;
+    compiler_info.spirv_caps.MultiView = opts->target == PSBC_TARGET_PS5 &&
+        (mesa_stage == MESA_SHADER_VERTEX || mesa_stage == MESA_SHADER_FRAGMENT);
     compiler_info.spirv_caps.Geometry = true;
     compiler_info.spirv_caps.TransformFeedback = true;
     compiler_info.spirv_caps.DotProduct = true;
@@ -2144,6 +2142,7 @@ static PsbcResult psbc_compile_impl(
     compiler_info.key.load_grid_size_from_user_sgpr = (gfxlevel >= GFX10_3);
     compiler_info.key.use_ngg = opts->ngg;
     compiler_info.key.ps5_global_streamout = opts->ps5_global_streamout;
+    compiler_info.key.ps5_fragment_view_index = opts->target == PSBC_TARGET_PS5;
     /* ACO uses debug.family for disassembly and init_program assertion */
     compiler_info.debug.family = chipfamily;
 
