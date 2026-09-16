@@ -62,6 +62,7 @@ tests/test_vertex_bindings
 tests/test_fragment_input_bases
 tests/test_descriptor_static_use
 tests/test_draw_id
+tests/test_view_index
 
 # Editor / OS
 .DS_Store

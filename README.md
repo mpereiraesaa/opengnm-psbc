@@ -38,6 +38,13 @@ The PS5 GPU is RDNA2 (GFX10.3). Legacy PS4 (GFX7) and PS4 Pro
   mask and whether it indexes bindings or attributes. Descriptor tables must
   be packed in increasing set-bit order; unused inputs can disappear during
   optimization. All library consumers must rebuild against the updated header.
+- Metadata version 14 adds the ViewIndex user-data slot (`view_index_valid` and
+  `view_index_user_data_dword`). RADV declares `ac.view_index` at its own
+  user-data location rather than inside the base-vertex block DrawIndex shares,
+  so the slot is that location's SGPR index; it is reported only for the stages
+  this profile delivers a view index to and only when the compiled stage really
+  reads the built-in. Other stages keep the conservative lowering of ViewIndex
+  to zero.
 - Metadata version 13 adds the DrawIndex user-data slot (`draw_id_valid` and
   `draw_id_user_data_dword`) for stages that read the built-in. It is reported
   only when the optimized shader really reads DrawIndex, and it names a dword

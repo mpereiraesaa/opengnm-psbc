@@ -20,7 +20,7 @@
 extern "C" {
 #endif
 
-#define PSBC_SHADER_METADATA_VERSION 13u
+#define PSBC_SHADER_METADATA_VERSION 14u
 
 struct nir_shader;
 struct nir_shader_compiler_options;
@@ -232,6 +232,17 @@ typedef struct {
      * and must not invent one. Version 13 added these two fields. */
     bool                 draw_id_valid;
     uint32_t             draw_id_user_data_dword;
+    /* ViewIndex, the multiview built-in (gl_ViewIndex). RADV declares it as its
+     * own user-data location rather than a dword inside the base-vertex block,
+     * so the slot reported here is that location's SGPR index in the user-SGPR
+     * block - the same quantity base_vertex_user_data_dword carries - and no
+     * offset arithmetic against another argument is involved. It is valid only
+     * when the compiled stage really reads the built-in and only for the stages
+     * this profile delivers a view index to; a caller that sees
+     * view_index_valid false has no ViewIndex value to deliver and must not
+     * invent one. Version 14 added these two fields. */
+    bool                 view_index_valid;
+    uint32_t             view_index_user_data_dword;
     bool                 start_instance_valid;
     uint32_t             start_instance_user_data_dword;
     bool                 streamout_valid;

@@ -58,6 +58,19 @@ test-draw-id: $(LIBPSBC)
 	$(CC) -std=c11 -Wall -Wextra -Werror -Ilibpsbc tests/test_draw_id.c $(LIBPSBC) -lstdc++ -lm -lpthread -o tests/test_draw_id
 	./tests/test_draw_id
 
+.PHONY: test-view-index
+test-view-index: $(LIBPSBC)
+	# ViewIndex is the multiview built-in; the positive source reads it and the
+	# negative source (tri.vert) does not, so the two runs pin the slot's
+	# presence and its absence from the same options, and the fragment compile
+	# pins that a stage this profile does not deliver a view index to never
+	# reports a slot even when it reads the built-in.
+	$(GLSLANG) -V --target-env vulkan1.1 tests/view-index.vert -o tests/view-index.spv
+	$(GLSLANG) -V --target-env vulkan1.0 tests/tri.vert -o tests/tri.spv
+	$(GLSLANG) -V --target-env vulkan1.1 tests/view-index.frag -o tests/view-index.frag.spv
+	$(CC) -std=c11 -Wall -Wextra -Werror -Ilibpsbc tests/test_view_index.c $(LIBPSBC) -lstdc++ -lm -lpthread -o tests/test_view_index
+	./tests/test_view_index
+
 .PHONY: test-descriptor-static-use
 test-descriptor-static-use: $(LIBPSBC)
 	$(GLSLANG) -V --target-env vulkan1.0 tests/descriptor-static-use.frag -o tests/descriptor-static-use.spv
