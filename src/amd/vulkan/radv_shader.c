@@ -624,7 +624,19 @@ radv_shader_spirv_to_nir(const struct radv_compiler_info *compiler_info, struct 
       if (nir->info.stage == MESA_SHADER_FRAGMENT)
          NIR_PASS(_, nir, nir_lower_input_attachments,
                   &(nir_input_attachment_options){
-                     .use_ia_coord_intrin = true,
+                     /* PSBC selects machine code for the whole pinned
+                      * GFX10/GFX11 ACO, and that ACO has no selection for
+                      * nir_intrinsic_load_input_attachment_coord: asking for
+                      * the coordinate intrinsic aborts instruction selection
+                      * instead of compiling. The frag-coord lowering this
+                      * option selects is the one that ACO can select - it
+                      * turns a subpassLoad
+                      * into a texel fetch on the attachment's resource-only
+                      * image record, which is exactly the descriptor an input
+                      * attachment is read through - so input attachments
+                      * compile here at all rather than failing closed with an
+                      * unimplemented intrinsic. */
+                     .use_ia_coord_intrin = false,
                   });
 
       nir_remove_dead_variables_options dead_vars_opts = {

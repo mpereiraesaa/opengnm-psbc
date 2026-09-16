@@ -139,6 +139,10 @@ typedef enum {
     PSBC_DESCRIPTOR_UNIFORM_TEXEL_BUFFER,
     PSBC_DESCRIPTOR_COMBINED_IMAGE_SAMPLER,
     PSBC_DESCRIPTOR_STORAGE_BUFFER,
+    /* Resource-only image data read by a fragment shader through
+     * subpassLoad: eight DWORDs, exactly like a sampled T# but with no
+     * sampler words, so it is never conflated with a combined T#/S# pair. */
+    PSBC_DESCRIPTOR_INPUT_ATTACHMENT,
 } PsbcDescriptorType;
 
 typedef struct {
