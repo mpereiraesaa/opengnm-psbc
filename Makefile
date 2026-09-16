@@ -69,6 +69,8 @@ test-view-index: $(LIBPSBC)
 	$(GLSLANG) -V --target-env vulkan1.0 tests/tri.frag -o tests/tri.frag.spv
 	$(CC) -std=c11 -Wall -Wextra -Werror -Ilibpsbc tests/test_view_index.c $(LIBPSBC) -lstdc++ -lm -lpthread -o tests/test_view_index
 	./tests/test_view_index
+	PSBC_DEBUG_NIR=1 ./tests/test_view_index 2>tests/view-index.nir.log
+	$(PYTHON) -c 'from pathlib import Path; fs=Path("tests/view-index.nir.log").read_text().split("shader: MESA_SHADER_FRAGMENT")[1]; assert "arg_upper_bound_u32_amd=31" in fs, "fragment ViewIndex must preserve views above one"'
 
 .PHONY: test-descriptor-static-use
 test-descriptor-static-use: $(LIBPSBC)

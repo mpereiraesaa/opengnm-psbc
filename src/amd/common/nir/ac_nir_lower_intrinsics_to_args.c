@@ -322,7 +322,9 @@ lower_intrinsic_to_arg(nir_builder *b, nir_intrinsic_instr *intrin, void *state)
       replacement = ac_nir_load_arg(b, s->args, s->args->draw_id);
       break;
    case nir_intrinsic_load_view_index:
-      replacement = ac_nir_load_arg_upper_bound(b, s->args, s->args->view_index, 1);
+      /* View masks have 32 bits, not two views. A bound of one lets range
+       * analysis incorrectly fold comparisons involving views 2 through 31. */
+      replacement = ac_nir_load_arg_upper_bound(b, s->args, s->args->view_index, 31);
       break;
    case nir_intrinsic_load_invocation_id:
       if (b->shader->info.stage == MESA_SHADER_TESS_CTRL) {
