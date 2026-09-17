@@ -78,6 +78,16 @@ test-descriptor-static-use: $(LIBPSBC)
 	$(CC) -std=c11 -Wall -Wextra -Werror -Ilibpsbc tests/test_descriptor_static_use.c $(LIBPSBC) -lstdc++ -lm -lpthread -o tests/test_descriptor_static_use
 	./tests/test_descriptor_static_use
 
+.PHONY: test-merged-geometry-metadata
+test-merged-geometry-metadata: $(LIBPSBC)
+	# A merged VS+GS pair must be identifiable and must describe its ES half,
+	# while the GE PC-line allocation appears only when the caller supplies the
+	# SA/CU and PC-line facts the compiler cannot derive.
+	$(GLSLANG) -V --target-env vulkan1.0 tests/merged-geometry.vert -o tests/merged-geometry.vert.spv
+	$(GLSLANG) -V -S geom --target-env vulkan1.0 tests/merged-geometry.geom -o tests/merged-geometry.geom.spv
+	$(CC) -std=c11 -Wall -Wextra -Werror -Ilibpsbc tests/test_merged_geometry_metadata.c $(LIBPSBC) -lstdc++ -lm -lpthread -o tests/test_merged_geometry_metadata
+	./tests/test_merged_geometry_metadata tests/merged-geometry.vert.spv tests/merged-geometry.geom.spv
+
 test-core-vertex-formats: $(PSBC)
 	$(PYTHON) tests/verify_core_vertex_formats.py --psbc ./$(PSBC) --glslang $(GLSLANG)
 
