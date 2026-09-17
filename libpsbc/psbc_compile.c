@@ -873,6 +873,11 @@ static void fill_shader_metadata(const BuildContext* ctx,
                                !ctx->rinfo->ps.num_inputs &&
                                ctx->config->lds_size;
         metadata->hardware_stage = PSBC_HW_STAGE_PIXEL;
+        /* What this pixel stage reads of the distance built-ins: the SPIR-V
+         * reader records the declared widths, so a consumer learns the input
+         * width without re-parsing the module. */
+        metadata->ps_clip_distance_reads = ctx->nir->info.clip_distance_array_size;
+        metadata->ps_cull_distance_reads = ctx->nir->info.cull_distance_array_size;
         if (!ctx->input_semantics || !ctx->input_semantics->valid)
             metadata->unresolved_fields |= PSBC_UNRESOLVED_AGC_LINKAGE;
         else {

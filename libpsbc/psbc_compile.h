@@ -20,7 +20,7 @@
 extern "C" {
 #endif
 
-#define PSBC_SHADER_METADATA_VERSION 15u
+#define PSBC_SHADER_METADATA_VERSION 16u
 
 struct nir_shader;
 struct nir_shader_compiler_options;
@@ -245,6 +245,14 @@ typedef struct {
     PsbcRegisterWrite    hull_ls_pgm_hi;
     PsbcRegisterWrite    hull_ls_rsrc1;
     PsbcRegisterWrite    hull_ls_rsrc2;
+    /* Fragment-stage distance usage.  The masks above describe what a pre-raster
+     * stage exports; these two describe what a pixel stage declares and reads,
+     * which is the input the rasterizer would have to deliver to it.  Both are
+     * zero for a fragment stage that reads neither, and for every other stage.
+     * A consumer that cannot route distances to the pixel stage can use a
+     * non-zero value here to refuse precisely instead of guessing. */
+    uint32_t             ps_clip_distance_reads;
+    uint32_t             ps_cull_distance_reads;
     uint32_t             input_semantic_count;
     uint32_t             input_semantics[PSBC_MAX_SEMANTICS];
     uint32_t             output_semantic_count;

@@ -87,6 +87,15 @@ test-tessellation-gap: $(LIBPSBC)
 	$(GLSLANG) -V --target-env vulkan1.0 tests/tri.vert -o tests/tri.vert.spv
 	$(CC) -std=c11 -Wall -Wextra -Werror -Ilibpsbc tests/test_tessellation_gap.c $(LIBPSBC) -lstdc++ -lm -lpthread -o tests/test_tessellation_gap
 	./tests/test_tessellation_gap tests/test.tesc.spv tests/test.tese.spv tests/tri.vert.spv
+
+.PHONY: test-fragment-distance-reads
+test-fragment-distance-reads: $(LIBPSBC)
+	# The pixel stage reports the distance widths it declares, so a consumer
+	# that cannot route distances to the pixel stage can refuse precisely.
+	$(GLSLANG) -V -S frag --target-env vulkan1.0 tests/fragment-clip-read.frag -o tests/fragment-clip-read.frag.spv
+	$(GLSLANG) -V -S frag --target-env vulkan1.0 tests/fragment-plain.frag -o tests/fragment-plain.frag.spv
+	$(CC) -std=c11 -Wall -Wextra -Werror -Ilibpsbc tests/test_fragment_distance_reads.c $(LIBPSBC) -lstdc++ -lm -lpthread -o tests/test_fragment_distance_reads
+	./tests/test_fragment_distance_reads tests/fragment-clip-read.frag.spv tests/fragment-plain.frag.spv
 .PHONY: test-merged-geometry-metadata
 test-merged-geometry-metadata: $(LIBPSBC)
 	# A merged VS+GS pair must be identifiable and must describe its ES half,
@@ -96,6 +105,7 @@ test-merged-geometry-metadata: $(LIBPSBC)
 	$(GLSLANG) -V -S geom --target-env vulkan1.0 tests/merged-geometry.geom -o tests/merged-geometry.geom.spv
 	$(CC) -std=c11 -Wall -Wextra -Werror -Ilibpsbc tests/test_merged_geometry_metadata.c $(LIBPSBC) -lstdc++ -lm -lpthread -o tests/test_merged_geometry_metadata
 	./tests/test_merged_geometry_metadata tests/merged-geometry.vert.spv tests/merged-geometry.geom.spv
+
 test-core-vertex-formats: $(PSBC)
 	$(PYTHON) tests/verify_core_vertex_formats.py --psbc ./$(PSBC) --glslang $(GLSLANG)
 
