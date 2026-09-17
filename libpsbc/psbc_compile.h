@@ -174,6 +174,16 @@ typedef enum {
     PSBC_UNRESOLVED_PROGRAM_CHECKSUM       = 1u << 0,
     PSBC_UNRESOLVED_NGG_ESGS_RING_ITEMSIZE = 1u << 1,
     PSBC_UNRESOLVED_AGC_LINKAGE             = 1u << 2,
+    /* The stand-alone tessellation stages compile to ISA, but this compiler has
+     * no tessellation *pipeline* entry point: radv builds the hull shader as one
+     * merged vertex+tessellation-control program (AC_HW_HULL_SHADER, programmed
+     * through SPI_SHADER_PGM_LO_LS on gfx10) and the domain half as a separate
+     * stage, and it programs the hull/domain state (VGT_LS_HS_CONFIG,
+     * VGT_TF_PARAM, VGT_TF_RING_SIZE, VGT_HS_OFFCHIP_PARAM) through the
+     * pipeline's context rolls. A TESS_CTRL/TESS_EVAL result from
+     * psbc_compile_shader() is therefore an ISA-level diagnostic and must never
+     * be treated as a loadable package. */
+    PSBC_UNRESOLVED_TESS_PIPELINE          = 1u << 3,
 } PsbcUnresolvedField;
 
 typedef struct {

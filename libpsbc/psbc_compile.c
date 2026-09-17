@@ -1079,6 +1079,18 @@ static void fill_shader_metadata(const BuildContext* ctx,
             ctx->config->rsrc2);
         return;
     }
+
+    if (ctx->stage == MESA_SHADER_TESS_CTRL ||
+        ctx->stage == MESA_SHADER_TESS_EVAL) {
+        /* These two stages compile to ISA, but no loadable tessellation package
+         * exists yet: the compiler has no merged LS+HS (or DS+GS) pipeline
+         * entry point, and radv programs the hull/domain state through the
+         * pipeline's context rolls rather than through the shader package.
+         * Report that explicitly so a consumer refuses the result instead of
+         * reading an unclassified UNKNOWN hardware stage. */
+        metadata->unresolved_fields |= PSBC_UNRESOLVED_TESS_PIPELINE;
+        return;
+    }
 }
 
 /* Build the shader binary into a memory buffer instead of a file. */
