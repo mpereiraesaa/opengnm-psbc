@@ -253,6 +253,25 @@ typedef struct {
      * non-zero value here to refuse precisely instead of guessing. */
     uint32_t             ps_clip_distance_reads;
     uint32_t             ps_cull_distance_reads;
+    /* Merged pre-raster pair: the system SGPRs the caller must supply and the
+     * launch shape they describe.  A merged vertex+geometry stage is two
+     * programs in one, and each half disables the lanes it does not need from
+     * these two registers (radv declares them as the merged stage's first
+     * system registers and the compiler reads them to gate the geometry half).
+     * They are counts, not addresses: merged_wave_info holds the ES lane count
+     * in byte 0 and the GS lane count in byte 1, and gs_tg_info holds the
+     * vertices of the group in bits 12..20 and its primitives in bits 22..30.
+     * The counts are the ones this metadata already programs into
+     * VGT_GS_ONCHIP_CNTL.  A caller that leaves the registers stale changes how
+     * many lanes each half runs, so esgs_system_sgprs_valid is the flag to
+     * check before executing the program. */
+    bool                 esgs_system_sgprs_valid;
+    uint32_t             esgs_gs_tg_info_sgpr;
+    uint32_t             esgs_merged_wave_info_sgpr;
+    uint32_t             esgs_es_verts_per_subgroup;
+    uint32_t             esgs_gs_inst_prims_per_subgroup;
+    uint32_t             esgs_prim_amp_factor;
+    uint32_t             esgs_workgroup_size;
     uint32_t             input_semantic_count;
     uint32_t             input_semantics[PSBC_MAX_SEMANTICS];
     uint32_t             output_semantic_count;

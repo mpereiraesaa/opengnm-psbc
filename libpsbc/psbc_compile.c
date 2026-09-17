@@ -1061,6 +1061,29 @@ static void fill_shader_metadata(const BuildContext* ctx,
             S_028A44_GS_PRIMS_PER_SUBGRP(ctx->rinfo->ngg_info.max_gsprims) |
             S_028A44_GS_INST_PRIMS_IN_SUBGRP(
                 ctx->rinfo->ngg_info.max_gsprims * gs_num_invocations));
+        /* The same counts the register above describes, published for the two
+         * system SGPRs a merged pair reads: the shader uses them to disable the
+         * lanes each half does not need, and a caller that cannot supply them
+         * would run a different number of ES and GS lanes per workgroup than
+         * the program was built for. */
+        if (ctx->rargs->ac.gs_tg_info.used &&
+            ctx->rargs->ac.merged_wave_info.used) {
+            metadata->esgs_system_sgprs_valid = true;
+            metadata->esgs_gs_tg_info_sgpr =
+                ctx->rargs->ac.args[ctx->rargs->ac.gs_tg_info.arg_index].offset;
+            metadata->esgs_merged_wave_info_sgpr =
+                ctx->rargs->ac.args[ctx->rargs->ac.merged_wave_info.arg_index].offset;
+            metadata->esgs_es_verts_per_subgroup =
+                ctx->rinfo->ngg_info.hw_max_esverts;
+            metadata->esgs_gs_inst_prims_per_subgroup =
+                ctx->rinfo->ngg_info.max_gsprims * gs_num_invocations;
+            metadata->esgs_prim_amp_factor = ctx->rinfo->ngg_info.prim_amp_factor;
+            metadata->esgs_workgroup_size = ac_compute_ngg_workgroup_size(
+                ctx->rinfo->ngg_info.hw_max_esverts,
+                ctx->rinfo->ngg_info.max_gsprims * gs_num_invocations,
+                ctx->rinfo->ngg_info.max_out_verts,
+                ctx->rinfo->ngg_info.prim_amp_factor);
+        }
         metadata_add_register(cx, cx_count, PSBC_MAX_CONTEXT_REGISTERS,
             PSBC_CX_OFFSET(R_0287FC_GE_MAX_OUTPUT_PER_SUBGROUP),
             S_0287FC_MAX_VERTS_PER_SUBGROUP(
@@ -2757,6 +2780,43 @@ static PsbcResult psbc_compile_impl(
         &compiler_info, &gfx_state, &stage, previous_stage, NULL
     );
     debug_stage("declare-args-end");
+
+    /* Temporary T04 ABI trace: which SGPR each declared argument landed in, and
+     * which user-data slots the stage publishes. Off unless asked for. */
+    if (getenv("PSBC_DEBUG_ARGS")) {
+        const struct ac_shader_args* a = &stage.args.ac;
+        fprintf(stderr, "PSBC_ARGS stage=%d num_user_sgprs=%u num_sgprs_used=%u arg_count=%u\n",
+                (int)mesa_stage, stage.args.num_user_sgprs, a->num_sgprs_used, a->arg_count);
+        const struct { const char* name; const struct ac_arg* arg; } named[] = {
+            { "ring_offsets", &a->ring_offsets },
+            { "gs_tg_info", &a->gs_tg_info },
+            { "merged_wave_info", &a->merged_wave_info },
+            { "tess_offchip_offset", &a->tess_offchip_offset },
+            { "scratch_offset", &a->scratch_offset },
+            { "ngg_lds_layout", &stage.args.ngg_lds_layout },
+            { "ngg_state", &stage.args.ngg_state },
+            { "base_vertex", &a->base_vertex },
+            { "start_instance", &a->start_instance },
+            { "draw_id", &a->draw_id },
+            { "view_index", &a->view_index },
+            { "vertex_buffers", &a->vertex_buffers },
+            { "push_constants", &a->push_constants },
+        };
+        for (unsigned i = 0; i < sizeof(named) / sizeof(named[0]); ++i) {
+            const struct ac_arg* arg = named[i].arg;
+            if (!arg->used) continue;
+            const __typeof__(a->args[0])* def = &a->args[arg->arg_index];
+            fprintf(stderr, "  %-20s arg=%u file=%u offset=%u size=%u type=%u skip=%u\n",
+                    named[i].name, arg->arg_index, (unsigned)def->file, def->offset,
+                    def->size, (unsigned)def->type, def->skip ? 1u : 0u);
+        }
+        for (unsigned i = 0; i < AC_UD_MAX_UD; ++i) {
+            const struct radv_userdata_info* info = &stage.args.user_sgprs_locs.shader_data[i];
+            if (info->sgpr_idx < 0) continue;
+            fprintf(stderr, "  ud[%u] sgpr=%d count=%u\n", i, (int)info->sgpr_idx,
+                    (unsigned)info->num_sgprs);
+        }
+    }
 
     stage.info.user_sgprs_locs = stage.args.user_sgprs_locs;
     stage.info.inline_push_constant_mask = stage.args.ac.inline_push_const_mask;
