@@ -990,8 +990,10 @@ static void fill_shader_metadata(const BuildContext* ctx,
     }
 
     if ((ctx->stage == MESA_SHADER_VERTEX ||
+         ctx->stage == MESA_SHADER_TESS_EVAL ||
          ctx->stage == MESA_SHADER_GEOMETRY) && ctx->ngg) {
         const bool has_geometry = ctx->stage == MESA_SHADER_GEOMETRY;
+        const bool is_tess_eval = ctx->stage == MESA_SHADER_TESS_EVAL;
         const uint32_t nparams = MAX2(ctx->rinfo->outinfo.param_exports, 1);
         const bool no_pc_export = ctx->rinfo->outinfo.param_exports == 0 &&
                                   ctx->rinfo->outinfo.prim_param_exports == 0;
@@ -2242,7 +2244,8 @@ static PsbcResult psbc_compile_impl(
     }
     if (opts->ngg &&
         (opts->target != PSBC_TARGET_PS5 ||
-         (mesa_stage != MESA_SHADER_VERTEX && !paired_geometry)))
+         (mesa_stage != MESA_SHADER_VERTEX && mesa_stage != MESA_SHADER_TESS_EVAL &&
+          !paired_geometry)))
         return PSBC_RESULT_UNSUPPORTED_STAGE;
     if (opts->descriptor_binding_count > PSBC_MAX_DESCRIPTOR_BINDINGS)
         return PSBC_RESULT_INTERNAL_ERROR;
