@@ -64,9 +64,18 @@ typedef enum {
 #define PSBC_MAX_CONTEXT_REGISTERS 16
 #define PSBC_MAX_SHADER_REGISTERS 8
 #define PSBC_MAX_SEMANTICS 32
-/* Private matching key shared by our AGC producer/consumer packages, after
- * the generic keys 15..46. This is not a PSSL system-semantic enum. */
+/* Private matching keys shared by our AGC producer/consumer packages, after
+ * the generic keys 15..46. This is not a PSSL system-semantic enum: the two
+ * halves of a pipeline pair on these values, and the producer's word also
+ * carries the parameter index of what it exports in bits 8..15. */
 #define PSBC_SEMANTIC_PRIMITIVE_ID 47u
+/* One key per packed clip/cull distance register the pre-raster stage exports
+ * and the pixel stage reads: clip components come first, cull continues after
+ * them, four components per register, so a stage pairs the (whole) register
+ * rather than a feature - a register can hold clip and cull components at the
+ * same time. The low byte identifies the register; the producer adds its
+ * parameter index above it. */
+#define PSBC_SEMANTIC_DISTANCE_REGISTER 48u
 #define PSBC_MAX_VERTEX_ATTRIBUTES 32
 #define PSBC_MAX_DESCRIPTOR_BINDINGS 64
 #define PSBC_MAX_DESCRIPTOR_SETS 4

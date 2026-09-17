@@ -511,6 +511,38 @@ static bool build_input_semantics(const nir_shader* nir,
                 const bool primitive_id = io.location == VARYING_SLOT_PRIMITIVE_ID;
                 if (primitive_id && (io.num_slots != 1 || mode != 1))
                     return false;
+                /* A distance the PIXEL stage reads is a packed position
+                 * register: the rasterizer interpolates it like a varying and
+                 * the linker places it at the attribute slot of the register
+                 * the pre-raster stage exported. Name that register with the
+                 * same private key the export side uses, so the two halves pair
+                 * on the register (not on the feature - one register holds clip
+                 * and cull components together) and the producer's word carries
+                 * the parameter index to interpolate from. A stage whose
+                 * declared width is outside the two packed registers is left
+                 * undescribed, which the pipeline then refuses. */
+                const bool clip_distance = io.location == VARYING_SLOT_CLIP_DIST0 ||
+                    io.location == VARYING_SLOT_CLIP_DIST1;
+                const bool cull_distance = io.location == VARYING_SLOT_CULL_DIST0 ||
+                    io.location == VARYING_SLOT_CULL_DIST1;
+                if (clip_distance || cull_distance) {
+                    const unsigned declared = clip_distance ?
+                        nir->info.clip_distance_array_size :
+                        nir->info.cull_distance_array_size;
+                    const uint32_t attribute = nir_intrinsic_base(intrin);
+                    if (io.num_slots != 1 || !declared || declared > 8u ||
+                        attribute >= generic_count ||
+                        PSBC_SEMANTIC_DISTANCE_REGISTER + attribute >
+                            PSBC_SEMANTIC_DISTANCE_REGISTER + 1u)
+                        return false;
+                    const uint32_t word =
+                        PSBC_SEMANTIC_DISTANCE_REGISTER + attribute;
+                    if (seen[attribute] && words_by_attribute[attribute] != word)
+                        return false;
+                    words_by_attribute[attribute] = word;
+                    seen[attribute] = true;
+                    continue;
+                }
                 if (!primitive_id && io.location < VARYING_SLOT_VAR0)
                     continue;
                 for (uint32_t slot = 0; slot < io.num_slots; ++slot) {
@@ -553,6 +585,9 @@ static bool fill_output_semantics(const struct radv_shader_info* info,
                 (15u + semantic) | ((uint32_t)parameter << 8);
         }
     }
+    /* The distance registers follow the described varyings in the parameter
+     * space, so their parameter indices start at this count. */
+    const unsigned generic_semantics = metadata->output_semantic_count;
     const uint8_t primitive_id =
         info->outinfo.vs_output_param_offset[VARYING_SLOT_PRIMITIVE_ID];
     if (primitive_id < PSBC_MAX_SEMANTICS) {
@@ -560,6 +595,24 @@ static bool fill_output_semantics(const struct radv_shader_info* info,
             return false;
         metadata->output_semantics[metadata->output_semantic_count++] =
             PSBC_SEMANTIC_PRIMITIVE_ID | ((uint32_t)primitive_id << 8);
+    }
+    /* The packed distance registers are pixel attributes too, and a pixel
+     * stage that reads a distance needs to name the register it reads: publish
+     * one word per register, after the described varyings and with the
+     * parameter index those registers occupy in the export space. Without this
+     * the pixel input list stays unresolved for a distance attribute and the
+     * AGC linker has nothing to map the read to (the pin's behaviour). */
+    const unsigned clip_components = util_bitcount(info->outinfo.clip_dist_mask);
+    const unsigned cull_components = util_bitcount(info->outinfo.cull_dist_mask);
+    const unsigned distance_registers =
+        (clip_components + cull_components + 3u) / 4u;
+    for (unsigned register_index = 0; register_index < distance_registers;
+         ++register_index) {
+        if (metadata->output_semantic_count >= PSBC_MAX_SEMANTICS)
+            return false;
+        metadata->output_semantics[metadata->output_semantic_count++] =
+            (PSBC_SEMANTIC_DISTANCE_REGISTER + register_index) |
+            ((uint32_t)(generic_semantics + register_index) << 8);
     }
     return metadata->output_semantic_count ==
         info->outinfo.param_exports + info->outinfo.prim_param_exports;
