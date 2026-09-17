@@ -2932,6 +2932,113 @@ PsbcResult psbc_compile_geometry_pipeline(
                              opts, out);
 }
 
+/* Find one shader register in a metadata block, or NULL when the stage did not
+ * publish it. */
+static PsbcRegisterWrite* find_shader_register(PsbcShaderMetadata* metadata,
+                                               uint16_t offset) {
+    for (uint32_t i = 0; i < metadata->shader_register_count; ++i)
+        if (metadata->shader_registers[i].offset == offset)
+            return &metadata->shader_registers[i];
+    return NULL;
+}
+
+/* The combined LS/HS resource registers radv produces for a hull stage
+ * (radv_shader_combine_cfg_vs_tcs in the pinned tree): the vertex half is the
+ * base, the control half raises the VGPR/SGPR/LS_VGPR_COMP_CNT fields, and its
+ * scratch enable does not leak into the LS half. */
+static void combine_vs_tcs_config(uint32_t vs_rsrc1, uint32_t vs_rsrc2,
+                                  uint32_t tcs_rsrc1, uint32_t tcs_rsrc2,
+                                  uint32_t* rsrc1_out, uint32_t* rsrc2_out) {
+    uint32_t rsrc1 = vs_rsrc1;
+    if (G_00B848_VGPRS(tcs_rsrc1) > G_00B848_VGPRS(rsrc1))
+        rsrc1 = (rsrc1 & C_00B848_VGPRS) | (tcs_rsrc1 & ~C_00B848_VGPRS);
+    if (G_00B228_SGPRS(tcs_rsrc1) > G_00B228_SGPRS(rsrc1))
+        rsrc1 = (rsrc1 & C_00B228_SGPRS) | (tcs_rsrc1 & ~C_00B228_SGPRS);
+    if (G_00B428_LS_VGPR_COMP_CNT(tcs_rsrc1) > G_00B428_LS_VGPR_COMP_CNT(rsrc1))
+        rsrc1 = (rsrc1 & C_00B428_LS_VGPR_COMP_CNT) |
+                (tcs_rsrc1 & ~C_00B428_LS_VGPR_COMP_CNT);
+    *rsrc1_out = rsrc1;
+    *rsrc2_out = vs_rsrc2 | (tcs_rsrc2 & ~C_00B12C_SCRATCH_EN);
+}
+
+PsbcResult psbc_compile_tess_pipeline(
+    const uint32_t* vertex_spirv,
+    size_t vertex_spirv_size,
+    const uint32_t* tess_ctrl_spirv,
+    size_t tess_ctrl_spirv_size,
+    const PsbcCompileOptions* opts,
+    PsbcShaderOutput* out
+) {
+    if (!out || !opts || !vertex_spirv || !tess_ctrl_spirv)
+        return PSBC_RESULT_INVALID_SPIRV;
+    if (opts->stage != PSBC_STAGE_TESS_CTRL || opts->target != PSBC_TARGET_PS5)
+        return PSBC_RESULT_UNSUPPORTED_STAGE;
+
+    /* The vertex half of a tessellation pipeline feeds the control stage and is
+     * not an NGG program, so it is compiled with the control stage as its
+     * consumer and with NGG off. */
+    PsbcCompileOptions ls_options = *opts;
+    ls_options.stage = PSBC_STAGE_VERTEX;
+    ls_options.ngg = false;
+    PsbcShaderOutput ls = {0};
+    PsbcResult result = psbc_compile_shader(vertex_spirv, vertex_spirv_size,
+                                            &ls_options, &ls);
+    if (result != PSBC_RESULT_OK)
+        return result;
+
+    PsbcShaderOutput hs = {0};
+    result = psbc_compile_shader(tess_ctrl_spirv, tess_ctrl_spirv_size, opts, &hs);
+    if (result != PSBC_RESULT_OK) {
+        psbc_free_output(&ls);
+        return result;
+    }
+
+    const uint16_t ls_lo = PSBC_SH_OFFSET(R_00B520_SPI_SHADER_PGM_LO_LS);
+    const uint16_t ls_hi = PSBC_SH_OFFSET(R_00B524_SPI_SHADER_PGM_HI_LS);
+    const uint16_t ls_rsrc1_off = PSBC_SH_OFFSET(R_00B528_SPI_SHADER_PGM_RSRC1_LS);
+    const uint16_t ls_rsrc2_off = PSBC_SH_OFFSET(R_00B52C_SPI_SHADER_PGM_RSRC2_LS);
+    const PsbcRegisterWrite* vs_rsrc1 =
+        find_shader_register(&ls.metadata,
+                             PSBC_SH_OFFSET(R_00B128_SPI_SHADER_PGM_RSRC1_VS));
+    const PsbcRegisterWrite* vs_rsrc2 =
+        find_shader_register(&ls.metadata,
+                             PSBC_SH_OFFSET(R_00B12C_SPI_SHADER_PGM_RSRC2_VS));
+    PsbcRegisterWrite* hs_rsrc1 =
+        find_shader_register(&hs.metadata,
+                             PSBC_SH_OFFSET(R_00B428_SPI_SHADER_PGM_RSRC1_HS));
+    PsbcRegisterWrite* hs_rsrc2 =
+        find_shader_register(&hs.metadata,
+                             PSBC_SH_OFFSET(R_00B42C_SPI_SHADER_PGM_RSRC2_HS));
+    if (!vs_rsrc1 || !vs_rsrc2 || !hs_rsrc1 || !hs_rsrc2) {
+        psbc_free_output(&ls);
+        psbc_free_output(&hs);
+        return PSBC_RESULT_UNSUPPORTED_STAGE;
+    }
+
+    uint32_t combined_rsrc1 = 0, combined_rsrc2 = 0;
+    combine_vs_tcs_config(vs_rsrc1->value, vs_rsrc2->value,
+                          hs_rsrc1->value, hs_rsrc2->value,
+                          &combined_rsrc1, &combined_rsrc2);
+    hs_rsrc1->value = combined_rsrc1;
+    hs_rsrc2->value = combined_rsrc2;
+
+    hs.metadata.hull_ls_valid = true;
+    hs.metadata.hull_ls_code_size = (uint32_t)ls.machine_code_size;
+    hs.metadata.hull_ls_pgm_lo = (PsbcRegisterWrite){.offset = ls_lo, .value = 0};
+    hs.metadata.hull_ls_pgm_hi = (PsbcRegisterWrite){.offset = ls_hi, .value = 0};
+    hs.metadata.hull_ls_rsrc1 =
+        (PsbcRegisterWrite){.offset = ls_rsrc1_off, .value = vs_rsrc1->value};
+    hs.metadata.hull_ls_rsrc2 =
+        (PsbcRegisterWrite){.offset = ls_rsrc2_off, .value = vs_rsrc2->value};
+    /* The LS machine code itself is not packaged yet, so the result stays
+     * explicitly short of a loadable hull package. */
+    hs.metadata.unresolved_fields |= PSBC_UNRESOLVED_TESS_PIPELINE;
+    psbc_free_output(&ls);
+
+    *out = hs;
+    return PSBC_RESULT_OK;
+}
+
 PsbcResult psbc_compile_nir_geometry_pipeline(
     const struct nir_shader* vertex_nir,
     const struct nir_shader* geometry_nir,

@@ -95,6 +95,34 @@ int main(int argc, char **argv)
         psbc_free_output(&output);
     }
 
+    /* The pair entry point compiles both halves, publishes the LS half, and
+     * combines the HS resource registers instead of copying one half's. */
+    {
+        PsbcCompileOptions options = options_for(PSBC_STAGE_TESS_CTRL);
+        PsbcShaderOutput pair = {0};
+        assert(psbc_compile_tess_pipeline(vertex_spirv, vertex_bytes,
+                                          control_spirv, control_bytes,
+                                          &options, &pair) == PSBC_RESULT_OK);
+        assert(pair.metadata.hull_ls_valid);
+        assert(pair.metadata.hull_ls_code_size > 0);
+        assert(pair.metadata.hull_ls_rsrc1.value != 0);
+        assert(pair.metadata.hull_ls_rsrc2.value != 0);
+        /* Still not a loadable package: the LS code and the hull state the
+         * pipeline owns are not in it. */
+        assert((pair.metadata.unresolved_fields & PSBC_UNRESOLVED_TESS_PIPELINE) != 0);
+        assert(pair.metadata.shader_register_count == 4);
+        {
+            PsbcCompileOptions control_options = options_for(PSBC_STAGE_TESS_CTRL);
+            PsbcShaderOutput control = {0};
+            assert(psbc_compile_shader(control_spirv, control_bytes,
+                                       &control_options, &control) == PSBC_RESULT_OK);
+            assert((pair.metadata.shader_registers[2].value & 0x3Fu) >=
+                   (control.metadata.shader_registers[2].value & 0x3Fu));
+            psbc_free_output(&control);
+        }
+        psbc_free_output(&pair);
+    }
+
     /* Control: a vertex shader is not a tessellation stage and must not carry
      * the tessellation gap bit. */
     PsbcCompileOptions vertex_options = options_for(PSBC_STAGE_VERTEX);

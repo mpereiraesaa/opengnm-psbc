@@ -206,6 +206,18 @@ typedef struct {
     PsbcRegisterWrite    linkage_ge_cntl;
     PsbcRegisterWrite    linkage_stages_en;
     PsbcRegisterWrite    linkage_user_vgpr_en;
+    /* Hull halves.  A GFX10 hull stage runs two programs: the LS half (the
+     * vertex shader, R_00B520..) and the HS half (the tessellation-control
+     * shader, R_00B420..).  psbc_compile_tess_pipeline() compiles both and
+     * publishes the LS half here, with the HS half's RSRC1/RSRC2 replaced by
+     * the combined pair radv produces with radv_shader_combine_cfg_vs_tcs().
+     * hull_ls_valid stays false for a stand-alone control shader. */
+    bool                 hull_ls_valid;
+    uint32_t             hull_ls_code_size;
+    PsbcRegisterWrite    hull_ls_pgm_lo;
+    PsbcRegisterWrite    hull_ls_pgm_hi;
+    PsbcRegisterWrite    hull_ls_rsrc1;
+    PsbcRegisterWrite    hull_ls_rsrc2;
     uint32_t             input_semantic_count;
     uint32_t             input_semantics[PSBC_MAX_SEMANTICS];
     uint32_t             output_semantic_count;
@@ -401,6 +413,23 @@ PsbcResult psbc_compile_geometry_pipeline(
 PsbcResult psbc_compile_nir_geometry_pipeline(
     const struct nir_shader* vertex_nir,
     const struct nir_shader* geometry_nir,
+    const PsbcCompileOptions* opts,
+    PsbcShaderOutput* out
+);
+
+/* Compile a PS5 tessellation pipeline's two hull halves: the vertex shader as
+ * the LS half and the tessellation-control shader as the HS half.  Both are
+ * compiled with the pinned ACO path, the LS half is published through the
+ * hull_ls_* metadata fields, and the HS half's RSRC1/RSRC2 are replaced by the
+ * combined pair radv_shader_combine_cfg_vs_tcs() produces.  The returned
+ * output is still not a loadable hull package (the LS code and the hull state
+ * the pipeline owns are not in it), which PSBC_UNRESOLVED_TESS_PIPELINE keeps
+ * explicit. */
+PsbcResult psbc_compile_tess_pipeline(
+    const uint32_t* vertex_spirv,
+    size_t vertex_spirv_size,
+    const uint32_t* tess_ctrl_spirv,
+    size_t tess_ctrl_spirv_size,
     const PsbcCompileOptions* opts,
     PsbcShaderOutput* out
 );
