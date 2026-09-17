@@ -1080,14 +1080,37 @@ static void fill_shader_metadata(const BuildContext* ctx,
         return;
     }
 
-    if (ctx->stage == MESA_SHADER_TESS_CTRL ||
-        ctx->stage == MESA_SHADER_TESS_EVAL) {
-        /* These two stages compile to ISA, but no loadable tessellation package
-         * exists yet: the compiler has no merged LS+HS (or DS+GS) pipeline
-         * entry point, and radv programs the hull/domain state through the
-         * pipeline's context rolls rather than through the shader package.
-         * Report that explicitly so a consumer refuses the result instead of
-         * reading an unclassified UNKNOWN hardware stage. */
+    if (ctx->stage == MESA_SHADER_TESS_CTRL) {
+        /* The hull half. On GFX10 the hull stage is two program counters: the
+         * LS program (the vertex half, R_00B520/R_00B528) and the HS program
+         * (this tessellation-control half, R_00B420/R_00B428), whose
+         * RSRC1/RSRC2 radv combines with radv_shader_combine_cfg_vs_tcs().
+         * Publish this half's program and resource registers from the same
+         * config the legacy GNM packaging already writes; everything else -
+         * the LS half's program, the combined RSRC pair, and the hull state the
+         * driver owns (VGT_SHADER_STAGES_EN LS_EN/HS_EN, VGT_LS_HS_CONFIG,
+         * VGT_TF_RING_SIZE, VGT_HS_OFFCHIP_PARAM) - stays explicitly
+         * unresolved, so a consumer still cannot mistake this for a loadable
+         * hull package. */
+        metadata->unresolved_fields |= PSBC_UNRESOLVED_TESS_PIPELINE;
+        metadata_add_register(sh, sh_count, PSBC_MAX_SHADER_REGISTERS,
+            PSBC_SH_OFFSET(R_00B420_SPI_SHADER_PGM_LO_HS), 0);
+        metadata_add_register(sh, sh_count, PSBC_MAX_SHADER_REGISTERS,
+            PSBC_SH_OFFSET(R_00B424_SPI_SHADER_PGM_HI_HS), 0);
+        metadata_add_register(sh, sh_count, PSBC_MAX_SHADER_REGISTERS,
+            PSBC_SH_OFFSET(R_00B428_SPI_SHADER_PGM_RSRC1_HS),
+            ctx->config->rsrc1);
+        metadata_add_register(sh, sh_count, PSBC_MAX_SHADER_REGISTERS,
+            PSBC_SH_OFFSET(R_00B42C_SPI_SHADER_PGM_RSRC2_HS),
+            ctx->config->rsrc2);
+        return;
+    }
+
+    if (ctx->stage == MESA_SHADER_TESS_EVAL) {
+        /* The domain half has no package state at all yet: radv runs it in the
+         * ES/GS hardware path with the tessellation-specific configuration, and
+         * nothing here describes that. Keep the explicit unresolved bit and
+         * publish no registers rather than an incomplete set. */
         metadata->unresolved_fields |= PSBC_UNRESOLVED_TESS_PIPELINE;
         return;
     }

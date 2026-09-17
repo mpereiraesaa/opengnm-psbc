@@ -51,22 +51,37 @@ int main(int argc, char **argv)
     uint32_t *evaluation_spirv = read_spirv(argv[2], &evaluation_bytes);
     uint32_t *vertex_spirv = read_spirv(argv[3], &vertex_bytes);
 
-    const PsbcStage stages[2] = {PSBC_STAGE_TESS_CTRL, PSBC_STAGE_TESS_EVAL};
-    uint32_t *spirv[2] = {control_spirv, evaluation_spirv};
-    size_t spirv_bytes[2] = {control_bytes, evaluation_bytes};
-
-    for (unsigned i = 0; i < 2; ++i) {
-        PsbcCompileOptions options = options_for(stages[i]);
+    /* The hull half compiles and publishes its own program registers, but the
+     * package is still explicitly incomplete. */
+    {
+        PsbcCompileOptions options = options_for(PSBC_STAGE_TESS_CTRL);
         PsbcShaderOutput output = {0};
-        const PsbcResult result =
-            psbc_compile_shader(spirv[i], spirv_bytes[i], &options, &output);
-        /* The ISA compiles: that is exactly why the gap has to be explicit. */
-        assert(result == PSBC_RESULT_OK);
+        assert(psbc_compile_shader(control_spirv, control_bytes, &options,
+                                   &output) == PSBC_RESULT_OK);
         assert((output.metadata.unresolved_fields & PSBC_UNRESOLVED_TESS_PIPELINE) != 0);
         assert(output.metadata.hardware_stage == PSBC_HW_STAGE_UNKNOWN);
         assert(!output.metadata.linkage_valid);
         assert(output.metadata.context_register_count == 0);
-        assert(!output.metadata.merged_geometry);
+        /* Program LO/HI plus RSRC1/RSRC2 of the HS half, for this half only. */
+        assert(output.metadata.shader_register_count == 4);
+        for (unsigned r = 1; r < output.metadata.shader_register_count; ++r)
+            assert(output.metadata.shader_registers[r].offset >
+                   output.metadata.shader_registers[r - 1].offset);
+        assert(output.metadata.shader_registers[2].value != 0);
+        psbc_free_output(&output);
+    }
+
+    /* The domain half has no package state at all yet and must publish none. */
+    {
+        PsbcCompileOptions options = options_for(PSBC_STAGE_TESS_EVAL);
+        PsbcShaderOutput output = {0};
+        assert(psbc_compile_shader(evaluation_spirv, evaluation_bytes, &options,
+                                   &output) == PSBC_RESULT_OK);
+        assert((output.metadata.unresolved_fields & PSBC_UNRESOLVED_TESS_PIPELINE) != 0);
+        assert(output.metadata.hardware_stage == PSBC_HW_STAGE_UNKNOWN);
+        assert(!output.metadata.linkage_valid);
+        assert(output.metadata.context_register_count == 0);
+        assert(output.metadata.shader_register_count == 0);
         psbc_free_output(&output);
     }
 
