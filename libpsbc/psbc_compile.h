@@ -20,7 +20,7 @@
 extern "C" {
 #endif
 
-#define PSBC_SHADER_METADATA_VERSION 14u
+#define PSBC_SHADER_METADATA_VERSION 15u
 
 struct nir_shader;
 struct nir_shader_compiler_options;
@@ -206,6 +206,29 @@ typedef struct {
     PsbcRegisterWrite    linkage_ge_cntl;
     PsbcRegisterWrite    linkage_stages_en;
     PsbcRegisterWrite    linkage_user_vgpr_en;
+    /* Merged vertex+geometry pre-raster stage.  The merged program occupies
+     * the same NGG hardware slot as a vertex-only one and the AGC linked block
+     * carries no geometry variant, so nothing downstream can tell the two
+     * apart from the rest of this metadata.  When merged_geometry is true the
+     * es_* fields describe the ES half the caller has to launch with it, in
+     * the same units radv uses: merged_es_itemsize in bytes (the ES half's
+     * export item size) and merged_esgs_ring_itemsize in dwords (the value the
+     * pair programs into VGT_ESGS_RING_ITEMSIZE).  Both are zero/false for
+     * every other compile.  The merged program's argument declaration is
+     * shared by both halves and is already reported through the user-data
+     * slots and the register set, and the ES half's parameter exports follow
+     * from the item size, so they are not duplicated here. */
+    bool                 merged_geometry;
+    uint32_t             merged_es_itemsize;
+    uint32_t             merged_esgs_ring_itemsize;
+    /* GE PC-line allocation (UC R_030980).  radv programs it for every NGG
+     * pipeline from ac_compute_late_alloc(), which is a property of the
+     * running device (SA/CU topology and per-shader-engine PC-line budget),
+     * not of the shader.  The register write is emitted only when the caller
+     * supplied those facts in PsbcCompileOptions; otherwise the field stays
+     * invalid rather than carrying a guessed constant. */
+    bool                 linkage_ge_pc_alloc_valid;
+    PsbcRegisterWrite    linkage_ge_pc_alloc;
     /* Hull halves.  A GFX10 hull stage runs two programs: the LS half (the
      * vertex shader, R_00B520..) and the HS half (the tessellation-control
      * shader, R_00B420..).  psbc_compile_tess_pipeline() compiles both and
@@ -348,6 +371,18 @@ typedef struct {
      * caller that supplies legacy texture indices carrying no Vulkan deref must
      * leave this false and keep the conservative layout fallback. */
     bool        static_descriptor_use;
+    /* Device facts the merged NGG pipeline state needs and this compiler
+     * cannot derive.  ac_compute_late_alloc() reads the SA/CU topology
+     * (min_good_cu_per_sa, family) and the per-shader-engine PC-line budget
+     * (pc_lines) of the device the shader will run on; libpsbc has no
+     * radeon_info of its own, and guessing those numbers is exactly what the
+     * native evidence already rejected.  When ngg_device_facts is false the
+     * metadata carries no GE PC-line allocation (the previous behaviour). */
+    bool        ngg_device_facts;
+    uint32_t    ngg_pc_lines;           /* radeon_info::pc_lines */
+    uint32_t    ngg_min_good_cu_per_sa; /* radeon_info::min_good_cu_per_sa */
+    bool        ngg_culling;            /* info->has_ngg_culling */
+    bool        ngg_uses_scratch;       /* scratch_bytes_per_wave > 0 */
 } PsbcCompileOptions;
 
 /* === API === */

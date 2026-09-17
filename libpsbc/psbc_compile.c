@@ -305,6 +305,8 @@ typedef struct {
 typedef struct {
     const struct nir_shader* nir;
     const struct radv_shader_info* rinfo;
+    /* ES half of a merged vertex+geometry pair; NULL for every other compile. */
+    const struct radv_shader_info* es_info;
     const struct radv_shader_args* rargs;
     const struct ac_shader_config* config;
     enum amd_gfx_level gfx_level;
@@ -977,6 +979,49 @@ static void fill_shader_metadata(const BuildContext* ctx,
             .offset = PSBC_UC_OFFSET(R_030988_GE_USER_VGPR_EN),
             .value = 0,
         };
+        /* Publish the ES half of a merged vertex+geometry pair and, when the
+         * caller supplied the device facts, the GE PC-line allocation radv
+         * programs for every NGG pipeline.  Nothing here is derived from a
+         * guessed constant: the merged fields come from the linked ES shader
+         * info this compile already built, and the allocation comes from the
+         * caller's device facts through the same ac_compute_late_alloc() radv
+         * uses. */
+        if (ctx->es_info) {
+            metadata->merged_geometry = true;
+            metadata->merged_es_itemsize = ctx->es_info->esgs_itemsize;
+            metadata->merged_esgs_ring_itemsize =
+                ctx->rinfo->ngg_info.vgt_esgs_ring_itemsize;
+        }
+        if (ctx->options->ngg_device_facts) {
+            struct radeon_info facts = {0};
+            unsigned late_alloc_wave64 = 0;
+            unsigned cu_mask = 0xffff;
+            facts.gfx_level = ctx->gfx_level;
+            facts.family = ctx->family;
+            facts.pc_lines = ctx->options->ngg_pc_lines;
+            facts.min_good_cu_per_sa = ctx->options->ngg_min_good_cu_per_sa;
+            ac_compute_late_alloc(&facts, true, ctx->options->ngg_culling,
+                                  ctx->options->ngg_uses_scratch,
+                                  &late_alloc_wave64, &cu_mask);
+            uint32_t oversub_pc_lines =
+                late_alloc_wave64 ? ctx->options->ngg_pc_lines / 4 : 0;
+            if (ctx->options->ngg_culling) {
+                /* Same oversubscription factor radv applies to a culling NGG
+                 * pipeline, from the exports this stage already produces. */
+                unsigned oversub_factor = 2;
+                if (ctx->rinfo->outinfo.param_exports > 4)
+                    oversub_factor = 4;
+                else if (ctx->rinfo->outinfo.param_exports > 2)
+                    oversub_factor = 3;
+                oversub_pc_lines *= oversub_factor;
+            }
+            metadata->linkage_ge_pc_alloc_valid = true;
+            metadata->linkage_ge_pc_alloc = (PsbcRegisterWrite) {
+                .offset = PSBC_UC_OFFSET(R_030980_GE_PC_ALLOC),
+                .value = S_030980_OVERSUB_EN(oversub_pc_lines > 0) |
+                         S_030980_NUM_PC_LINES(oversub_pc_lines - 1),
+            };
+        }
         metadata_add_register(cx, cx_count, PSBC_MAX_CONTEXT_REGISTERS,
             PSBC_CX_OFFSET(R_0286C4_SPI_VS_OUT_CONFIG),
             S_0286C4_VS_EXPORT_COUNT(nparams - 1) |
@@ -2842,6 +2887,7 @@ static PsbcResult psbc_compile_impl(
     /* Build the PS4/PS5 shader binary */
     BuildContext buildctx = {
         .rinfo = &binary->info,
+        .es_info = paired_geometry ? &previous.info : NULL,
         .rargs = &stage.args,
         .config = &binary->config,
         .nir = nir,
