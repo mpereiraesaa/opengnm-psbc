@@ -20,7 +20,11 @@
 extern "C" {
 #endif
 
-#define PSBC_SHADER_METADATA_VERSION 16u
+/* 17: the merged pair's system-SGPR indices and launch counts, the driver
+ * user-data window base, and the pixel stage's distance reads. A consumer that
+ * cached a program against version 16 must not interpret those fields with the
+ * new layout, so the version and the driver's cache key move together. */
+#define PSBC_SHADER_METADATA_VERSION 17u
 
 struct nir_shader;
 struct nir_shader_compiler_options;
