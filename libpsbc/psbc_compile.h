@@ -264,7 +264,17 @@ typedef struct {
      * The counts are the ones this metadata already programs into
      * VGT_GS_ONCHIP_CNTL.  A caller that leaves the registers stale changes how
      * many lanes each half runs, so esgs_system_sgprs_valid is the flag to
-     * check before executing the program. */
+     * check before executing the program.
+     *
+     * The two indices are SGPR offsets in the stage's SYSTEM block, i.e. below
+     * user_data_window_base: measured on three compiled programs (a merged
+     * vertex+geometry pair, a clip/cull vertex program and a draw-parameter
+     * program whose base_vertex/BaseInstance semantics are hardware-verified),
+     * an argument's SGPR offset is its user-data dword plus that base.  A
+     * driver writes its user data into the window and cannot address the system
+     * block, so these two fields describe registers the linked GE state must
+     * supply; a consumer that treats them as user-data dwords would write eight
+     * SGPRs away from the registers the shader reads. */
     bool                 esgs_system_sgprs_valid;
     uint32_t             esgs_gs_tg_info_sgpr;
     uint32_t             esgs_merged_wave_info_sgpr;
@@ -272,6 +282,12 @@ typedef struct {
     uint32_t             esgs_gs_inst_prims_per_subgroup;
     uint32_t             esgs_prim_amp_factor;
     uint32_t             esgs_workgroup_size;
+    /* SGPR index the first driver-supplied user-data dword lands on.  The
+     * driver writes user_sgpr_count dwords into the window that starts here;
+     * everything below it is a system register the linked GE state supplies.
+     * Zero means the stage declares no such window, and a consumer must not
+     * assume a base it was not given. */
+    uint32_t             user_data_window_base;
     uint32_t             input_semantic_count;
     uint32_t             input_semantics[PSBC_MAX_SEMANTICS];
     uint32_t             output_semantic_count;

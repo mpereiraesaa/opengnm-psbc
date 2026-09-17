@@ -1084,6 +1084,47 @@ static void fill_shader_metadata(const BuildContext* ctx,
                 ctx->rinfo->ngg_info.max_out_verts,
                 ctx->rinfo->ngg_info.prim_amp_factor);
         }
+        /* Every driver-visible argument lands at its user-data dword plus the
+         * stage's window base, so the base must be the same for all of them.
+         * Publish it only when the pairs that carry both an SGPR offset and a
+         * dword index agree - a consumer that derived it from one pair would
+         * silently misplace the whole block if that pair were inconsistent. */
+        {
+            struct {
+                const struct ac_arg *arg;
+                uint32_t dword;
+                bool published;
+            } pairs[4] = {
+                { &ctx->rargs->ac.base_vertex, metadata->base_vertex_user_data_dword,
+                  metadata->base_vertex_valid },
+                { &ctx->rargs->ac.start_instance, metadata->start_instance_user_data_dword,
+                  metadata->start_instance_valid },
+                { &ctx->rargs->ac.draw_id, metadata->draw_id_user_data_dword,
+                  metadata->draw_id_valid },
+                { &ctx->rargs->ngg_lds_layout, metadata->ngg_lds_layout_user_data_dword,
+                  metadata->ngg_lds_layout_valid },
+            };
+            uint32_t base = 0;
+            bool any = false, agree = true;
+            for (unsigned i = 0; i < 4 && agree; ++i) {
+                if (!pairs[i].published || !pairs[i].arg->used)
+                    continue;
+                const uint32_t offset =
+                    ctx->rargs->ac.args[pairs[i].arg->arg_index].offset;
+                if (offset < pairs[i].dword) {
+                    agree = false;
+                    break;
+                }
+                if (!any) {
+                    base = offset - pairs[i].dword;
+                    any = true;
+                } else if (offset - pairs[i].dword != base) {
+                    agree = false;
+                }
+            }
+            if (any && agree)
+                metadata->user_data_window_base = base;
+        }
         metadata_add_register(cx, cx_count, PSBC_MAX_CONTEXT_REGISTERS,
             PSBC_CX_OFFSET(R_0287FC_GE_MAX_OUTPUT_PER_SUBGROUP),
             S_0287FC_MAX_VERTS_PER_SUBGROUP(
