@@ -3024,6 +3024,22 @@ PsbcResult psbc_compile_tess_pipeline(
 
     hs.metadata.hull_ls_valid = true;
     hs.metadata.hull_ls_code_size = (uint32_t)ls.machine_code_size;
+    /* Carry the LS program in the same buffer as the HS program: the HS half
+     * keeps offset 0, and hull_ls_code_offset is where the LS half starts.  A
+     * consumer that wants one program still reads the bytes it always did. */
+    const size_t hs_code_size = hs.machine_code_size;
+    uint8_t* combined = malloc(hs_code_size + ls.machine_code_size);
+    if (!combined) {
+        psbc_free_output(&ls);
+        psbc_free_output(&hs);
+        return PSBC_RESULT_OUT_OF_MEMORY;
+    }
+    memcpy(combined, hs.machine_code, hs_code_size);
+    memcpy(combined + hs_code_size, ls.machine_code, ls.machine_code_size);
+    free(hs.machine_code);
+    hs.machine_code = combined;
+    hs.machine_code_size = hs_code_size + ls.machine_code_size;
+    hs.metadata.hull_ls_code_offset = (uint32_t)hs_code_size;
     hs.metadata.hull_ls_pgm_lo = (PsbcRegisterWrite){.offset = ls_lo, .value = 0};
     hs.metadata.hull_ls_pgm_hi = (PsbcRegisterWrite){.offset = ls_hi, .value = 0};
     hs.metadata.hull_ls_rsrc1 =

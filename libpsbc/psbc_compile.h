@@ -214,6 +214,10 @@ typedef struct {
      * hull_ls_valid stays false for a stand-alone control shader. */
     bool                 hull_ls_valid;
     uint32_t             hull_ls_code_size;
+    /* Byte offset of the LS program inside PsbcShaderOutput::machine_code.  The
+     * HS program starts at offset 0, so a consumer that only knows the HS half
+     * still reads the same bytes it always did. */
+    uint32_t             hull_ls_code_offset;
     PsbcRegisterWrite    hull_ls_pgm_lo;
     PsbcRegisterWrite    hull_ls_pgm_hi;
     PsbcRegisterWrite    hull_ls_rsrc1;

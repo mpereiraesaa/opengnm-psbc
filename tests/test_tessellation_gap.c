@@ -13,6 +13,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 static uint32_t *read_spirv(const char *path, size_t *bytes)
 {
@@ -105,6 +106,7 @@ int main(int argc, char **argv)
                                           &options, &pair) == PSBC_RESULT_OK);
         assert(pair.metadata.hull_ls_valid);
         assert(pair.metadata.hull_ls_code_size > 0);
+        assert(pair.metadata.hull_ls_code_offset > 0);
         assert(pair.metadata.hull_ls_rsrc1.value != 0);
         assert(pair.metadata.hull_ls_rsrc2.value != 0);
         /* Still not a loadable package: the LS code and the hull state the
@@ -118,7 +120,26 @@ int main(int argc, char **argv)
                                        &control_options, &control) == PSBC_RESULT_OK);
             assert((pair.metadata.shader_registers[2].value & 0x3Fu) >=
                    (control.metadata.shader_registers[2].value & 0x3Fu));
+            /* The packaged buffer is [HS code][LS code]: the HS half keeps the
+             * bytes a single-program consumer would read, and the LS half sits
+             * exactly where the metadata says. */
+            assert(pair.machine_code_size ==
+                   control.machine_code_size + pair.metadata.hull_ls_code_size);
+            assert(pair.metadata.hull_ls_code_offset == control.machine_code_size);
+            assert(memcmp(pair.machine_code, control.machine_code,
+                          control.machine_code_size) == 0);
             psbc_free_output(&control);
+        }
+        {
+            PsbcCompileOptions ls_options = options_for(PSBC_STAGE_VERTEX);
+            PsbcShaderOutput ls = {0};
+            assert(psbc_compile_shader(vertex_spirv, vertex_bytes, &ls_options,
+                                       &ls) == PSBC_RESULT_OK);
+            assert(ls.machine_code_size == pair.metadata.hull_ls_code_size);
+            assert(memcmp((const uint8_t *)pair.machine_code +
+                              pair.metadata.hull_ls_code_offset,
+                          ls.machine_code, ls.machine_code_size) == 0);
+            psbc_free_output(&ls);
         }
         psbc_free_output(&pair);
     }
