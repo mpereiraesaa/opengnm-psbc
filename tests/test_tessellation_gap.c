@@ -51,6 +51,14 @@ int main(int argc, char **argv)
     uint32_t *evaluation_spirv = read_spirv(argv[2], &evaluation_bytes);
     uint32_t *vertex_spirv = read_spirv(argv[3], &vertex_bytes);
 
+    /* VGT_TF_PARAM: one context register at the register's own offset
+     * ((0x028B6C - 0x28000) / 4, SI_CONTEXT_REG_OFFSET), whose value is derived
+     * from the interface the control shader declares.  Note that a stand-alone
+     * control shader does not carry the domain - that comes from the evaluation
+     * shader - so this value is the derivation's default here, which is one more
+     * reason the package cannot be complete without the pipeline's other half. */
+    const uint16_t tf_param_offset = (uint16_t)((0x028B6Cu - 0x28000u) / 4u);
+
     /* The hull half compiles and publishes its own program registers, but the
      * package is still explicitly incomplete. */
     {
@@ -61,13 +69,15 @@ int main(int argc, char **argv)
         assert((output.metadata.unresolved_fields & PSBC_UNRESOLVED_TESS_PIPELINE) != 0);
         assert(output.metadata.hardware_stage == PSBC_HW_STAGE_UNKNOWN);
         assert(!output.metadata.linkage_valid);
-        assert(output.metadata.context_register_count == 0);
+        assert(output.metadata.context_register_count == 1);
+        assert(output.metadata.context_registers[0].offset == tf_param_offset);
         /* Program LO/HI plus RSRC1/RSRC2 of the HS half, for this half only. */
         assert(output.metadata.shader_register_count == 4);
         for (unsigned r = 1; r < output.metadata.shader_register_count; ++r)
             assert(output.metadata.shader_registers[r].offset >
                    output.metadata.shader_registers[r - 1].offset);
         assert(output.metadata.shader_registers[2].value != 0);
+        assert(output.metadata.context_registers[0].value != 0);
         psbc_free_output(&output);
     }
 

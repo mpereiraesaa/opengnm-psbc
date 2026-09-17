@@ -669,6 +669,41 @@ static void gather_static_descriptor_use(
     }
 }
 
+/* VGT_TF_PARAM for a tessellation stage, derived from the interface that stage
+ * declares: the primitive mode (domain), the spacing/partitioning and the
+ * output topology.  The legacy GNM packaging and the PS5 metadata both use this
+ * one derivation so the two can never disagree. */
+static uint32_t tess_tf_param(const nir_shader* nir) {
+    uint32_t tf_type;
+    switch (nir->info.tess._primitive_mode) {
+    case TESS_PRIMITIVE_ISOLINES:   tf_type = V_028B6C_TESS_ISOLINE;  break;
+    case TESS_PRIMITIVE_TRIANGLES:  tf_type = V_028B6C_TESS_TRIANGLE; break;
+    case TESS_PRIMITIVE_QUADS:      tf_type = V_028B6C_TESS_QUAD;     break;
+    default:                        tf_type = V_028B6C_TESS_TRIANGLE; break;
+    }
+
+    uint32_t tf_partition;
+    switch (nir->info.tess.spacing) {
+    case TESS_SPACING_EQUAL:           tf_partition = V_028B6C_PART_INTEGER;    break;
+    case TESS_SPACING_FRACTIONAL_ODD:  tf_partition = V_028B6C_PART_FRAC_ODD;   break;
+    case TESS_SPACING_FRACTIONAL_EVEN: tf_partition = V_028B6C_PART_FRAC_EVEN;  break;
+    default:                           tf_partition = V_028B6C_PART_INTEGER;    break;
+    }
+
+    uint32_t tf_topology;
+    if (nir->info.tess.point_mode) {
+        tf_topology = V_028B6C_OUTPUT_POINT;
+    } else if (nir->info.tess.ccw) {
+        tf_topology = V_028B6C_OUTPUT_TRIANGLE_CCW;
+    } else {
+        tf_topology = V_028B6C_OUTPUT_TRIANGLE_CW;
+    }
+
+    return S_028B6C_TYPE(tf_type) |
+           S_028B6C_PARTITIONING(tf_partition) |
+           S_028B6C_TOPOLOGY(tf_topology);
+}
+
 static void fill_shader_metadata(const BuildContext* ctx,
                                  PsbcShaderMetadata* metadata) {
     memset(metadata, 0, sizeof(*metadata));
@@ -1093,6 +1128,13 @@ static void fill_shader_metadata(const BuildContext* ctx,
          * unresolved, so a consumer still cannot mistake this for a loadable
          * hull package. */
         metadata->unresolved_fields |= PSBC_UNRESOLVED_TESS_PIPELINE;
+        /* The hull/domain interface state this stage fully determines: the
+         * domain, the partitioning and the output topology.  The rest of the
+         * hull state (LS_HS_CONFIG, the TF ring, the offchip parameter and the
+         * stage enables) needs the pipeline's patch control points and the
+         * driver's draw state, so it stays out of the package on purpose. */
+        metadata_add_register(cx, cx_count, PSBC_MAX_CONTEXT_REGISTERS,
+            PSBC_CX_OFFSET(R_028B6C_VGT_TF_PARAM), tess_tf_param(ctx->nir));
         metadata_add_register(sh, sh_count, PSBC_MAX_SHADER_REGISTERS,
             PSBC_SH_OFFSET(R_00B420_SPI_SHADER_PGM_LO_HS), 0);
         metadata_add_register(sh, sh_count, PSBC_MAX_SHADER_REGISTERS,
@@ -1452,38 +1494,8 @@ static PsbcResult buildshaderbinary(
         break;
     }
     case PSBC_STAGE_TESS_CTRL: {
-        /* Map tess primitive mode to VGT_TF_PARAM TYPE field */
-        uint32_t tf_type;
-        switch (ctx->nir->info.tess._primitive_mode) {
-        case TESS_PRIMITIVE_ISOLINES:   tf_type = V_028B6C_TESS_ISOLINE;  break;
-        case TESS_PRIMITIVE_TRIANGLES:  tf_type = V_028B6C_TESS_TRIANGLE; break;
-        case TESS_PRIMITIVE_QUADS:      tf_type = V_028B6C_TESS_QUAD;     break;
-        default:                        tf_type = V_028B6C_TESS_TRIANGLE; break;
-        }
-
-        /* Map tess spacing to VGT_TF_PARAM PARTITIONING field */
-        uint32_t tf_partition;
-        switch (ctx->nir->info.tess.spacing) {
-        case TESS_SPACING_EQUAL:           tf_partition = V_028B6C_PART_INTEGER;    break;
-        case TESS_SPACING_FRACTIONAL_ODD:  tf_partition = V_028B6C_PART_FRAC_ODD;   break;
-        case TESS_SPACING_FRACTIONAL_EVEN: tf_partition = V_028B6C_PART_FRAC_EVEN;  break;
-        default:                           tf_partition = V_028B6C_PART_INTEGER;    break;
-        }
-
-        /* Map CCW + point_mode to VGT_TF_PARAM TOPOLOGY field */
-        uint32_t tf_topology;
-        if (ctx->nir->info.tess.point_mode) {
-            tf_topology = V_028B6C_OUTPUT_POINT;
-        } else if (ctx->nir->info.tess.ccw) {
-            tf_topology = V_028B6C_OUTPUT_TRIANGLE_CCW;
-        } else {
-            tf_topology = V_028B6C_OUTPUT_TRIANGLE_CW;
-        }
-
-        const uint32_t tf_param =
-            S_028B6C_TYPE(tf_type) |
-            S_028B6C_PARTITIONING(tf_partition) |
-            S_028B6C_TOPOLOGY(tf_topology);
+        /* One derivation, shared with the PS5 metadata path. */
+        const uint32_t tf_param = tess_tf_param(ctx->nir);
 
         const GnmHsShader hsh = {
             .common =
