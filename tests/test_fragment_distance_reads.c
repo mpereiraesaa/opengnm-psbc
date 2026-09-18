@@ -52,8 +52,8 @@ static void compile_fragment(const char *path, PsbcShaderMetadata *out)
 
 int main(int argc, char **argv)
 {
-    assert(argc == 3);
-    PsbcShaderMetadata reading, plain;
+    assert(argc == 4);
+    PsbcShaderMetadata reading, plain, second;
     compile_fragment(argv[1], &reading);
     assert(reading.version == PSBC_SHADER_METADATA_VERSION);
     assert(reading.hardware_stage == PSBC_HW_STAGE_PIXEL);
@@ -65,6 +65,16 @@ int main(int argc, char **argv)
     compile_fragment(argv[2], &plain);
     assert(plain.hardware_stage == PSBC_HW_STAGE_PIXEL);
     assert(!plain.ps_clip_distance_reads && !plain.ps_cull_distance_reads);
+
+    /* The register a distance read targets. A fragment that declares eight clip
+     * distances and reads only gl_ClipDistance[4] must name the SECOND packed
+     * register, because that is where component 4 lives; naming the first made
+     * the pixel stage interpolate the wrong register, and the upstream clipping
+     * leaf that reads the middle distance failed on hardware because of it. */
+    compile_fragment(argv[3], &second);
+    assert(second.ps_clip_distance_reads == 8 && !second.ps_cull_distance_reads);
+    assert(second.input_semantic_count == 1);
+    assert((second.input_semantics[0] & 255u) == PSBC_SEMANTIC_DISTANCE_REGISTER + 1u);
 
     printf("fragment distance reads reported: clip=%u cull=%u plain=%u\n",
            reading.ps_clip_distance_reads, reading.ps_cull_distance_reads,

@@ -530,13 +530,23 @@ static bool build_input_semantics(const nir_shader* nir,
                         nir->info.clip_distance_array_size :
                         nir->info.cull_distance_array_size;
                     const uint32_t attribute = nir_intrinsic_base(intrin);
+                    /* The register a read targets is the SLOT's own index, not
+                     * the attribute the linker gave it: VARYING_SLOT_CLIP_DIST0
+                     * and _DIST1 ARE the two packed position registers, and the
+                     * cull distances share them (a cull read arrives with one
+                     * of these locations too). Using the attribute as the
+                     * register index made a read of gl_ClipDistance[4] - which
+                     * lives in the second register - name the first, so the
+                     * pixel stage interpolated the wrong packed register and
+                     * the clipping leaf that reads the middle distance failed
+                     * on hardware while the 1_7 … 7_1 variants passed. */
+                    const unsigned register_index =
+                        (unsigned)(io.location - VARYING_SLOT_CLIP_DIST0);
                     if (io.num_slots != 1 || !declared || declared > 8u ||
-                        attribute >= generic_count ||
-                        PSBC_SEMANTIC_DISTANCE_REGISTER + attribute >
-                            PSBC_SEMANTIC_DISTANCE_REGISTER + 1u)
+                        register_index > 1u || attribute >= generic_count)
                         return false;
                     const uint32_t word =
-                        PSBC_SEMANTIC_DISTANCE_REGISTER + attribute;
+                        PSBC_SEMANTIC_DISTANCE_REGISTER + register_index;
                     if (seen[attribute] && words_by_attribute[attribute] != word)
                         return false;
                     words_by_attribute[attribute] = word;
