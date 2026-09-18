@@ -460,6 +460,18 @@ typedef struct {
      * radeon_info of its own, and guessing those numbers is exactly what the
      * native evidence already rejected.  When ngg_device_facts is false the
      * metadata carries no GE PC-line allocation (the previous behaviour). */
+    /* DIAGNOSTIC: compile an NGG stage with passthrough forced OFF.
+     *
+     * radv enables NGG passthrough whenever the stage does not cull and is
+     * not a vertex shader exporting the primitive ID, which includes a
+     * tessellation EVALUATION half. On PS5 no working pipeline has ever run
+     * passthrough with ES_EN = ES_STAGE_DS - every passing NGG draw on the
+     * device is vertex-fed - so the combination is untested there. Forcing it
+     * off has to happen in the COMPILER, because the mode decides both the
+     * generated code and the published VGT_SHADER_STAGES_EN: clearing the
+     * register bit alone would mismatch a shader ACO already built for
+     * passthrough. Default false keeps radv's own decision. */
+    bool        ngg_no_passthrough;
     bool        ngg_device_facts;
     uint32_t    ngg_pc_lines;           /* radeon_info::pc_lines */
     uint32_t    ngg_min_good_cu_per_sa; /* radeon_info::min_good_cu_per_sa */

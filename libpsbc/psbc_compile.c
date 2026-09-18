@@ -3030,6 +3030,14 @@ static PsbcResult psbc_compile_impl(
          *       tess-levels-to-TES flag to CONSTANTS instead of to fields of a
          *       tcs_offchip_layout user SGPR that nothing on this platform
          *       supplies. */
+        /* The passthrough override, applied after the link so nothing
+         * recomputes it, and before ACO reads it. radv_shader.c passes
+         * info->is_ngg_passthrough straight to aco as options.passthrough,
+         * and this compile publishes the same flag into
+         * VGT_SHADER_STAGES_EN.PRIMGEN_PASSTHRU_EN, so one assignment keeps
+         * the program and the register describing the same pipeline. */
+        if (opts->ngg_no_passthrough)
+            stage.info.is_ngg_passthrough = false;
         if (next_link_valid) {
             stage.info.tcs.tes_reads_tess_factors = next_link_reads_tess_factors;
             stage.info.tcs.tes_inputs_read = next_link_inputs_read;
