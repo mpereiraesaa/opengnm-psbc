@@ -2511,6 +2511,16 @@ static PsbcResult psbc_compile_impl(
      * This shader is compiled into nothing. It exists so the control half can
      * be linked to it, which is the mirror of what the domain compile already
      * does in the other direction. */
+    /* The facts the link yields, extracted as plain values so the link-only
+     * shader can be freed the moment it has been read. It is consumed long
+     * before the compile ends and there are a dozen early-return paths
+     * between here and there; carrying the nir_shader across all of them
+     * leaked it (603 KB, caught by the sanitizer gate), and adding a free to
+     * every exit would have been one edit away from leaking again. */
+    bool next_link_valid = false;
+    bool next_link_reads_tess_factors = false;
+    uint64_t next_link_inputs_read = 0, next_link_patch_inputs_read = 0;
+    enum tess_primitive_mode next_link_primitive_mode = TESS_PRIMITIVE_UNSPECIFIED;
     nir_shader* next_link_nir = NULL;
     if (paired_hull && next_link_spirv) {
         struct radv_shader_stage next_link = {0};
@@ -2536,6 +2546,15 @@ static PsbcResult psbc_compile_impl(
         nir->info.tess.ccw |= next_link_nir->info.tess.ccw;
         nir->info.tess.point_mode |= next_link_nir->info.tess.point_mode;
         debug_shader_io("next-link-SPIR-V", next_link_nir, NULL);
+        next_link_reads_tess_factors =
+            !!(next_link_nir->info.inputs_read &
+               (VARYING_BIT_TESS_LEVEL_INNER | VARYING_BIT_TESS_LEVEL_OUTER));
+        next_link_inputs_read = next_link_nir->info.inputs_read;
+        next_link_patch_inputs_read = next_link_nir->info.patch_inputs_read;
+        next_link_primitive_mode = next_link_nir->info.tess._primitive_mode;
+        next_link_valid = true;
+        ralloc_free(next_link_nir);
+        next_link_nir = NULL;
     }
     if (paired_domain) {
         /* merge_tess_info(), from the pinned radv_pipeline_graphics.c. The
@@ -3011,15 +3030,11 @@ static PsbcResult psbc_compile_impl(
          *       tess-levels-to-TES flag to CONSTANTS instead of to fields of a
          *       tcs_offchip_layout user SGPR that nothing on this platform
          *       supplies. */
-        if (paired_hull && next_link_nir) {
-            stage.info.tcs.tes_reads_tess_factors =
-                !!(next_link_nir->info.inputs_read &
-                   (VARYING_BIT_TESS_LEVEL_INNER | VARYING_BIT_TESS_LEVEL_OUTER));
-            stage.info.tcs.tes_inputs_read = next_link_nir->info.inputs_read;
-            stage.info.tcs.tes_patch_inputs_read =
-                next_link_nir->info.patch_inputs_read;
-            stage.info.tes._primitive_mode =
-                next_link_nir->info.tess._primitive_mode;
+        if (next_link_valid) {
+            stage.info.tcs.tes_reads_tess_factors = next_link_reads_tess_factors;
+            stage.info.tcs.tes_inputs_read = next_link_inputs_read;
+            stage.info.tcs.tes_patch_inputs_read = next_link_patch_inputs_read;
+            stage.info.tes._primitive_mode = next_link_primitive_mode;
             stage.info.outputs_linked = true;
         }
         /* Standalone linking conservatively adds PrimitiveID without an FS.
