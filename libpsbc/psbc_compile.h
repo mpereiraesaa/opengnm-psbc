@@ -20,7 +20,11 @@
 extern "C" {
 #endif
 
-#define PSBC_SHADER_METADATA_VERSION 14u
+/* 17: the merged pair's system-SGPR indices and launch counts, the driver
+ * user-data window base, and the pixel stage's distance reads. A consumer that
+ * cached a program against version 16 must not interpret those fields with the
+ * new layout, so the version and the driver's cache key move together. */
+#define PSBC_SHADER_METADATA_VERSION 17u
 
 struct nir_shader;
 struct nir_shader_compiler_options;
@@ -60,9 +64,24 @@ typedef enum {
 #define PSBC_MAX_CONTEXT_REGISTERS 16
 #define PSBC_MAX_SHADER_REGISTERS 8
 #define PSBC_MAX_SEMANTICS 32
-/* Private matching key shared by our AGC producer/consumer packages, after
- * the generic keys 15..46. This is not a PSSL system-semantic enum. */
+/* Private matching keys shared by our AGC producer/consumer packages, after
+ * the generic keys 15..46. This is not a PSSL system-semantic enum: the two
+ * halves of a pipeline pair on these values, and the producer's word also
+ * carries the parameter index of what it exports in bits 8..15. */
 #define PSBC_SEMANTIC_PRIMITIVE_ID 47u
+/* One key per packed clip/cull distance register the pre-raster stage exports
+ * and the pixel stage reads: clip components come first, cull continues after
+ * them, four components per register, so a stage pairs the (whole) register
+ * rather than a feature - a register can hold clip and cull components at the
+ * same time. The low byte identifies the register; the producer adds its
+ * parameter index above it. */
+#define PSBC_SEMANTIC_DISTANCE_REGISTER 48u
+/* The geometry stage's viewport selection. RADV counts it as a parameter
+ * export and gives it a slot in vs_output_param_offset, so a pipeline that
+ * writes gl_ViewportIndex exports one parameter more than its varyings and
+ * packed distance registers account for; naming it keeps the semantic list and
+ * the export count in agreement instead of leaving the linkage unresolved. */
+#define PSBC_SEMANTIC_VIEWPORT_INDEX 49u
 #define PSBC_MAX_VERTEX_ATTRIBUTES 32
 #define PSBC_MAX_DESCRIPTOR_BINDINGS 64
 #define PSBC_MAX_DESCRIPTOR_SETS 4
@@ -174,6 +193,16 @@ typedef enum {
     PSBC_UNRESOLVED_PROGRAM_CHECKSUM       = 1u << 0,
     PSBC_UNRESOLVED_NGG_ESGS_RING_ITEMSIZE = 1u << 1,
     PSBC_UNRESOLVED_AGC_LINKAGE             = 1u << 2,
+    /* The stand-alone tessellation stages compile to ISA, but this compiler has
+     * no tessellation *pipeline* entry point: radv builds the hull shader as one
+     * merged vertex+tessellation-control program (AC_HW_HULL_SHADER, programmed
+     * through SPI_SHADER_PGM_LO_LS on gfx10) and the domain half as a separate
+     * stage, and it programs the hull/domain state (VGT_LS_HS_CONFIG,
+     * VGT_TF_PARAM, VGT_TF_RING_SIZE, VGT_HS_OFFCHIP_PARAM) through the
+     * pipeline's context rolls. A TESS_CTRL/TESS_EVAL result from
+     * psbc_compile_shader() is therefore an ISA-level diagnostic and must never
+     * be treated as a loadable package. */
+    PSBC_UNRESOLVED_TESS_PIPELINE          = 1u << 3,
 } PsbcUnresolvedField;
 
 typedef struct {
@@ -196,6 +225,88 @@ typedef struct {
     PsbcRegisterWrite    linkage_ge_cntl;
     PsbcRegisterWrite    linkage_stages_en;
     PsbcRegisterWrite    linkage_user_vgpr_en;
+    /* Merged vertex+geometry pre-raster stage.  The merged program occupies
+     * the same NGG hardware slot as a vertex-only one and the AGC linked block
+     * carries no geometry variant, so nothing downstream can tell the two
+     * apart from the rest of this metadata.  When merged_geometry is true the
+     * es_* fields describe the ES half the caller has to launch with it, in
+     * the same units radv uses: merged_es_itemsize in bytes (the ES half's
+     * export item size) and merged_esgs_ring_itemsize in dwords (the value the
+     * pair programs into VGT_ESGS_RING_ITEMSIZE).  Both are zero/false for
+     * every other compile.  The merged program's argument declaration is
+     * shared by both halves and is already reported through the user-data
+     * slots and the register set, and the ES half's parameter exports follow
+     * from the item size, so they are not duplicated here. */
+    bool                 merged_geometry;
+    uint32_t             merged_es_itemsize;
+    uint32_t             merged_esgs_ring_itemsize;
+    /* GE PC-line allocation (UC R_030980).  radv programs it for every NGG
+     * pipeline from ac_compute_late_alloc(), which is a property of the
+     * running device (SA/CU topology and per-shader-engine PC-line budget),
+     * not of the shader.  The register write is emitted only when the caller
+     * supplied those facts in PsbcCompileOptions; otherwise the field stays
+     * invalid rather than carrying a guessed constant. */
+    bool                 linkage_ge_pc_alloc_valid;
+    PsbcRegisterWrite    linkage_ge_pc_alloc;
+    /* Hull halves.  A GFX10 hull stage runs two programs: the LS half (the
+     * vertex shader, R_00B520..) and the HS half (the tessellation-control
+     * shader, R_00B420..).  psbc_compile_tess_pipeline() compiles both and
+     * publishes the LS half here, with the HS half's RSRC1/RSRC2 replaced by
+     * the combined pair radv produces with radv_shader_combine_cfg_vs_tcs().
+     * hull_ls_valid stays false for a stand-alone control shader. */
+    bool                 hull_ls_valid;
+    uint32_t             hull_ls_code_size;
+    /* Byte offset of the LS program inside PsbcShaderOutput::machine_code.  The
+     * HS program starts at offset 0, so a consumer that only knows the HS half
+     * still reads the same bytes it always did. */
+    uint32_t             hull_ls_code_offset;
+    PsbcRegisterWrite    hull_ls_pgm_lo;
+    PsbcRegisterWrite    hull_ls_pgm_hi;
+    PsbcRegisterWrite    hull_ls_rsrc1;
+    PsbcRegisterWrite    hull_ls_rsrc2;
+    /* Fragment-stage distance usage.  The masks above describe what a pre-raster
+     * stage exports; these two describe what a pixel stage declares and reads,
+     * which is the input the rasterizer would have to deliver to it.  Both are
+     * zero for a fragment stage that reads neither, and for every other stage.
+     * A consumer that cannot route distances to the pixel stage can use a
+     * non-zero value here to refuse precisely instead of guessing. */
+    uint32_t             ps_clip_distance_reads;
+    uint32_t             ps_cull_distance_reads;
+    /* Merged pre-raster pair: the system SGPRs the caller must supply and the
+     * launch shape they describe.  A merged vertex+geometry stage is two
+     * programs in one, and each half disables the lanes it does not need from
+     * these two registers (radv declares them as the merged stage's first
+     * system registers and the compiler reads them to gate the geometry half).
+     * They are counts, not addresses: merged_wave_info holds the ES lane count
+     * in byte 0 and the GS lane count in byte 1, and gs_tg_info holds the
+     * vertices of the group in bits 12..20 and its primitives in bits 22..30.
+     * The counts are the ones this metadata already programs into
+     * VGT_GS_ONCHIP_CNTL.  A caller that leaves the registers stale changes how
+     * many lanes each half runs, so esgs_system_sgprs_valid is the flag to
+     * check before executing the program.
+     *
+     * The two indices are SGPR offsets in the stage's SYSTEM block, i.e. below
+     * user_data_window_base: measured on three compiled programs (a merged
+     * vertex+geometry pair, a clip/cull vertex program and a draw-parameter
+     * program whose base_vertex/BaseInstance semantics are hardware-verified),
+     * an argument's SGPR offset is its user-data dword plus that base.  A
+     * driver writes its user data into the window and cannot address the system
+     * block, so these two fields describe registers the linked GE state must
+     * supply; a consumer that treats them as user-data dwords would write eight
+     * SGPRs away from the registers the shader reads. */
+    bool                 esgs_system_sgprs_valid;
+    uint32_t             esgs_gs_tg_info_sgpr;
+    uint32_t             esgs_merged_wave_info_sgpr;
+    uint32_t             esgs_es_verts_per_subgroup;
+    uint32_t             esgs_gs_inst_prims_per_subgroup;
+    uint32_t             esgs_prim_amp_factor;
+    uint32_t             esgs_workgroup_size;
+    /* SGPR index the first driver-supplied user-data dword lands on.  The
+     * driver writes user_sgpr_count dwords into the window that starts here;
+     * everything below it is a system register the linked GE state supplies.
+     * Zero means the stage declares no such window, and a consumer must not
+     * assume a base it was not given. */
+    uint32_t             user_data_window_base;
     uint32_t             input_semantic_count;
     uint32_t             input_semantics[PSBC_MAX_SEMANTICS];
     uint32_t             output_semantic_count;
@@ -322,6 +433,18 @@ typedef struct {
      * caller that supplies legacy texture indices carrying no Vulkan deref must
      * leave this false and keep the conservative layout fallback. */
     bool        static_descriptor_use;
+    /* Device facts the merged NGG pipeline state needs and this compiler
+     * cannot derive.  ac_compute_late_alloc() reads the SA/CU topology
+     * (min_good_cu_per_sa, family) and the per-shader-engine PC-line budget
+     * (pc_lines) of the device the shader will run on; libpsbc has no
+     * radeon_info of its own, and guessing those numbers is exactly what the
+     * native evidence already rejected.  When ngg_device_facts is false the
+     * metadata carries no GE PC-line allocation (the previous behaviour). */
+    bool        ngg_device_facts;
+    uint32_t    ngg_pc_lines;           /* radeon_info::pc_lines */
+    uint32_t    ngg_min_good_cu_per_sa; /* radeon_info::min_good_cu_per_sa */
+    bool        ngg_culling;            /* info->has_ngg_culling */
+    bool        ngg_uses_scratch;       /* scratch_bytes_per_wave > 0 */
 } PsbcCompileOptions;
 
 /* === API === */
@@ -391,6 +514,23 @@ PsbcResult psbc_compile_geometry_pipeline(
 PsbcResult psbc_compile_nir_geometry_pipeline(
     const struct nir_shader* vertex_nir,
     const struct nir_shader* geometry_nir,
+    const PsbcCompileOptions* opts,
+    PsbcShaderOutput* out
+);
+
+/* Compile a PS5 tessellation pipeline's two hull halves: the vertex shader as
+ * the LS half and the tessellation-control shader as the HS half.  Both are
+ * compiled with the pinned ACO path, the LS half is published through the
+ * hull_ls_* metadata fields, and the HS half's RSRC1/RSRC2 are replaced by the
+ * combined pair radv_shader_combine_cfg_vs_tcs() produces.  The returned
+ * output is still not a loadable hull package (the LS code and the hull state
+ * the pipeline owns are not in it), which PSBC_UNRESOLVED_TESS_PIPELINE keeps
+ * explicit. */
+PsbcResult psbc_compile_tess_pipeline(
+    const uint32_t* vertex_spirv,
+    size_t vertex_spirv_size,
+    const uint32_t* tess_ctrl_spirv,
+    size_t tess_ctrl_spirv_size,
     const PsbcCompileOptions* opts,
     PsbcShaderOutput* out
 );

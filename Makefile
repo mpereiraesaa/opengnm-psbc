@@ -78,6 +78,47 @@ test-descriptor-static-use: $(LIBPSBC)
 	$(CC) -std=c11 -Wall -Wextra -Werror -Ilibpsbc tests/test_descriptor_static_use.c $(LIBPSBC) -lstdc++ -lm -lpthread -o tests/test_descriptor_static_use
 	./tests/test_descriptor_static_use
 
+.PHONY: test-tessellation-gap
+test-tessellation-gap: $(LIBPSBC)
+	# The tessellation stages compile to ISA but must report the explicit
+	# pipeline gap rather than an unclassified hardware stage.
+	$(GLSLANG) -V -S tesc --target-env vulkan1.0 tests/test.tesc -o tests/test.tesc.spv
+	$(GLSLANG) -V -S tese --target-env vulkan1.0 tests/test.tese -o tests/test.tese.spv
+	$(GLSLANG) -V --target-env vulkan1.0 tests/tri.vert -o tests/tri.vert.spv
+	$(CC) -std=c11 -Wall -Wextra -Werror -Ilibpsbc tests/test_tessellation_gap.c $(LIBPSBC) -lstdc++ -lm -lpthread -o tests/test_tessellation_gap
+	./tests/test_tessellation_gap tests/test.tesc.spv tests/test.tese.spv tests/tri.vert.spv
+
+.PHONY: test-fragment-distance-reads
+test-fragment-distance-reads: $(LIBPSBC)
+	# The pixel stage reports the distance widths it declares, so a consumer
+	# that cannot route distances to the pixel stage can refuse precisely.
+	$(GLSLANG) -V -S frag --target-env vulkan1.0 tests/fragment-clip-read.frag -o tests/fragment-clip-read.frag.spv
+	$(GLSLANG) -V -S frag --target-env vulkan1.0 tests/fragment-plain.frag -o tests/fragment-plain.frag.spv
+	$(GLSLANG) -V -S frag --target-env vulkan1.0 tests/fragment-clip-read-second.frag -o tests/fragment-clip-read-second.frag.spv
+	$(CC) -std=c11 -Wall -Wextra -Werror -Ilibpsbc tests/test_fragment_distance_reads.c $(LIBPSBC) -lstdc++ -lm -lpthread -o tests/test_fragment_distance_reads
+	./tests/test_fragment_distance_reads tests/fragment-clip-read.frag.spv tests/fragment-plain.frag.spv tests/fragment-clip-read-second.frag.spv
+.PHONY: test-merged-geometry-metadata
+test-merged-geometry-metadata: $(LIBPSBC)
+	# A merged VS+GS pair must be identifiable and must describe its ES half,
+	# while the GE PC-line allocation appears only when the caller supplies the
+	# SA/CU and PC-line facts the compiler cannot derive.
+	$(GLSLANG) -V --target-env vulkan1.0 tests/merged-geometry.vert -o tests/merged-geometry.vert.spv
+	$(GLSLANG) -V -S geom --target-env vulkan1.0 tests/merged-geometry.geom -o tests/merged-geometry.geom.spv
+	$(CC) -std=c11 -Wall -Wextra -Werror -Ilibpsbc tests/test_merged_geometry_metadata.c $(LIBPSBC) -lstdc++ -lm -lpthread -o tests/test_merged_geometry_metadata
+	./tests/test_merged_geometry_metadata tests/merged-geometry.vert.spv tests/merged-geometry.geom.spv
+
+.PHONY: test-viewport-index-metadata
+test-viewport-index-metadata: $(LIBPSBC)
+	# A geometry stage that writes gl_ViewportIndex exports one parameter the
+	# varying loop cannot describe. The semantic list must name it, or the
+	# linkage stays unresolved and a viewport-routing pipeline is refused; the
+	# control stage writes no viewport index and must be unchanged.
+	$(GLSLANG) -V --target-env vulkan1.0 tests/merged-geometry.vert -o tests/merged-geometry.vert.spv
+	$(GLSLANG) -V -S geom --target-env vulkan1.0 tests/viewport-index.geom -o tests/viewport-index.geom.spv
+	$(GLSLANG) -V -S geom --target-env vulkan1.0 tests/merged-geometry.geom -o tests/merged-geometry.geom.spv
+	$(CC) -std=c11 -Wall -Wextra -Werror -Ilibpsbc tests/test_viewport_index_metadata.c $(LIBPSBC) -lstdc++ -lm -lpthread -o tests/test_viewport_index_metadata
+	./tests/test_viewport_index_metadata tests/merged-geometry.vert.spv tests/viewport-index.geom.spv tests/merged-geometry.geom.spv
+
 test-core-vertex-formats: $(PSBC)
 	$(PYTHON) tests/verify_core_vertex_formats.py --psbc ./$(PSBC) --glslang $(GLSLANG)
 
