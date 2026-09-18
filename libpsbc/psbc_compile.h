@@ -76,6 +76,12 @@ typedef enum {
  * same time. The low byte identifies the register; the producer adds its
  * parameter index above it. */
 #define PSBC_SEMANTIC_DISTANCE_REGISTER 48u
+/* The geometry stage's viewport selection. RADV counts it as a parameter
+ * export and gives it a slot in vs_output_param_offset, so a pipeline that
+ * writes gl_ViewportIndex exports one parameter more than its varyings and
+ * packed distance registers account for; naming it keeps the semantic list and
+ * the export count in agreement instead of leaving the linkage unresolved. */
+#define PSBC_SEMANTIC_VIEWPORT_INDEX 49u
 #define PSBC_MAX_VERTEX_ATTRIBUTES 32
 #define PSBC_MAX_DESCRIPTOR_BINDINGS 64
 #define PSBC_MAX_DESCRIPTOR_SETS 4
