@@ -50,6 +50,9 @@ allocate_inline_push_consts(const struct radv_shader_info *info, struct user_sgp
 
 struct radv_shader_args_state {
    struct radv_shader_args *args;
+   /* PS5 only: needed by declare_global_input_sgprs() to decide whether the
+    * ring descriptor table travels as user data on this target. */
+   const struct radv_compiler_info *compiler_info;
    bool gather_debug_info;
    void *ctx;
    const char *arg_names[AC_MAX_ARGS];
@@ -141,6 +144,27 @@ static void
 declare_global_input_sgprs(struct radv_shader_args_state *state, const enum amd_gfx_level gfx_level,
                            const struct radv_shader_info *info, const struct user_sgpr_info *user_sgpr_info)
 {
+   /* PS5 only: the ring descriptor table, as USER DATA.
+    *
+    * The tessellation stages are the only ones that dereference that table -
+    * load_ring() reads a buffer descriptor from it at ring*16 - and on this
+    * platform the system-block ring_offsets at s0/s1 cannot be written. For a
+    * merged shader it sits below the user-data window (which is what the
+    * num_user_sgprs reset in radv_declare_shader_args encodes), and the native
+    * graphics API exposes no call that configures a global ring table, so
+    * nothing populates it. The address therefore travels as ordinary user
+    * data, which IS writable, and load_ring() prefers it when it is present.
+    *
+    * Declared HERE, with the other window arguments, rather than beside
+    * ring_offsets: absolute SGPR assignment follows the order of the
+    * ac_add_arg calls, so declaring it earlier places it inside the eight
+    * hardware system SGPRs, on top of tess_offchip_offset and
+    * merged_wave_info. */
+   if (state->compiler_info && state->compiler_info->key.ps5_tess_ring_table &&
+       (info->stage == MESA_SHADER_TESS_CTRL || info->stage == MESA_SHADER_TESS_EVAL)) {
+      RADV_ADD_UD_ARG(state, 2, AC_ARG_CONST_ADDR, ps5_ring_table, AC_UD_PS5_RING_TABLE);
+   }
+
    if (user_sgpr_info) {
       if (info->descriptor_heap) {
          add_descriptor_heap(state, RADV_HEAP_RESOURCE);
@@ -982,6 +1006,7 @@ radv_declare_shader_args(const struct radv_compiler_info *compiler_info,
 
    struct radv_shader_args_state state = {
       .args = args,
+      .compiler_info = compiler_info,
    };
 
    struct user_sgpr_info user_sgpr_info = {0};
@@ -1043,6 +1068,7 @@ radv_declare_ps_epilog_args(const struct radv_compiler_info *compiler_info, cons
 {
    struct radv_shader_args_state state = {
       .args = args,
+      .compiler_info = compiler_info,
    };
 
    radv_init_shader_args(compiler_info, &state, MESA_SHADER_FRAGMENT);

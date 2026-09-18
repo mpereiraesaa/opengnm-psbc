@@ -305,6 +305,12 @@ typedef struct {
 typedef struct {
     const struct nir_shader* nir;
     const struct radv_shader_info* rinfo;
+    /* ES half of a merged vertex+geometry pair; NULL for every other compile. */
+    const struct radv_shader_info* es_info;
+    /* True when this control-stage compile carried its vertex half, so the
+     * published program is a real merged LS/HS image rather than a control
+     * half that has nothing to run with. */
+    bool ls_merged;
     const struct radv_shader_args* rargs;
     const struct ac_shader_config* config;
     enum amd_gfx_level gfx_level;
@@ -509,6 +515,38 @@ static bool build_input_semantics(const nir_shader* nir,
                 const bool primitive_id = io.location == VARYING_SLOT_PRIMITIVE_ID;
                 if (primitive_id && (io.num_slots != 1 || mode != 1))
                     return false;
+                /* A distance the PIXEL stage reads is a packed position
+                 * register: the rasterizer interpolates it like a varying and
+                 * the linker places it at the attribute slot of the register
+                 * the pre-raster stage exported. Name that register with the
+                 * same private key the export side uses, so the two halves pair
+                 * on the register (not on the feature - one register holds clip
+                 * and cull components together) and the producer's word carries
+                 * the parameter index to interpolate from. A stage whose
+                 * declared width is outside the two packed registers is left
+                 * undescribed, which the pipeline then refuses. */
+                const bool clip_distance = io.location == VARYING_SLOT_CLIP_DIST0 ||
+                    io.location == VARYING_SLOT_CLIP_DIST1;
+                const bool cull_distance = io.location == VARYING_SLOT_CULL_DIST0 ||
+                    io.location == VARYING_SLOT_CULL_DIST1;
+                if (clip_distance || cull_distance) {
+                    const unsigned declared = clip_distance ?
+                        nir->info.clip_distance_array_size :
+                        nir->info.cull_distance_array_size;
+                    const uint32_t attribute = nir_intrinsic_base(intrin);
+                    if (io.num_slots != 1 || !declared || declared > 8u ||
+                        attribute >= generic_count ||
+                        PSBC_SEMANTIC_DISTANCE_REGISTER + attribute >
+                            PSBC_SEMANTIC_DISTANCE_REGISTER + 1u)
+                        return false;
+                    const uint32_t word =
+                        PSBC_SEMANTIC_DISTANCE_REGISTER + attribute;
+                    if (seen[attribute] && words_by_attribute[attribute] != word)
+                        return false;
+                    words_by_attribute[attribute] = word;
+                    seen[attribute] = true;
+                    continue;
+                }
                 if (!primitive_id && io.location < VARYING_SLOT_VAR0)
                     continue;
                 for (uint32_t slot = 0; slot < io.num_slots; ++slot) {
@@ -551,6 +589,9 @@ static bool fill_output_semantics(const struct radv_shader_info* info,
                 (15u + semantic) | ((uint32_t)parameter << 8);
         }
     }
+    /* The distance registers follow the described varyings in the parameter
+     * space, so their parameter indices start at this count. */
+    const unsigned generic_semantics = metadata->output_semantic_count;
     const uint8_t primitive_id =
         info->outinfo.vs_output_param_offset[VARYING_SLOT_PRIMITIVE_ID];
     if (primitive_id < PSBC_MAX_SEMANTICS) {
@@ -558,6 +599,24 @@ static bool fill_output_semantics(const struct radv_shader_info* info,
             return false;
         metadata->output_semantics[metadata->output_semantic_count++] =
             PSBC_SEMANTIC_PRIMITIVE_ID | ((uint32_t)primitive_id << 8);
+    }
+    /* The packed distance registers are pixel attributes too, and a pixel
+     * stage that reads a distance needs to name the register it reads: publish
+     * one word per register, after the described varyings and with the
+     * parameter index those registers occupy in the export space. Without this
+     * the pixel input list stays unresolved for a distance attribute and the
+     * AGC linker has nothing to map the read to (the pin's behaviour). */
+    const unsigned clip_components = util_bitcount(info->outinfo.clip_dist_mask);
+    const unsigned cull_components = util_bitcount(info->outinfo.cull_dist_mask);
+    const unsigned distance_registers =
+        (clip_components + cull_components + 3u) / 4u;
+    for (unsigned register_index = 0; register_index < distance_registers;
+         ++register_index) {
+        if (metadata->output_semantic_count >= PSBC_MAX_SEMANTICS)
+            return false;
+        metadata->output_semantics[metadata->output_semantic_count++] =
+            (PSBC_SEMANTIC_DISTANCE_REGISTER + register_index) |
+            ((uint32_t)(generic_semantics + register_index) << 8);
     }
     return metadata->output_semantic_count ==
         info->outinfo.param_exports + info->outinfo.prim_param_exports;
@@ -669,6 +728,41 @@ static void gather_static_descriptor_use(
     }
 }
 
+/* VGT_TF_PARAM for a tessellation stage, derived from the interface that stage
+ * declares: the primitive mode (domain), the spacing/partitioning and the
+ * output topology.  The legacy GNM packaging and the PS5 metadata both use this
+ * one derivation so the two can never disagree. */
+static uint32_t tess_tf_param(const nir_shader* nir) {
+    uint32_t tf_type;
+    switch (nir->info.tess._primitive_mode) {
+    case TESS_PRIMITIVE_ISOLINES:   tf_type = V_028B6C_TESS_ISOLINE;  break;
+    case TESS_PRIMITIVE_TRIANGLES:  tf_type = V_028B6C_TESS_TRIANGLE; break;
+    case TESS_PRIMITIVE_QUADS:      tf_type = V_028B6C_TESS_QUAD;     break;
+    default:                        tf_type = V_028B6C_TESS_TRIANGLE; break;
+    }
+
+    uint32_t tf_partition;
+    switch (nir->info.tess.spacing) {
+    case TESS_SPACING_EQUAL:           tf_partition = V_028B6C_PART_INTEGER;    break;
+    case TESS_SPACING_FRACTIONAL_ODD:  tf_partition = V_028B6C_PART_FRAC_ODD;   break;
+    case TESS_SPACING_FRACTIONAL_EVEN: tf_partition = V_028B6C_PART_FRAC_EVEN;  break;
+    default:                           tf_partition = V_028B6C_PART_INTEGER;    break;
+    }
+
+    uint32_t tf_topology;
+    if (nir->info.tess.point_mode) {
+        tf_topology = V_028B6C_OUTPUT_POINT;
+    } else if (nir->info.tess.ccw) {
+        tf_topology = V_028B6C_OUTPUT_TRIANGLE_CCW;
+    } else {
+        tf_topology = V_028B6C_OUTPUT_TRIANGLE_CW;
+    }
+
+    return S_028B6C_TYPE(tf_type) |
+           S_028B6C_PARTITIONING(tf_partition) |
+           S_028B6C_TOPOLOGY(tf_topology);
+}
+
 static void fill_shader_metadata(const BuildContext* ctx,
                                  PsbcShaderMetadata* metadata) {
     memset(metadata, 0, sizeof(*metadata));
@@ -687,6 +781,11 @@ static void fill_shader_metadata(const BuildContext* ctx,
             ctx->rargs->user_sgprs_locs
                 .shader_data[AC_UD_PUSH_CONSTANTS].sgpr_idx;
         metadata->push_constant_size = ctx->rinfo->push_constant_size;
+    }
+    if (ctx->rargs->ps5_ring_table.used) {
+        metadata->ps5_ring_table_valid = true;
+        metadata->ps5_ring_table_user_data_dword =
+            ctx->rargs->user_sgprs_locs.shader_data[AC_UD_PS5_RING_TABLE].sgpr_idx;
     }
     if (ctx->ngg && ctx->rargs->ngg_lds_layout.used) {
         metadata->ngg_lds_layout_valid = true;
@@ -836,6 +935,11 @@ static void fill_shader_metadata(const BuildContext* ctx,
                                !ctx->rinfo->ps.num_inputs &&
                                ctx->config->lds_size;
         metadata->hardware_stage = PSBC_HW_STAGE_PIXEL;
+        /* What this pixel stage reads of the distance built-ins: the SPIR-V
+         * reader records the declared widths, so a consumer learns the input
+         * width without re-parsing the module. */
+        metadata->ps_clip_distance_reads = ctx->nir->info.clip_distance_array_size;
+        metadata->ps_cull_distance_reads = ctx->nir->info.cull_distance_array_size;
         if (!ctx->input_semantics || !ctx->input_semantics->valid)
             metadata->unresolved_fields |= PSBC_UNRESOLVED_AGC_LINKAGE;
         else {
@@ -895,8 +999,10 @@ static void fill_shader_metadata(const BuildContext* ctx,
     }
 
     if ((ctx->stage == MESA_SHADER_VERTEX ||
+         ctx->stage == MESA_SHADER_TESS_EVAL ||
          ctx->stage == MESA_SHADER_GEOMETRY) && ctx->ngg) {
         const bool has_geometry = ctx->stage == MESA_SHADER_GEOMETRY;
+        const bool is_tess_eval = ctx->stage == MESA_SHADER_TESS_EVAL;
         const uint32_t nparams = MAX2(ctx->rinfo->outinfo.param_exports, 1);
         const bool no_pc_export = ctx->rinfo->outinfo.param_exports == 0 &&
                                   ctx->rinfo->outinfo.prim_param_exports == 0;
@@ -942,6 +1048,49 @@ static void fill_shader_metadata(const BuildContext* ctx,
             .offset = PSBC_UC_OFFSET(R_030988_GE_USER_VGPR_EN),
             .value = 0,
         };
+        /* Publish the ES half of a merged vertex+geometry pair and, when the
+         * caller supplied the device facts, the GE PC-line allocation radv
+         * programs for every NGG pipeline.  Nothing here is derived from a
+         * guessed constant: the merged fields come from the linked ES shader
+         * info this compile already built, and the allocation comes from the
+         * caller's device facts through the same ac_compute_late_alloc() radv
+         * uses. */
+        if (ctx->es_info) {
+            metadata->merged_geometry = true;
+            metadata->merged_es_itemsize = ctx->es_info->esgs_itemsize;
+            metadata->merged_esgs_ring_itemsize =
+                ctx->rinfo->ngg_info.vgt_esgs_ring_itemsize;
+        }
+        if (ctx->options->ngg_device_facts) {
+            struct radeon_info facts = {0};
+            unsigned late_alloc_wave64 = 0;
+            unsigned cu_mask = 0xffff;
+            facts.gfx_level = ctx->gfx_level;
+            facts.family = ctx->family;
+            facts.pc_lines = ctx->options->ngg_pc_lines;
+            facts.min_good_cu_per_sa = ctx->options->ngg_min_good_cu_per_sa;
+            ac_compute_late_alloc(&facts, true, ctx->options->ngg_culling,
+                                  ctx->options->ngg_uses_scratch,
+                                  &late_alloc_wave64, &cu_mask);
+            uint32_t oversub_pc_lines =
+                late_alloc_wave64 ? ctx->options->ngg_pc_lines / 4 : 0;
+            if (ctx->options->ngg_culling) {
+                /* Same oversubscription factor radv applies to a culling NGG
+                 * pipeline, from the exports this stage already produces. */
+                unsigned oversub_factor = 2;
+                if (ctx->rinfo->outinfo.param_exports > 4)
+                    oversub_factor = 4;
+                else if (ctx->rinfo->outinfo.param_exports > 2)
+                    oversub_factor = 3;
+                oversub_pc_lines *= oversub_factor;
+            }
+            metadata->linkage_ge_pc_alloc_valid = true;
+            metadata->linkage_ge_pc_alloc = (PsbcRegisterWrite) {
+                .offset = PSBC_UC_OFFSET(R_030980_GE_PC_ALLOC),
+                .value = S_030980_OVERSUB_EN(oversub_pc_lines > 0) |
+                         S_030980_NUM_PC_LINES(oversub_pc_lines - 1),
+            };
+        }
         metadata_add_register(cx, cx_count, PSBC_MAX_CONTEXT_REGISTERS,
             PSBC_CX_OFFSET(R_0286C4_SPI_VS_OUT_CONFIG),
             S_0286C4_VS_EXPORT_COUNT(nparams - 1) |
@@ -976,6 +1125,70 @@ static void fill_shader_metadata(const BuildContext* ctx,
             S_028A44_GS_PRIMS_PER_SUBGRP(ctx->rinfo->ngg_info.max_gsprims) |
             S_028A44_GS_INST_PRIMS_IN_SUBGRP(
                 ctx->rinfo->ngg_info.max_gsprims * gs_num_invocations));
+        /* The same counts the register above describes, published for the two
+         * system SGPRs a merged pair reads: the shader uses them to disable the
+         * lanes each half does not need, and a caller that cannot supply them
+         * would run a different number of ES and GS lanes per workgroup than
+         * the program was built for. */
+        if (ctx->rargs->ac.gs_tg_info.used &&
+            ctx->rargs->ac.merged_wave_info.used) {
+            metadata->esgs_system_sgprs_valid = true;
+            metadata->esgs_gs_tg_info_sgpr =
+                ctx->rargs->ac.args[ctx->rargs->ac.gs_tg_info.arg_index].offset;
+            metadata->esgs_merged_wave_info_sgpr =
+                ctx->rargs->ac.args[ctx->rargs->ac.merged_wave_info.arg_index].offset;
+            metadata->esgs_es_verts_per_subgroup =
+                ctx->rinfo->ngg_info.hw_max_esverts;
+            metadata->esgs_gs_inst_prims_per_subgroup =
+                ctx->rinfo->ngg_info.max_gsprims * gs_num_invocations;
+            metadata->esgs_prim_amp_factor = ctx->rinfo->ngg_info.prim_amp_factor;
+            metadata->esgs_workgroup_size = ac_compute_ngg_workgroup_size(
+                ctx->rinfo->ngg_info.hw_max_esverts,
+                ctx->rinfo->ngg_info.max_gsprims * gs_num_invocations,
+                ctx->rinfo->ngg_info.max_out_verts,
+                ctx->rinfo->ngg_info.prim_amp_factor);
+        }
+        /* Every driver-visible argument lands at its user-data dword plus the
+         * stage's window base, so the base must be the same for all of them.
+         * Publish it only when the pairs that carry both an SGPR offset and a
+         * dword index agree - a consumer that derived it from one pair would
+         * silently misplace the whole block if that pair were inconsistent. */
+        {
+            struct {
+                const struct ac_arg *arg;
+                uint32_t dword;
+                bool published;
+            } pairs[4] = {
+                { &ctx->rargs->ac.base_vertex, metadata->base_vertex_user_data_dword,
+                  metadata->base_vertex_valid },
+                { &ctx->rargs->ac.start_instance, metadata->start_instance_user_data_dword,
+                  metadata->start_instance_valid },
+                { &ctx->rargs->ac.draw_id, metadata->draw_id_user_data_dword,
+                  metadata->draw_id_valid },
+                { &ctx->rargs->ngg_lds_layout, metadata->ngg_lds_layout_user_data_dword,
+                  metadata->ngg_lds_layout_valid },
+            };
+            uint32_t base = 0;
+            bool any = false, agree = true;
+            for (unsigned i = 0; i < 4 && agree; ++i) {
+                if (!pairs[i].published || !pairs[i].arg->used)
+                    continue;
+                const uint32_t offset =
+                    ctx->rargs->ac.args[pairs[i].arg->arg_index].offset;
+                if (offset < pairs[i].dword) {
+                    agree = false;
+                    break;
+                }
+                if (!any) {
+                    base = offset - pairs[i].dword;
+                    any = true;
+                } else if (offset - pairs[i].dword != base) {
+                    agree = false;
+                }
+            }
+            if (any && agree)
+                metadata->user_data_window_base = base;
+        }
         metadata_add_register(cx, cx_count, PSBC_MAX_CONTEXT_REGISTERS,
             PSBC_CX_OFFSET(R_0287FC_GE_MAX_OUTPUT_PER_SUBGROUP),
             S_0287FC_MAX_VERTS_PER_SUBGROUP(
@@ -1077,6 +1290,66 @@ static void fill_shader_metadata(const BuildContext* ctx,
         metadata_add_register(sh, sh_count, PSBC_MAX_SHADER_REGISTERS,
             PSBC_SH_OFFSET(R_00B12C_SPI_SHADER_PGM_RSRC2_VS),
             ctx->config->rsrc2);
+        return;
+    }
+
+    if (ctx->stage == MESA_SHADER_TESS_CTRL) {
+        /* The merged LS/HS program.  On GFX10 this hardware stage is ONE
+         * program counter, and the pinned radv_get_shader_regs() puts it at
+         * the LS block while the resource pair stays at the HS block:
+         *
+         *   AC_HW_HULL_SHADER, gfx_level >= GFX10:
+         *     pgm_lo    = R_00B520_SPI_SHADER_PGM_LO_LS
+         *     pgm_rsrc1 = R_00B428_SPI_SHADER_PGM_RSRC1_HS
+         *     pgm_rsrc2 = R_00B42C_SPI_SHADER_PGM_RSRC2_HS
+         *
+         * R_00B420_SPI_SHADER_PGM_LO_HS is the address register only for
+         * gfx_level < GFX9, so it is deliberately NOT published here: writing
+         * it on this target names no program the hardware will launch.  The
+         * config is the merged binary's own - ACO compiled both halves in one
+         * call, so there is nothing left to combine by hand. */
+        metadata_add_register(cx, cx_count, PSBC_MAX_CONTEXT_REGISTERS,
+            PSBC_CX_OFFSET(R_028B6C_VGT_TF_PARAM), tess_tf_param(ctx->nir));
+        metadata_add_register(sh, sh_count, PSBC_MAX_SHADER_REGISTERS,
+            PSBC_SH_OFFSET(R_00B520_SPI_SHADER_PGM_LO_LS), 0);
+        metadata_add_register(sh, sh_count, PSBC_MAX_SHADER_REGISTERS,
+            PSBC_SH_OFFSET(R_00B524_SPI_SHADER_PGM_HI_LS), 0);
+        metadata_add_register(sh, sh_count, PSBC_MAX_SHADER_REGISTERS,
+            PSBC_SH_OFFSET(R_00B428_SPI_SHADER_PGM_RSRC1_HS),
+            ctx->config->rsrc1);
+        metadata_add_register(sh, sh_count, PSBC_MAX_SHADER_REGISTERS,
+            PSBC_SH_OFFSET(R_00B42C_SPI_SHADER_PGM_RSRC2_HS),
+            ctx->config->rsrc2);
+        /* The tessellation workgroup layout this stage computed when the
+         * caller supplied the pipeline's patch control points: the patch count
+         * per workgroup, the LDS the LS/HS workgroup needs and its size. This
+         * is the compiler's own tessellation workgroup computation (the same
+         * numbers the io-to-mem lowering sized the offchip layout with), which
+         * is what makes the driver's VGT_LS_HS_CONFIG and launch derivation
+         * come from the compile rather than from a driver guess. */
+        if (ctx->rinfo->tcs.lds_size || ctx->rinfo->num_tess_patches) {
+            metadata->hull_tess_wg_valid = true;
+            metadata->hull_num_patches_per_wg = ctx->rinfo->num_tess_patches;
+            metadata->hull_tcs_lds_size = ctx->rinfo->tcs.lds_size;
+            metadata->hull_workgroup_size = ctx->rinfo->workgroup_size;
+        }
+        /* A merged pair is a launchable hull program: one image, its address
+         * register, its resource pair and the workgroup layout are all here.
+         * A control half compiled ALONE still is not - it has no vertex half
+         * to run with - so it keeps the unresolved bit. */
+        if (!ctx->ls_merged)
+            metadata->unresolved_fields |= PSBC_UNRESOLVED_TESS_PIPELINE;
+        else
+            metadata->hardware_stage = PSBC_HW_STAGE_HULL;
+        return;
+    }
+
+    if (ctx->stage == MESA_SHADER_TESS_EVAL) {
+        /* The domain half has no package state at all yet: radv runs it in the
+         * ES/GS hardware path with the tessellation-specific configuration, and
+         * nothing here describes that. Keep the explicit unresolved bit and
+         * publish no registers rather than an incomplete set. */
+        metadata->unresolved_fields |= PSBC_UNRESOLVED_TESS_PIPELINE;
         return;
     }
 }
@@ -1417,38 +1690,8 @@ static PsbcResult buildshaderbinary(
         break;
     }
     case PSBC_STAGE_TESS_CTRL: {
-        /* Map tess primitive mode to VGT_TF_PARAM TYPE field */
-        uint32_t tf_type;
-        switch (ctx->nir->info.tess._primitive_mode) {
-        case TESS_PRIMITIVE_ISOLINES:   tf_type = V_028B6C_TESS_ISOLINE;  break;
-        case TESS_PRIMITIVE_TRIANGLES:  tf_type = V_028B6C_TESS_TRIANGLE; break;
-        case TESS_PRIMITIVE_QUADS:      tf_type = V_028B6C_TESS_QUAD;     break;
-        default:                        tf_type = V_028B6C_TESS_TRIANGLE; break;
-        }
-
-        /* Map tess spacing to VGT_TF_PARAM PARTITIONING field */
-        uint32_t tf_partition;
-        switch (ctx->nir->info.tess.spacing) {
-        case TESS_SPACING_EQUAL:           tf_partition = V_028B6C_PART_INTEGER;    break;
-        case TESS_SPACING_FRACTIONAL_ODD:  tf_partition = V_028B6C_PART_FRAC_ODD;   break;
-        case TESS_SPACING_FRACTIONAL_EVEN: tf_partition = V_028B6C_PART_FRAC_EVEN;  break;
-        default:                           tf_partition = V_028B6C_PART_INTEGER;    break;
-        }
-
-        /* Map CCW + point_mode to VGT_TF_PARAM TOPOLOGY field */
-        uint32_t tf_topology;
-        if (ctx->nir->info.tess.point_mode) {
-            tf_topology = V_028B6C_OUTPUT_POINT;
-        } else if (ctx->nir->info.tess.ccw) {
-            tf_topology = V_028B6C_OUTPUT_TRIANGLE_CCW;
-        } else {
-            tf_topology = V_028B6C_OUTPUT_TRIANGLE_CW;
-        }
-
-        const uint32_t tf_param =
-            S_028B6C_TYPE(tf_type) |
-            S_028B6C_PARTITIONING(tf_partition) |
-            S_028B6C_TOPOLOGY(tf_topology);
+        /* One derivation, shared with the PS5 metadata path. */
+        const uint32_t tf_param = tess_tf_param(ctx->nir);
 
         const GnmHsShader hsh = {
             .common =
@@ -1980,6 +2223,13 @@ static PsbcResult psbc_compile_impl(
     const uint32_t*       previous_spirv,
     size_t                previous_spirv_size,
     const nir_shader*     previous_input_nir,
+    /* A LINK-ONLY next stage, compiled into nothing and used purely for the
+     * cross-stage facts the consumer cannot know about itself. Today only the
+     * hull pair supplies one: the tessellator's domain, spacing, winding and
+     * point mode are declared in the EVALUATION half, and a control half
+     * compiled without it has no way to learn them. */
+    const uint32_t*       next_link_spirv,
+    size_t                next_link_spirv_size,
     const PsbcCompileOptions* opts,
     PsbcShaderOutput*     out
 ) {
@@ -2003,12 +2253,35 @@ static PsbcResult psbc_compile_impl(
             return validation;
     }
 
-    const bool paired_geometry = previous_spirv || previous_input_nir;
+    /* A previous stage makes this a MERGED compile: GFX9+ runs vertex+geometry
+     * as one ES/GS program and vertex+control as one LS/HS program, and in both
+     * cases ACO wants the pair in one call so it can emit a single image whose
+     * halves dispatch on merged_wave_info.  paired_previous is "there is a
+     * previous stage"; the two named forms are the stage-specific parts. */
+    const bool paired_previous = previous_spirv || previous_input_nir;
     mesa_shader_stage mesa_stage = psbc_to_mesa_stage(opts->stage);
     if (mesa_stage == MESA_SHADER_NONE)
         return PSBC_RESULT_UNSUPPORTED_STAGE;
-    if (paired_geometry &&
-        (mesa_stage != MESA_SHADER_GEOMETRY || !opts->ngg ||
+    const bool paired_geometry =
+        paired_previous && mesa_stage == MESA_SHADER_GEOMETRY;
+    const bool paired_hull =
+        paired_previous && mesa_stage == MESA_SHADER_TESS_CTRL;
+    /* The DOMAIN pair is a LINK, not a merge: the evaluation half is its own
+     * NGG program, but without its control half's info radv leaves
+     * num_tess_patches at zero, and radv_nir_lower_abi then makes the shader
+     * read the patch count, the attribute stride and tes_reads_tess_factors
+     * at RUNTIME out of the tcs_offchip_layout user SGPR. Linking the pair
+     * here keeps all three compile-time constants, which is both correct and
+     * the only form this driver's ABI can serve. */
+    const bool paired_domain =
+        paired_previous && mesa_stage == MESA_SHADER_TESS_EVAL;
+    /* The geometry pair is NGG; the hull pair is never NGG - LS/HS is a
+     * fixed-function-fed hardware stage, and the NGG program in a tessellation
+     * pipeline is the DOMAIN half, compiled separately. */
+    if (paired_previous &&
+        ((!paired_geometry && !paired_hull && !paired_domain) ||
+         (paired_geometry && !opts->ngg) || (paired_hull && opts->ngg) ||
+         (paired_domain && !opts->ngg) ||
          opts->target != PSBC_TARGET_PS5))
         return PSBC_RESULT_UNSUPPORTED_STAGE;
     if (opts->ps5_global_streamout && !paired_geometry)
@@ -2017,7 +2290,8 @@ static PsbcResult psbc_compile_impl(
         (opts->target != PSBC_TARGET_PS5 || mesa_stage != MESA_SHADER_FRAGMENT))
         return PSBC_RESULT_UNSUPPORTED_STAGE;
     if (previous_input_nir &&
-        previous_input_nir->info.stage != MESA_SHADER_VERTEX)
+        previous_input_nir->info.stage !=
+            (paired_domain ? MESA_SHADER_TESS_CTRL : MESA_SHADER_VERTEX))
         return PSBC_RESULT_UNSUPPORTED_STAGE;
     if (previous_spirv) {
         const PsbcResult validation =
@@ -2028,7 +2302,8 @@ static PsbcResult psbc_compile_impl(
     }
     if (opts->ngg &&
         (opts->target != PSBC_TARGET_PS5 ||
-         (mesa_stage != MESA_SHADER_VERTEX && !paired_geometry)))
+         (mesa_stage != MESA_SHADER_VERTEX && mesa_stage != MESA_SHADER_TESS_EVAL &&
+          !paired_geometry)))
         return PSBC_RESULT_UNSUPPORTED_STAGE;
     if (opts->descriptor_binding_count > PSBC_MAX_DESCRIPTOR_BINDINGS)
         return PSBC_RESULT_INTERNAL_ERROR;
@@ -2143,6 +2418,7 @@ static PsbcResult psbc_compile_impl(
     compiler_info.key.use_ngg = opts->ngg;
     compiler_info.key.ps5_global_streamout = opts->ps5_global_streamout;
     compiler_info.key.ps5_fragment_view_index = opts->target == PSBC_TARGET_PS5;
+    compiler_info.key.ps5_tess_ring_table = opts->target == PSBC_TARGET_PS5;
     /* ACO uses debug.family for disassembly and init_program assertion */
     compiler_info.debug.family = chipfamily;
 
@@ -2186,9 +2462,18 @@ static PsbcResult psbc_compile_impl(
          BITFIELD64_BIT(FRAG_RESULT_DUAL_SRC_BLEND));
     struct radv_shader_stage previous = {0};
     nir_shader* previous_nir = NULL;
-    if (paired_geometry) {
-        previous.stage = MESA_SHADER_VERTEX;
-        previous.next_stage = MESA_SHADER_GEOMETRY;
+    if (paired_previous) {
+        /* The consumer's own previous stage: a control half consumes the
+         * vertex half, an evaluation half consumes the control half. */
+        previous.stage = paired_domain ? MESA_SHADER_TESS_CTRL
+                                       : MESA_SHADER_VERTEX;
+        /* THE switch that decides the vertex half's hardware role. RADV's
+         * gather_shader_info_vs sets vs.as_ls only when next_stage is
+         * TESS_CTRL and vs.as_es only when it is GEOMETRY; with the default
+         * FRAGMENT the half is compiled as a legacy VS that exports to the
+         * parameter cache instead of writing its outputs to LDS for the
+         * consumer. */
+        previous.next_stage = mesa_stage;
         previous_nir = prepare_stage_nir(
             &compiler_info, &previous, previous_spirv, previous_spirv_size,
             previous_input_nir, opts
@@ -2202,15 +2487,129 @@ static PsbcResult psbc_compile_impl(
                                                "previous-SPIR-V",
                         previous_nir, NULL);
     }
+    /* The link-only evaluation half of a hull pair.
+     *
+     * The tessellator's configuration - domain, spacing, winding, point mode -
+     * is declared in the EVALUATION half by GLSL convention, and the Vulkan
+     * spec allows either tessellation stage to declare it. A control half
+     * compiled from the vertex and control SPIR-V alone therefore has no way
+     * to know the domain, and ac_nir_lower_tess_io_to_mem.c branches on
+     * exactly that: nir_load_tcs_primitive_mode_amd selects the triangle
+     * layout for TESS_PRIMITIVE_TRIANGLES, the isoline layout for
+     * TESS_PRIMITIVE_ISOLINES, and falls through to the QUAD layout for
+     * everything else - including TESS_PRIMITIVE_UNSPECIFIED, which is 0 in
+     * shader_enums.h and exactly what an unlinked control half reports.
+     *
+     * The consequence is not subtle and was measured on hardware: the hull
+     * stored outer 2.0, 2.0, 2.0 at ring words 16384-16386 and inner 1.0 at
+     * word 16388, leaving 16387 zero. That gap is the quad layout's fourth
+     * outer slot. The tessellator, configured by VGT_TF_PARAM.TYPE as a
+     * TRIANGLE domain, reads inner[0] from the contiguous fourth dword - the
+     * word the hull left zero - so the patch is tessellated with a zero inner
+     * level and nothing reaches the rasteriser.
+     *
+     * This shader is compiled into nothing. It exists so the control half can
+     * be linked to it, which is the mirror of what the domain compile already
+     * does in the other direction. */
+    /* The facts the link yields, extracted as plain values so the link-only
+     * shader can be freed the moment it has been read. It is consumed long
+     * before the compile ends and there are a dozen early-return paths
+     * between here and there; carrying the nir_shader across all of them
+     * leaked it (603 KB, caught by the sanitizer gate), and adding a free to
+     * every exit would have been one edit away from leaking again. */
+    bool next_link_valid = false;
+    bool next_link_reads_tess_factors = false;
+    uint64_t next_link_inputs_read = 0, next_link_patch_inputs_read = 0;
+    enum tess_primitive_mode next_link_primitive_mode = TESS_PRIMITIVE_UNSPECIFIED;
+    nir_shader* next_link_nir = NULL;
+    if (paired_hull && next_link_spirv) {
+        struct radv_shader_stage next_link = {0};
+        next_link.stage = MESA_SHADER_TESS_EVAL;
+        next_link.next_stage = MESA_SHADER_FRAGMENT;
+        next_link_nir = prepare_stage_nir(
+            &compiler_info, &next_link, next_link_spirv,
+            next_link_spirv_size, NULL, opts
+        );
+        if (!next_link_nir) {
+            ralloc_free(previous_nir);
+            ralloc_free(nir);
+            psbc_shutdown();
+            return PSBC_RESULT_COMPILE_NIR;
+        }
+        /* merge_tess_info(), the same union the domain compile performs: the
+         * two halves may each declare part of the tessellator configuration
+         * and the backend's view has to be both. Here the control half is the
+         * one being compiled, so the merged view lands on it. */
+        nir->info.tess.tcs_vertices_out |= next_link_nir->info.tess.tcs_vertices_out;
+        nir->info.tess.spacing |= next_link_nir->info.tess.spacing;
+        nir->info.tess._primitive_mode |= next_link_nir->info.tess._primitive_mode;
+        nir->info.tess.ccw |= next_link_nir->info.tess.ccw;
+        nir->info.tess.point_mode |= next_link_nir->info.tess.point_mode;
+        debug_shader_io("next-link-SPIR-V", next_link_nir, NULL);
+        next_link_reads_tess_factors =
+            !!(next_link_nir->info.inputs_read &
+               (VARYING_BIT_TESS_LEVEL_INNER | VARYING_BIT_TESS_LEVEL_OUTER));
+        next_link_inputs_read = next_link_nir->info.inputs_read;
+        next_link_patch_inputs_read = next_link_nir->info.patch_inputs_read;
+        next_link_primitive_mode = next_link_nir->info.tess._primitive_mode;
+        next_link_valid = true;
+        ralloc_free(next_link_nir);
+        next_link_nir = NULL;
+    }
+    if (paired_domain) {
+        /* merge_tess_info(), from the pinned radv_pipeline_graphics.c. The
+         * Vulkan spec lets the domain, spacing, winding, point mode and output
+         * vertex count be declared in EITHER tessellation stage, and requires
+         * only that they agree where both declare them - so the backend's view
+         * has to be the union. GLSL conventionally puts the output vertex
+         * count on the control half and the domain/spacing/winding on the
+         * evaluation half, which means neither half alone carries the whole
+         * tessellator configuration.
+         *
+         * Without this the evaluation half sees tcs_vertices_out == 0, and
+         * radv_nir_lower_abi asserts on it while computing the attribute
+         * stride as soon as the patch count is a compile-time constant. */
+        nir->info.tess.tcs_vertices_out |= previous_nir->info.tess.tcs_vertices_out;
+        nir->info.tess.spacing |= previous_nir->info.tess.spacing;
+        nir->info.tess._primitive_mode |= previous_nir->info.tess._primitive_mode;
+        nir->info.tess.ccw |= previous_nir->info.tess.ccw;
+        nir->info.tess.point_mode |= previous_nir->info.tess.point_mode;
+        /* and the merged view back onto the control half. */
+        previous_nir->info.tess.tcs_vertices_out = nir->info.tess.tcs_vertices_out;
+        previous_nir->info.tess._primitive_mode = nir->info.tess._primitive_mode;
+        previous_nir->info.tess.spacing = nir->info.tess.spacing;
+        previous_nir->info.tess.ccw = nir->info.tess.ccw;
+        previous_nir->info.tess.point_mode = nir->info.tess.point_mode;
+        if (getenv("PSBC_DEBUG_TESSMERGE"))
+            fprintf(stderr, "PSBC_TESSMERGE tes_out=%u tcs_out=%u mode=%d spacing=%d ccw=%d\n",
+                    nir->info.tess.tcs_vertices_out,
+                    previous_nir->info.tess.tcs_vertices_out,
+                    (int)nir->info.tess._primitive_mode,
+                    (int)nir->info.tess.spacing, (int)nir->info.tess.ccw);
+    }
 
     /* Shader info + args + postprocess */
     stage.nir = nir;
+    /* radv_link_shaders_info() detects a stage by its .nir pointer. The
+     * geometry pair deliberately leaves previous.nir unset and marks its
+     * linked slot counts by hand below, so its published metadata does not
+     * move; the hull pair needs the real VS->TCS linking, which computes
+     * vs.tcs_inputs_via_lds, the LSHS workgroup size and tcs_in_out_eq from
+     * the two shaders' actual IO. */
+    if (paired_hull || paired_domain)
+        previous.nir = previous_nir;
     radv_nir_shader_info_init(stage.stage, stage.next_stage, &stage.info);
     stage.info.is_ngg = opts->ngg;
-    if (paired_geometry) {
+    if (paired_previous) {
         radv_nir_shader_info_init(previous.stage, previous.next_stage,
                                   &previous.info);
-        previous.info.is_ngg = true;
+        /* The LS half of a hull pair is not NGG; only the ES half of a
+         * geometry pair is. */
+        previous.info.is_ngg = paired_geometry;
+        /* The control half of a domain pair needs its own patch-count
+         * derivation to run, which is what the link then copies across. */
+    }
+    if (paired_geometry) {
         NIR_PASS(_, nir, nir_lower_gs_intrinsics,
                  nir_lower_gs_intrinsics_per_stream |
                  nir_lower_gs_intrinsics_count_primitives |
@@ -2267,10 +2666,16 @@ static PsbcResult psbc_compile_impl(
                 (struct radv_descriptor_set_layout*)descriptor_set_storage[set];
     }
     stage.layout = layout;
-    if (paired_geometry)
+    if (paired_previous)
         previous.layout = layout;
     struct radv_graphics_state_key gfx_state = {0};
     gfx_state.rs.provoking_vtx_last = opts->provoking_vtx_last;
+    /* The tessellation workgroup layout is derived from the pipeline's patch
+     * control points (the input patch size, not the control stage's output
+     * vertex count), so the hull compile can size its LDS and name the patch
+     * count the LS_HS launch state needs. Zero keeps the tessellation info
+     * uncomputed, exactly like a pipeline that does not draw patches. */
+    gfx_state.ts.patch_control_points = opts->patch_control_points;
     if (opts->rasterization_samples != 0 &&
         opts->rasterization_samples != 1 &&
         opts->rasterization_samples != 2 &&
@@ -2539,7 +2944,7 @@ static PsbcResult psbc_compile_impl(
         &compiler_info, nir, &layout, &stage.key, &gfx_state,
         RADV_PIPELINE_GRAPHICS, false, &stage.info
     );
-    if (paired_geometry) {
+    if (paired_previous) {
         radv_nir_shader_info_pass(
             &compiler_info, previous_nir, &layout, &previous.key, &gfx_state,
             RADV_PIPELINE_GRAPHICS, false, &previous.info
@@ -2556,7 +2961,7 @@ static PsbcResult psbc_compile_impl(
         for (uint32_t i = 0; i < opts->descriptor_binding_count; ++i)
             descriptor_set_mask |= 1u << opts->descriptor_bindings[i].set;
         stage.info.desc_set_used_mask |= descriptor_set_mask;
-        if (paired_geometry)
+        if (paired_previous)
             previous.info.desc_set_used_mask |= descriptor_set_mask;
     } else if (opts->descriptor_binding_count) {
         /* The deref form is only visible before the descriptor lowering that
@@ -2584,25 +2989,62 @@ static PsbcResult psbc_compile_impl(
             stage.info.can_inline_all_push_constants = false;
             stage.info.inline_push_constant_mask = 0;
         }
-        if (paired_geometry && previous.info.loads_push_constants) {
+        if (paired_previous && previous.info.loads_push_constants) {
             previous.info.can_inline_all_push_constants = false;
             previous.info.inline_push_constant_mask = 0;
         }
     }
     debug_stage("shader-info-end");
     debug_shader_io("info", nir, &stage.info);
-    if (paired_geometry)
+    if (paired_previous)
         debug_shader_io("previous-info", previous_nir, &previous.info);
 
-    if (opts->ngg) {
+    if (opts->ngg || paired_hull) {
         struct radv_shader_stage stages[MESA_VULKAN_SHADER_STAGES] = {0};
         stages[mesa_stage] = stage;
-        if (paired_geometry)
-            stages[MESA_SHADER_VERTEX] = previous;
+        if (paired_previous)
+            stages[previous.stage] = previous;
         radv_nir_shader_info_link(&compiler_info, &gfx_state, stages);
         stage.info = stages[mesa_stage].info;
-        if (paired_geometry)
-            previous.info = stages[MESA_SHADER_VERTEX].info;
+        if (paired_previous)
+            previous.info = stages[previous.stage].info;
+        /* The TCS<->TES half of the link, which radv performs in
+         * radv_link_shaders_info() when both stages are present and which is
+         * skipped here because the evaluation half is not one of the compiled
+         * stages. Every value is a pure function of the evaluation half's
+         * NIR, so the link-only shader is enough and no second info pass is
+         * needed:
+         *
+         *   tcs.tes_reads_tess_factors  <- gather_shader_info_tes()'s own
+         *       definition, tes.reads_tess_factors, which is exactly this
+         *       test on inputs_read.
+         *   tcs.tes_inputs_read, tcs.tes_patch_inputs_read <- verbatim; the
+         *       control half otherwise assumes ~0ULL, that is, that the
+         *       evaluation half reads EVERYTHING, which oversizes the
+         *       off-chip patch.
+         *   tes._primitive_mode <- verbatim, and this is the one that decides
+         *       the tessellation-factor layout.
+         *   outputs_linked <- radv_graphics_shaders_fill_linked_tcs_tes_io_info(),
+         *       which sets it on the control half; it is what makes
+         *       radv_nir_lower_abi lower the primitive mode and the
+         *       tess-levels-to-TES flag to CONSTANTS instead of to fields of a
+         *       tcs_offchip_layout user SGPR that nothing on this platform
+         *       supplies. */
+        /* The passthrough override, applied after the link so nothing
+         * recomputes it, and before ACO reads it. radv_shader.c passes
+         * info->is_ngg_passthrough straight to aco as options.passthrough,
+         * and this compile publishes the same flag into
+         * VGT_SHADER_STAGES_EN.PRIMGEN_PASSTHRU_EN, so one assignment keeps
+         * the program and the register describing the same pipeline. */
+        if (opts->ngg_no_passthrough)
+            stage.info.is_ngg_passthrough = false;
+        if (next_link_valid) {
+            stage.info.tcs.tes_reads_tess_factors = next_link_reads_tess_factors;
+            stage.info.tcs.tes_inputs_read = next_link_inputs_read;
+            stage.info.tcs.tes_patch_inputs_read = next_link_patch_inputs_read;
+            stage.info.tes._primitive_mode = next_link_primitive_mode;
+            stage.info.outputs_linked = true;
+        }
         /* Standalone linking conservatively adds PrimitiveID without an FS.
          * Drop only the implicit, final per-primitive parameter when the
          * caller has proved it dead. Keep explicit outputs and unknown
@@ -2639,7 +3081,7 @@ static PsbcResult psbc_compile_impl(
      * public metadata/runtime ABI. */
     if (opts->descriptor_binding_count) {
         stage.info.force_indirect_descriptors = false;
-        if (paired_geometry)
+        if (paired_previous)
             previous.info.force_indirect_descriptors = false;
     }
 
@@ -2661,9 +3103,46 @@ static PsbcResult psbc_compile_impl(
     );
     debug_stage("declare-args-end");
 
+    /* Temporary T04 ABI trace: which SGPR each declared argument landed in, and
+     * which user-data slots the stage publishes. Off unless asked for. */
+    if (getenv("PSBC_DEBUG_ARGS")) {
+        const struct ac_shader_args* a = &stage.args.ac;
+        fprintf(stderr, "PSBC_ARGS stage=%d num_user_sgprs=%u num_sgprs_used=%u arg_count=%u\n",
+                (int)mesa_stage, stage.args.num_user_sgprs, a->num_sgprs_used, a->arg_count);
+        const struct { const char* name; const struct ac_arg* arg; } named[] = {
+            { "ring_offsets", &a->ring_offsets },
+            { "gs_tg_info", &a->gs_tg_info },
+            { "merged_wave_info", &a->merged_wave_info },
+            { "tess_offchip_offset", &a->tess_offchip_offset },
+            { "scratch_offset", &a->scratch_offset },
+            { "ngg_lds_layout", &stage.args.ngg_lds_layout },
+            { "ngg_state", &stage.args.ngg_state },
+            { "base_vertex", &a->base_vertex },
+            { "start_instance", &a->start_instance },
+            { "draw_id", &a->draw_id },
+            { "view_index", &a->view_index },
+            { "vertex_buffers", &a->vertex_buffers },
+            { "push_constants", &a->push_constants },
+        };
+        for (unsigned i = 0; i < sizeof(named) / sizeof(named[0]); ++i) {
+            const struct ac_arg* arg = named[i].arg;
+            if (!arg->used) continue;
+            const __typeof__(a->args[0])* def = &a->args[arg->arg_index];
+            fprintf(stderr, "  %-20s arg=%u file=%u offset=%u size=%u type=%u skip=%u\n",
+                    named[i].name, arg->arg_index, (unsigned)def->file, def->offset,
+                    def->size, (unsigned)def->type, def->skip ? 1u : 0u);
+        }
+        for (unsigned i = 0; i < AC_UD_MAX_UD; ++i) {
+            const struct radv_userdata_info* info = &stage.args.user_sgprs_locs.shader_data[i];
+            if (info->sgpr_idx < 0) continue;
+            fprintf(stderr, "  ud[%u] sgpr=%d count=%u\n", i, (int)info->sgpr_idx,
+                    (unsigned)info->num_sgprs);
+        }
+    }
+
     stage.info.user_sgprs_locs = stage.args.user_sgprs_locs;
     stage.info.inline_push_constant_mask = stage.args.ac.inline_push_const_mask;
-    if (paired_geometry) {
+    if (paired_geometry || paired_hull) {
         previous.args = stage.args;
         previous.info.user_sgprs_locs = stage.info.user_sgprs_locs;
         previous.info.inline_push_constant_mask =
@@ -2696,7 +3175,7 @@ static PsbcResult psbc_compile_impl(
             ralloc_free(gs_copy);
     }
 
-    if (paired_geometry)
+    if (paired_geometry || paired_hull)
         radv_postprocess_nir(&compiler_info, &gfx_state, &previous);
     radv_postprocess_nir(&compiler_info, &gfx_state, &stage);
     if (mesa_stage == MESA_SHADER_FRAGMENT &&
@@ -2746,7 +3225,10 @@ static PsbcResult psbc_compile_impl(
     /* Compile NIR to GCN ISA via ACO */
     nir_shader* shaders[2] = {nir, NULL};
     unsigned shader_count = 1;
-    if (paired_geometry) {
+    /* A merge hands ACO both halves; the domain LINK compiles only the
+     * evaluation half - its control half was prepared for the info link and
+     * is not part of this program. */
+    if (paired_geometry || paired_hull) {
         shaders[0] = previous_nir;
         shaders[1] = nir;
         shader_count = 2;
@@ -2795,6 +3277,8 @@ static PsbcResult psbc_compile_impl(
     /* Build the PS4/PS5 shader binary */
     BuildContext buildctx = {
         .rinfo = &binary->info,
+        .es_info = paired_geometry ? &previous.info : NULL,
+        .ls_merged = paired_hull,
         .rargs = &stage.args,
         .config = &binary->config,
         .nir = nir,
@@ -2860,7 +3344,7 @@ PsbcResult psbc_compile_shader(
     const PsbcCompileOptions* opts,
     PsbcShaderOutput* out
 ) {
-    return psbc_compile_impl(spirv, spirv_size, NULL, NULL, 0, NULL,
+    return psbc_compile_impl(spirv, spirv_size, NULL, NULL, 0, NULL, NULL, 0,
                              opts, out);
 }
 
@@ -2869,7 +3353,7 @@ PsbcResult psbc_compile_nir(
     const PsbcCompileOptions* opts,
     PsbcShaderOutput* out
 ) {
-    return psbc_compile_impl(NULL, 0, nir, NULL, 0, NULL, opts, out);
+    return psbc_compile_impl(NULL, 0, nir, NULL, 0, NULL, NULL, 0, opts, out);
 }
 
 PsbcResult psbc_compile_geometry_pipeline(
@@ -2882,7 +3366,106 @@ PsbcResult psbc_compile_geometry_pipeline(
 ) {
     return psbc_compile_impl(geometry_spirv, geometry_spirv_size, NULL,
                              vertex_spirv, vertex_spirv_size, NULL,
+                             NULL, 0, opts, out);
+}
+
+/* Find one shader register in a metadata block, or NULL when the stage did not
+ * publish it. */
+static PsbcRegisterWrite* find_shader_register(PsbcShaderMetadata* metadata,
+                                               uint16_t offset) {
+    for (uint32_t i = 0; i < metadata->shader_register_count; ++i)
+        if (metadata->shader_registers[i].offset == offset)
+            return &metadata->shader_registers[i];
+    return NULL;
+}
+
+/* The combined LS/HS resource registers radv produces for a hull stage
+ * (radv_shader_combine_cfg_vs_tcs in the pinned tree): the vertex half is the
+ * base, the control half raises the VGPR/SGPR/LS_VGPR_COMP_CNT fields, and its
+ * scratch enable does not leak into the LS half. */
+static void combine_vs_tcs_config(uint32_t vs_rsrc1, uint32_t vs_rsrc2,
+                                  uint32_t tcs_rsrc1, uint32_t tcs_rsrc2,
+                                  uint32_t* rsrc1_out, uint32_t* rsrc2_out) {
+    uint32_t rsrc1 = vs_rsrc1;
+    if (G_00B848_VGPRS(tcs_rsrc1) > G_00B848_VGPRS(rsrc1))
+        rsrc1 = (rsrc1 & C_00B848_VGPRS) | (tcs_rsrc1 & ~C_00B848_VGPRS);
+    if (G_00B228_SGPRS(tcs_rsrc1) > G_00B228_SGPRS(rsrc1))
+        rsrc1 = (rsrc1 & C_00B228_SGPRS) | (tcs_rsrc1 & ~C_00B228_SGPRS);
+    if (G_00B428_LS_VGPR_COMP_CNT(tcs_rsrc1) > G_00B428_LS_VGPR_COMP_CNT(rsrc1))
+        rsrc1 = (rsrc1 & C_00B428_LS_VGPR_COMP_CNT) |
+                (tcs_rsrc1 & ~C_00B428_LS_VGPR_COMP_CNT);
+    *rsrc1_out = rsrc1;
+    *rsrc2_out = vs_rsrc2 | (tcs_rsrc2 & ~C_00B12C_SCRATCH_EN);
+}
+
+PsbcResult psbc_compile_tess_pipeline(
+    const uint32_t* vertex_spirv,
+    size_t vertex_spirv_size,
+    const uint32_t* tess_ctrl_spirv,
+    size_t tess_ctrl_spirv_size,
+    const uint32_t* tess_eval_spirv,
+    size_t tess_eval_spirv_size,
+    const PsbcCompileOptions* opts,
+    PsbcShaderOutput* out
+) {
+    if (!out || !opts || !vertex_spirv || !tess_ctrl_spirv || !tess_eval_spirv)
+        return PSBC_RESULT_INVALID_SPIRV;
+    if (opts->stage != PSBC_STAGE_TESS_CTRL || opts->target != PSBC_TARGET_PS5)
+        return PSBC_RESULT_UNSUPPORTED_STAGE;
+    /* The merged workgroup layout - patches per workgroup, its LDS size and
+     * its thread count - is computed from the pipeline's INPUT patch size, so
+     * without it the pair cannot be launched and must not be published as if
+     * it could.  radv_link_shaders_info() skips the whole LSHS workgroup
+     * derivation when patch_control_points is zero. */
+    if (!opts->patch_control_points || opts->patch_control_points > 32)
+        return PSBC_RESULT_UNSUPPORTED_STAGE;
+
+    /* ONE merged LS/HS program, exactly like the geometry pair one line up.
+     *
+     * This used to compile the two halves as INDEPENDENT programs - the vertex
+     * half through psbc_compile_shader() as a plain PSBC_STAGE_VERTEX with NGG
+     * off - and then memcpy them back to back.  That cannot work on GFX9+.
+     * RADV's gather_shader_info_vs() sets vs.as_ls only when next_stage is
+     * MESA_SHADER_TESS_CTRL, so a half compiled standalone got next_stage =
+     * FRAGMENT and came out as a legacy VS: it exported position and
+     * parameters to the parameter cache, never wrote its outputs to LDS for
+     * the control half, and carried the VS argument layout instead of the LS
+     * one.  Two such images concatenated have no merged entry dispatching on
+     * merged_wave_info either, while the hardware runs LS and HS as ONE stage
+     * from ONE program counter - so every patch draw faulted whatever the
+     * tessellation levels were.
+     *
+     * Routing through psbc_compile_impl() with the vertex SPIR-V as the
+     * previous stage hands both shaders to ACO in a single call, which is the
+     * same path the ES/GS pair already used and which aco_compile_shader()
+     * supports directly through its shader_count argument. */
+    return psbc_compile_impl(tess_ctrl_spirv, tess_ctrl_spirv_size, NULL,
+                             vertex_spirv, vertex_spirv_size, NULL,
+                             tess_eval_spirv, tess_eval_spirv_size,
                              opts, out);
+}
+
+PsbcResult psbc_compile_domain_pipeline(
+    const uint32_t* tess_ctrl_spirv,
+    size_t tess_ctrl_spirv_size,
+    const uint32_t* tess_eval_spirv,
+    size_t tess_eval_spirv_size,
+    const PsbcCompileOptions* opts,
+    PsbcShaderOutput* out
+) {
+    if (!out || !opts || !tess_ctrl_spirv || !tess_eval_spirv)
+        return PSBC_RESULT_INVALID_SPIRV;
+    if (opts->stage != PSBC_STAGE_TESS_EVAL || opts->target != PSBC_TARGET_PS5)
+        return PSBC_RESULT_UNSUPPORTED_STAGE;
+    if (!opts->patch_control_points || opts->patch_control_points > 32)
+        return PSBC_RESULT_UNSUPPORTED_STAGE;
+    /* Link-only: the control half is prepared for radv_link_shaders_info so
+     * the evaluation half inherits num_tess_patches (and the tess-factor and
+     * input-read facts) as compile-time constants. Only the evaluation half
+     * is compiled into the returned program. */
+    return psbc_compile_impl(tess_eval_spirv, tess_eval_spirv_size, NULL,
+                             tess_ctrl_spirv, tess_ctrl_spirv_size, NULL,
+                             NULL, 0, opts, out);
 }
 
 PsbcResult psbc_compile_nir_geometry_pipeline(
@@ -2892,7 +3475,7 @@ PsbcResult psbc_compile_nir_geometry_pipeline(
     PsbcShaderOutput* out
 ) {
     return psbc_compile_impl(NULL, 0, geometry_nir, NULL, 0, vertex_nir,
-                             opts, out);
+                             NULL, 0, opts, out);
 }
 
 void psbc_free_output(PsbcShaderOutput* out) {
