@@ -180,6 +180,9 @@ typedef enum {
     PSBC_HW_STAGE_VERTEX  = 1,
     PSBC_HW_STAGE_PIXEL   = 2,
     PSBC_HW_STAGE_NGG     = 3,
+    /* The merged LS/HS pair: one program the hardware launches from the LS
+     * block with the resource pair at the HS block (GFX10). */
+    PSBC_HW_STAGE_HULL    = 4,
 } PsbcHardwareStage;
 
 typedef enum {
@@ -535,6 +538,23 @@ PsbcResult psbc_compile_nir_geometry_pipeline(
  * output is still not a loadable hull package (the LS code and the hull state
  * the pipeline owns are not in it), which PSBC_UNRESOLVED_TESS_PIPELINE keeps
  * explicit. */
+/* Compile a PS5 tessellation pipeline's DOMAIN half with its control half
+ * linked in. The control half is used only for cross-stage info - the
+ * returned program is the evaluation half alone, as an NGG package - but the
+ * link is what keeps num_tess_patches, the attribute stride and
+ * tes_reads_tess_factors compile-time constants. Compiled alone, the
+ * evaluation half instead reads all three at runtime from the
+ * tcs_offchip_layout user SGPR (radv_nir_lower_abi), which is a different ABI
+ * and one no consumer here supplies. */
+PsbcResult psbc_compile_domain_pipeline(
+    const uint32_t* tess_ctrl_spirv,
+    size_t tess_ctrl_spirv_size,
+    const uint32_t* tess_eval_spirv,
+    size_t tess_eval_spirv_size,
+    const PsbcCompileOptions* opts,
+    PsbcShaderOutput* out
+);
+
 PsbcResult psbc_compile_tess_pipeline(
     const uint32_t* vertex_spirv,
     size_t vertex_spirv_size,
