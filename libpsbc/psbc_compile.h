@@ -568,6 +568,17 @@ PsbcResult psbc_compile_tess_pipeline(
     size_t vertex_spirv_size,
     const uint32_t* tess_ctrl_spirv,
     size_t tess_ctrl_spirv_size,
+    /* The evaluation half, LINK-ONLY: none of it is compiled into the
+     * returned program. It is required because the tessellator's domain,
+     * spacing, winding and point mode are declared in the evaluation half by
+     * GLSL convention, and the tessellation-factor LAYOUT the control half
+     * stores depends on the domain - triangles get four contiguous dwords,
+     * quads get six. A control half compiled without it reports
+     * TESS_PRIMITIVE_UNSPECIFIED and ac_nir_lower_tess_io_to_mem falls
+     * through to the quad layout, which puts inner[0] where the hardware
+     * tessellator reads outer[3]. */
+    const uint32_t* tess_eval_spirv,
+    size_t tess_eval_spirv_size,
     const PsbcCompileOptions* opts,
     PsbcShaderOutput* out
 );

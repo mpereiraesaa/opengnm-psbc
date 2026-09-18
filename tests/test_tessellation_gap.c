@@ -103,6 +103,7 @@ int main(int argc, char **argv)
         PsbcShaderOutput pair = {0};
         assert(psbc_compile_tess_pipeline(vertex_spirv, vertex_bytes,
                                           control_spirv, control_bytes,
+                                          evaluation_spirv, evaluation_bytes,
                                           &options, &pair) == PSBC_RESULT_OK);
         assert(pair.metadata.hull_ls_valid);
         assert(pair.metadata.hull_ls_code_size > 0);

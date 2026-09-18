@@ -2223,6 +2223,13 @@ static PsbcResult psbc_compile_impl(
     const uint32_t*       previous_spirv,
     size_t                previous_spirv_size,
     const nir_shader*     previous_input_nir,
+    /* A LINK-ONLY next stage, compiled into nothing and used purely for the
+     * cross-stage facts the consumer cannot know about itself. Today only the
+     * hull pair supplies one: the tessellator's domain, spacing, winding and
+     * point mode are declared in the EVALUATION half, and a control half
+     * compiled without it has no way to learn them. */
+    const uint32_t*       next_link_spirv,
+    size_t                next_link_spirv_size,
     const PsbcCompileOptions* opts,
     PsbcShaderOutput*     out
 ) {
@@ -2479,6 +2486,56 @@ static PsbcResult psbc_compile_impl(
         debug_shader_io(previous_input_nir ? "previous-NIR" :
                                                "previous-SPIR-V",
                         previous_nir, NULL);
+    }
+    /* The link-only evaluation half of a hull pair.
+     *
+     * The tessellator's configuration - domain, spacing, winding, point mode -
+     * is declared in the EVALUATION half by GLSL convention, and the Vulkan
+     * spec allows either tessellation stage to declare it. A control half
+     * compiled from the vertex and control SPIR-V alone therefore has no way
+     * to know the domain, and ac_nir_lower_tess_io_to_mem.c branches on
+     * exactly that: nir_load_tcs_primitive_mode_amd selects the triangle
+     * layout for TESS_PRIMITIVE_TRIANGLES, the isoline layout for
+     * TESS_PRIMITIVE_ISOLINES, and falls through to the QUAD layout for
+     * everything else - including TESS_PRIMITIVE_UNSPECIFIED, which is 0 in
+     * shader_enums.h and exactly what an unlinked control half reports.
+     *
+     * The consequence is not subtle and was measured on hardware: the hull
+     * stored outer 2.0, 2.0, 2.0 at ring words 16384-16386 and inner 1.0 at
+     * word 16388, leaving 16387 zero. That gap is the quad layout's fourth
+     * outer slot. The tessellator, configured by VGT_TF_PARAM.TYPE as a
+     * TRIANGLE domain, reads inner[0] from the contiguous fourth dword - the
+     * word the hull left zero - so the patch is tessellated with a zero inner
+     * level and nothing reaches the rasteriser.
+     *
+     * This shader is compiled into nothing. It exists so the control half can
+     * be linked to it, which is the mirror of what the domain compile already
+     * does in the other direction. */
+    nir_shader* next_link_nir = NULL;
+    if (paired_hull && next_link_spirv) {
+        struct radv_shader_stage next_link = {0};
+        next_link.stage = MESA_SHADER_TESS_EVAL;
+        next_link.next_stage = MESA_SHADER_FRAGMENT;
+        next_link_nir = prepare_stage_nir(
+            &compiler_info, &next_link, next_link_spirv,
+            next_link_spirv_size, NULL, opts
+        );
+        if (!next_link_nir) {
+            ralloc_free(previous_nir);
+            ralloc_free(nir);
+            psbc_shutdown();
+            return PSBC_RESULT_COMPILE_NIR;
+        }
+        /* merge_tess_info(), the same union the domain compile performs: the
+         * two halves may each declare part of the tessellator configuration
+         * and the backend's view has to be both. Here the control half is the
+         * one being compiled, so the merged view lands on it. */
+        nir->info.tess.tcs_vertices_out |= next_link_nir->info.tess.tcs_vertices_out;
+        nir->info.tess.spacing |= next_link_nir->info.tess.spacing;
+        nir->info.tess._primitive_mode |= next_link_nir->info.tess._primitive_mode;
+        nir->info.tess.ccw |= next_link_nir->info.tess.ccw;
+        nir->info.tess.point_mode |= next_link_nir->info.tess.point_mode;
+        debug_shader_io("next-link-SPIR-V", next_link_nir, NULL);
     }
     if (paired_domain) {
         /* merge_tess_info(), from the pinned radv_pipeline_graphics.c. The
@@ -2932,6 +2989,39 @@ static PsbcResult psbc_compile_impl(
         stage.info = stages[mesa_stage].info;
         if (paired_previous)
             previous.info = stages[previous.stage].info;
+        /* The TCS<->TES half of the link, which radv performs in
+         * radv_link_shaders_info() when both stages are present and which is
+         * skipped here because the evaluation half is not one of the compiled
+         * stages. Every value is a pure function of the evaluation half's
+         * NIR, so the link-only shader is enough and no second info pass is
+         * needed:
+         *
+         *   tcs.tes_reads_tess_factors  <- gather_shader_info_tes()'s own
+         *       definition, tes.reads_tess_factors, which is exactly this
+         *       test on inputs_read.
+         *   tcs.tes_inputs_read, tcs.tes_patch_inputs_read <- verbatim; the
+         *       control half otherwise assumes ~0ULL, that is, that the
+         *       evaluation half reads EVERYTHING, which oversizes the
+         *       off-chip patch.
+         *   tes._primitive_mode <- verbatim, and this is the one that decides
+         *       the tessellation-factor layout.
+         *   outputs_linked <- radv_graphics_shaders_fill_linked_tcs_tes_io_info(),
+         *       which sets it on the control half; it is what makes
+         *       radv_nir_lower_abi lower the primitive mode and the
+         *       tess-levels-to-TES flag to CONSTANTS instead of to fields of a
+         *       tcs_offchip_layout user SGPR that nothing on this platform
+         *       supplies. */
+        if (paired_hull && next_link_nir) {
+            stage.info.tcs.tes_reads_tess_factors =
+                !!(next_link_nir->info.inputs_read &
+                   (VARYING_BIT_TESS_LEVEL_INNER | VARYING_BIT_TESS_LEVEL_OUTER));
+            stage.info.tcs.tes_inputs_read = next_link_nir->info.inputs_read;
+            stage.info.tcs.tes_patch_inputs_read =
+                next_link_nir->info.patch_inputs_read;
+            stage.info.tes._primitive_mode =
+                next_link_nir->info.tess._primitive_mode;
+            stage.info.outputs_linked = true;
+        }
         /* Standalone linking conservatively adds PrimitiveID without an FS.
          * Drop only the implicit, final per-primitive parameter when the
          * caller has proved it dead. Keep explicit outputs and unknown
@@ -3231,7 +3321,7 @@ PsbcResult psbc_compile_shader(
     const PsbcCompileOptions* opts,
     PsbcShaderOutput* out
 ) {
-    return psbc_compile_impl(spirv, spirv_size, NULL, NULL, 0, NULL,
+    return psbc_compile_impl(spirv, spirv_size, NULL, NULL, 0, NULL, NULL, 0,
                              opts, out);
 }
 
@@ -3240,7 +3330,7 @@ PsbcResult psbc_compile_nir(
     const PsbcCompileOptions* opts,
     PsbcShaderOutput* out
 ) {
-    return psbc_compile_impl(NULL, 0, nir, NULL, 0, NULL, opts, out);
+    return psbc_compile_impl(NULL, 0, nir, NULL, 0, NULL, NULL, 0, opts, out);
 }
 
 PsbcResult psbc_compile_geometry_pipeline(
@@ -3253,7 +3343,7 @@ PsbcResult psbc_compile_geometry_pipeline(
 ) {
     return psbc_compile_impl(geometry_spirv, geometry_spirv_size, NULL,
                              vertex_spirv, vertex_spirv_size, NULL,
-                             opts, out);
+                             NULL, 0, opts, out);
 }
 
 /* Find one shader register in a metadata block, or NULL when the stage did not
@@ -3290,10 +3380,12 @@ PsbcResult psbc_compile_tess_pipeline(
     size_t vertex_spirv_size,
     const uint32_t* tess_ctrl_spirv,
     size_t tess_ctrl_spirv_size,
+    const uint32_t* tess_eval_spirv,
+    size_t tess_eval_spirv_size,
     const PsbcCompileOptions* opts,
     PsbcShaderOutput* out
 ) {
-    if (!out || !opts || !vertex_spirv || !tess_ctrl_spirv)
+    if (!out || !opts || !vertex_spirv || !tess_ctrl_spirv || !tess_eval_spirv)
         return PSBC_RESULT_INVALID_SPIRV;
     if (opts->stage != PSBC_STAGE_TESS_CTRL || opts->target != PSBC_TARGET_PS5)
         return PSBC_RESULT_UNSUPPORTED_STAGE;
@@ -3326,6 +3418,7 @@ PsbcResult psbc_compile_tess_pipeline(
      * supports directly through its shader_count argument. */
     return psbc_compile_impl(tess_ctrl_spirv, tess_ctrl_spirv_size, NULL,
                              vertex_spirv, vertex_spirv_size, NULL,
+                             tess_eval_spirv, tess_eval_spirv_size,
                              opts, out);
 }
 
@@ -3349,7 +3442,7 @@ PsbcResult psbc_compile_domain_pipeline(
      * is compiled into the returned program. */
     return psbc_compile_impl(tess_eval_spirv, tess_eval_spirv_size, NULL,
                              tess_ctrl_spirv, tess_ctrl_spirv_size, NULL,
-                             opts, out);
+                             NULL, 0, opts, out);
 }
 
 PsbcResult psbc_compile_nir_geometry_pipeline(
@@ -3359,7 +3452,7 @@ PsbcResult psbc_compile_nir_geometry_pipeline(
     PsbcShaderOutput* out
 ) {
     return psbc_compile_impl(NULL, 0, geometry_nir, NULL, 0, vertex_nir,
-                             opts, out);
+                             NULL, 0, opts, out);
 }
 
 void psbc_free_output(PsbcShaderOutput* out) {
