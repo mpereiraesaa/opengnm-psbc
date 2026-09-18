@@ -106,6 +106,18 @@ test-merged-geometry-metadata: $(LIBPSBC)
 	$(CC) -std=c11 -Wall -Wextra -Werror -Ilibpsbc tests/test_merged_geometry_metadata.c $(LIBPSBC) -lstdc++ -lm -lpthread -o tests/test_merged_geometry_metadata
 	./tests/test_merged_geometry_metadata tests/merged-geometry.vert.spv tests/merged-geometry.geom.spv
 
+.PHONY: test-viewport-index-metadata
+test-viewport-index-metadata: $(LIBPSBC)
+	# A geometry stage that writes gl_ViewportIndex exports one parameter the
+	# varying loop cannot describe. The semantic list must name it, or the
+	# linkage stays unresolved and a viewport-routing pipeline is refused; the
+	# control stage writes no viewport index and must be unchanged.
+	$(GLSLANG) -V --target-env vulkan1.0 tests/merged-geometry.vert -o tests/merged-geometry.vert.spv
+	$(GLSLANG) -V -S geom --target-env vulkan1.0 tests/viewport-index.geom -o tests/viewport-index.geom.spv
+	$(GLSLANG) -V -S geom --target-env vulkan1.0 tests/merged-geometry.geom -o tests/merged-geometry.geom.spv
+	$(CC) -std=c11 -Wall -Wextra -Werror -Ilibpsbc tests/test_viewport_index_metadata.c $(LIBPSBC) -lstdc++ -lm -lpthread -o tests/test_viewport_index_metadata
+	./tests/test_viewport_index_metadata tests/merged-geometry.vert.spv tests/viewport-index.geom.spv tests/merged-geometry.geom.spv
+
 test-core-vertex-formats: $(PSBC)
 	$(PYTHON) tests/verify_core_vertex_formats.py --psbc ./$(PSBC) --glslang $(GLSLANG)
 
