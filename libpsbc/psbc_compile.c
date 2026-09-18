@@ -669,6 +669,41 @@ static void gather_static_descriptor_use(
     }
 }
 
+/* VGT_TF_PARAM for a tessellation stage, derived from the interface that stage
+ * declares: the primitive mode (domain), the spacing/partitioning and the
+ * output topology.  The legacy GNM packaging and the PS5 metadata both use this
+ * one derivation so the two can never disagree. */
+static uint32_t tess_tf_param(const nir_shader* nir) {
+    uint32_t tf_type;
+    switch (nir->info.tess._primitive_mode) {
+    case TESS_PRIMITIVE_ISOLINES:   tf_type = V_028B6C_TESS_ISOLINE;  break;
+    case TESS_PRIMITIVE_TRIANGLES:  tf_type = V_028B6C_TESS_TRIANGLE; break;
+    case TESS_PRIMITIVE_QUADS:      tf_type = V_028B6C_TESS_QUAD;     break;
+    default:                        tf_type = V_028B6C_TESS_TRIANGLE; break;
+    }
+
+    uint32_t tf_partition;
+    switch (nir->info.tess.spacing) {
+    case TESS_SPACING_EQUAL:           tf_partition = V_028B6C_PART_INTEGER;    break;
+    case TESS_SPACING_FRACTIONAL_ODD:  tf_partition = V_028B6C_PART_FRAC_ODD;   break;
+    case TESS_SPACING_FRACTIONAL_EVEN: tf_partition = V_028B6C_PART_FRAC_EVEN;  break;
+    default:                           tf_partition = V_028B6C_PART_INTEGER;    break;
+    }
+
+    uint32_t tf_topology;
+    if (nir->info.tess.point_mode) {
+        tf_topology = V_028B6C_OUTPUT_POINT;
+    } else if (nir->info.tess.ccw) {
+        tf_topology = V_028B6C_OUTPUT_TRIANGLE_CCW;
+    } else {
+        tf_topology = V_028B6C_OUTPUT_TRIANGLE_CW;
+    }
+
+    return S_028B6C_TYPE(tf_type) |
+           S_028B6C_PARTITIONING(tf_partition) |
+           S_028B6C_TOPOLOGY(tf_topology);
+}
+
 static void fill_shader_metadata(const BuildContext* ctx,
                                  PsbcShaderMetadata* metadata) {
     memset(metadata, 0, sizeof(*metadata));
@@ -1079,6 +1114,48 @@ static void fill_shader_metadata(const BuildContext* ctx,
             ctx->config->rsrc2);
         return;
     }
+
+    if (ctx->stage == MESA_SHADER_TESS_CTRL) {
+        /* The hull half. On GFX10 the hull stage is two program counters: the
+         * LS program (the vertex half, R_00B520/R_00B528) and the HS program
+         * (this tessellation-control half, R_00B420/R_00B428), whose
+         * RSRC1/RSRC2 radv combines with radv_shader_combine_cfg_vs_tcs().
+         * Publish this half's program and resource registers from the same
+         * config the legacy GNM packaging already writes; everything else -
+         * the LS half's program, the combined RSRC pair, and the hull state the
+         * driver owns (VGT_SHADER_STAGES_EN LS_EN/HS_EN, VGT_LS_HS_CONFIG,
+         * VGT_TF_RING_SIZE, VGT_HS_OFFCHIP_PARAM) - stays explicitly
+         * unresolved, so a consumer still cannot mistake this for a loadable
+         * hull package. */
+        metadata->unresolved_fields |= PSBC_UNRESOLVED_TESS_PIPELINE;
+        /* The hull/domain interface state this stage fully determines: the
+         * domain, the partitioning and the output topology.  The rest of the
+         * hull state (LS_HS_CONFIG, the TF ring, the offchip parameter and the
+         * stage enables) needs the pipeline's patch control points and the
+         * driver's draw state, so it stays out of the package on purpose. */
+        metadata_add_register(cx, cx_count, PSBC_MAX_CONTEXT_REGISTERS,
+            PSBC_CX_OFFSET(R_028B6C_VGT_TF_PARAM), tess_tf_param(ctx->nir));
+        metadata_add_register(sh, sh_count, PSBC_MAX_SHADER_REGISTERS,
+            PSBC_SH_OFFSET(R_00B420_SPI_SHADER_PGM_LO_HS), 0);
+        metadata_add_register(sh, sh_count, PSBC_MAX_SHADER_REGISTERS,
+            PSBC_SH_OFFSET(R_00B424_SPI_SHADER_PGM_HI_HS), 0);
+        metadata_add_register(sh, sh_count, PSBC_MAX_SHADER_REGISTERS,
+            PSBC_SH_OFFSET(R_00B428_SPI_SHADER_PGM_RSRC1_HS),
+            ctx->config->rsrc1);
+        metadata_add_register(sh, sh_count, PSBC_MAX_SHADER_REGISTERS,
+            PSBC_SH_OFFSET(R_00B42C_SPI_SHADER_PGM_RSRC2_HS),
+            ctx->config->rsrc2);
+        return;
+    }
+
+    if (ctx->stage == MESA_SHADER_TESS_EVAL) {
+        /* The domain half has no package state at all yet: radv runs it in the
+         * ES/GS hardware path with the tessellation-specific configuration, and
+         * nothing here describes that. Keep the explicit unresolved bit and
+         * publish no registers rather than an incomplete set. */
+        metadata->unresolved_fields |= PSBC_UNRESOLVED_TESS_PIPELINE;
+        return;
+    }
 }
 
 /* Build the shader binary into a memory buffer instead of a file. */
@@ -1417,38 +1494,8 @@ static PsbcResult buildshaderbinary(
         break;
     }
     case PSBC_STAGE_TESS_CTRL: {
-        /* Map tess primitive mode to VGT_TF_PARAM TYPE field */
-        uint32_t tf_type;
-        switch (ctx->nir->info.tess._primitive_mode) {
-        case TESS_PRIMITIVE_ISOLINES:   tf_type = V_028B6C_TESS_ISOLINE;  break;
-        case TESS_PRIMITIVE_TRIANGLES:  tf_type = V_028B6C_TESS_TRIANGLE; break;
-        case TESS_PRIMITIVE_QUADS:      tf_type = V_028B6C_TESS_QUAD;     break;
-        default:                        tf_type = V_028B6C_TESS_TRIANGLE; break;
-        }
-
-        /* Map tess spacing to VGT_TF_PARAM PARTITIONING field */
-        uint32_t tf_partition;
-        switch (ctx->nir->info.tess.spacing) {
-        case TESS_SPACING_EQUAL:           tf_partition = V_028B6C_PART_INTEGER;    break;
-        case TESS_SPACING_FRACTIONAL_ODD:  tf_partition = V_028B6C_PART_FRAC_ODD;   break;
-        case TESS_SPACING_FRACTIONAL_EVEN: tf_partition = V_028B6C_PART_FRAC_EVEN;  break;
-        default:                           tf_partition = V_028B6C_PART_INTEGER;    break;
-        }
-
-        /* Map CCW + point_mode to VGT_TF_PARAM TOPOLOGY field */
-        uint32_t tf_topology;
-        if (ctx->nir->info.tess.point_mode) {
-            tf_topology = V_028B6C_OUTPUT_POINT;
-        } else if (ctx->nir->info.tess.ccw) {
-            tf_topology = V_028B6C_OUTPUT_TRIANGLE_CCW;
-        } else {
-            tf_topology = V_028B6C_OUTPUT_TRIANGLE_CW;
-        }
-
-        const uint32_t tf_param =
-            S_028B6C_TYPE(tf_type) |
-            S_028B6C_PARTITIONING(tf_partition) |
-            S_028B6C_TOPOLOGY(tf_topology);
+        /* One derivation, shared with the PS5 metadata path. */
+        const uint32_t tf_param = tess_tf_param(ctx->nir);
 
         const GnmHsShader hsh = {
             .common =
@@ -2883,6 +2930,129 @@ PsbcResult psbc_compile_geometry_pipeline(
     return psbc_compile_impl(geometry_spirv, geometry_spirv_size, NULL,
                              vertex_spirv, vertex_spirv_size, NULL,
                              opts, out);
+}
+
+/* Find one shader register in a metadata block, or NULL when the stage did not
+ * publish it. */
+static PsbcRegisterWrite* find_shader_register(PsbcShaderMetadata* metadata,
+                                               uint16_t offset) {
+    for (uint32_t i = 0; i < metadata->shader_register_count; ++i)
+        if (metadata->shader_registers[i].offset == offset)
+            return &metadata->shader_registers[i];
+    return NULL;
+}
+
+/* The combined LS/HS resource registers radv produces for a hull stage
+ * (radv_shader_combine_cfg_vs_tcs in the pinned tree): the vertex half is the
+ * base, the control half raises the VGPR/SGPR/LS_VGPR_COMP_CNT fields, and its
+ * scratch enable does not leak into the LS half. */
+static void combine_vs_tcs_config(uint32_t vs_rsrc1, uint32_t vs_rsrc2,
+                                  uint32_t tcs_rsrc1, uint32_t tcs_rsrc2,
+                                  uint32_t* rsrc1_out, uint32_t* rsrc2_out) {
+    uint32_t rsrc1 = vs_rsrc1;
+    if (G_00B848_VGPRS(tcs_rsrc1) > G_00B848_VGPRS(rsrc1))
+        rsrc1 = (rsrc1 & C_00B848_VGPRS) | (tcs_rsrc1 & ~C_00B848_VGPRS);
+    if (G_00B228_SGPRS(tcs_rsrc1) > G_00B228_SGPRS(rsrc1))
+        rsrc1 = (rsrc1 & C_00B228_SGPRS) | (tcs_rsrc1 & ~C_00B228_SGPRS);
+    if (G_00B428_LS_VGPR_COMP_CNT(tcs_rsrc1) > G_00B428_LS_VGPR_COMP_CNT(rsrc1))
+        rsrc1 = (rsrc1 & C_00B428_LS_VGPR_COMP_CNT) |
+                (tcs_rsrc1 & ~C_00B428_LS_VGPR_COMP_CNT);
+    *rsrc1_out = rsrc1;
+    *rsrc2_out = vs_rsrc2 | (tcs_rsrc2 & ~C_00B12C_SCRATCH_EN);
+}
+
+PsbcResult psbc_compile_tess_pipeline(
+    const uint32_t* vertex_spirv,
+    size_t vertex_spirv_size,
+    const uint32_t* tess_ctrl_spirv,
+    size_t tess_ctrl_spirv_size,
+    const PsbcCompileOptions* opts,
+    PsbcShaderOutput* out
+) {
+    if (!out || !opts || !vertex_spirv || !tess_ctrl_spirv)
+        return PSBC_RESULT_INVALID_SPIRV;
+    if (opts->stage != PSBC_STAGE_TESS_CTRL || opts->target != PSBC_TARGET_PS5)
+        return PSBC_RESULT_UNSUPPORTED_STAGE;
+
+    /* The vertex half of a tessellation pipeline feeds the control stage and is
+     * not an NGG program, so it is compiled with the control stage as its
+     * consumer and with NGG off. */
+    PsbcCompileOptions ls_options = *opts;
+    ls_options.stage = PSBC_STAGE_VERTEX;
+    ls_options.ngg = false;
+    PsbcShaderOutput ls = {0};
+    PsbcResult result = psbc_compile_shader(vertex_spirv, vertex_spirv_size,
+                                            &ls_options, &ls);
+    if (result != PSBC_RESULT_OK)
+        return result;
+
+    PsbcShaderOutput hs = {0};
+    result = psbc_compile_shader(tess_ctrl_spirv, tess_ctrl_spirv_size, opts, &hs);
+    if (result != PSBC_RESULT_OK) {
+        psbc_free_output(&ls);
+        return result;
+    }
+
+    const uint16_t ls_lo = PSBC_SH_OFFSET(R_00B520_SPI_SHADER_PGM_LO_LS);
+    const uint16_t ls_hi = PSBC_SH_OFFSET(R_00B524_SPI_SHADER_PGM_HI_LS);
+    const uint16_t ls_rsrc1_off = PSBC_SH_OFFSET(R_00B528_SPI_SHADER_PGM_RSRC1_LS);
+    const uint16_t ls_rsrc2_off = PSBC_SH_OFFSET(R_00B52C_SPI_SHADER_PGM_RSRC2_LS);
+    const PsbcRegisterWrite* vs_rsrc1 =
+        find_shader_register(&ls.metadata,
+                             PSBC_SH_OFFSET(R_00B128_SPI_SHADER_PGM_RSRC1_VS));
+    const PsbcRegisterWrite* vs_rsrc2 =
+        find_shader_register(&ls.metadata,
+                             PSBC_SH_OFFSET(R_00B12C_SPI_SHADER_PGM_RSRC2_VS));
+    PsbcRegisterWrite* hs_rsrc1 =
+        find_shader_register(&hs.metadata,
+                             PSBC_SH_OFFSET(R_00B428_SPI_SHADER_PGM_RSRC1_HS));
+    PsbcRegisterWrite* hs_rsrc2 =
+        find_shader_register(&hs.metadata,
+                             PSBC_SH_OFFSET(R_00B42C_SPI_SHADER_PGM_RSRC2_HS));
+    if (!vs_rsrc1 || !vs_rsrc2 || !hs_rsrc1 || !hs_rsrc2) {
+        psbc_free_output(&ls);
+        psbc_free_output(&hs);
+        return PSBC_RESULT_UNSUPPORTED_STAGE;
+    }
+
+    uint32_t combined_rsrc1 = 0, combined_rsrc2 = 0;
+    combine_vs_tcs_config(vs_rsrc1->value, vs_rsrc2->value,
+                          hs_rsrc1->value, hs_rsrc2->value,
+                          &combined_rsrc1, &combined_rsrc2);
+    hs_rsrc1->value = combined_rsrc1;
+    hs_rsrc2->value = combined_rsrc2;
+
+    hs.metadata.hull_ls_valid = true;
+    hs.metadata.hull_ls_code_size = (uint32_t)ls.machine_code_size;
+    /* Carry the LS program in the same buffer as the HS program: the HS half
+     * keeps offset 0, and hull_ls_code_offset is where the LS half starts.  A
+     * consumer that wants one program still reads the bytes it always did. */
+    const size_t hs_code_size = hs.machine_code_size;
+    uint8_t* combined = malloc(hs_code_size + ls.machine_code_size);
+    if (!combined) {
+        psbc_free_output(&ls);
+        psbc_free_output(&hs);
+        return PSBC_RESULT_OUT_OF_MEMORY;
+    }
+    memcpy(combined, hs.machine_code, hs_code_size);
+    memcpy(combined + hs_code_size, ls.machine_code, ls.machine_code_size);
+    free(hs.machine_code);
+    hs.machine_code = combined;
+    hs.machine_code_size = hs_code_size + ls.machine_code_size;
+    hs.metadata.hull_ls_code_offset = (uint32_t)hs_code_size;
+    hs.metadata.hull_ls_pgm_lo = (PsbcRegisterWrite){.offset = ls_lo, .value = 0};
+    hs.metadata.hull_ls_pgm_hi = (PsbcRegisterWrite){.offset = ls_hi, .value = 0};
+    hs.metadata.hull_ls_rsrc1 =
+        (PsbcRegisterWrite){.offset = ls_rsrc1_off, .value = vs_rsrc1->value};
+    hs.metadata.hull_ls_rsrc2 =
+        (PsbcRegisterWrite){.offset = ls_rsrc2_off, .value = vs_rsrc2->value};
+    /* The LS machine code itself is not packaged yet, so the result stays
+     * explicitly short of a loadable hull package. */
+    hs.metadata.unresolved_fields |= PSBC_UNRESOLVED_TESS_PIPELINE;
+    psbc_free_output(&ls);
+
+    *out = hs;
+    return PSBC_RESULT_OK;
 }
 
 PsbcResult psbc_compile_nir_geometry_pipeline(

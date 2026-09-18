@@ -174,6 +174,16 @@ typedef enum {
     PSBC_UNRESOLVED_PROGRAM_CHECKSUM       = 1u << 0,
     PSBC_UNRESOLVED_NGG_ESGS_RING_ITEMSIZE = 1u << 1,
     PSBC_UNRESOLVED_AGC_LINKAGE             = 1u << 2,
+    /* The stand-alone tessellation stages compile to ISA, but this compiler has
+     * no tessellation *pipeline* entry point: radv builds the hull shader as one
+     * merged vertex+tessellation-control program (AC_HW_HULL_SHADER, programmed
+     * through SPI_SHADER_PGM_LO_LS on gfx10) and the domain half as a separate
+     * stage, and it programs the hull/domain state (VGT_LS_HS_CONFIG,
+     * VGT_TF_PARAM, VGT_TF_RING_SIZE, VGT_HS_OFFCHIP_PARAM) through the
+     * pipeline's context rolls. A TESS_CTRL/TESS_EVAL result from
+     * psbc_compile_shader() is therefore an ISA-level diagnostic and must never
+     * be treated as a loadable package. */
+    PSBC_UNRESOLVED_TESS_PIPELINE          = 1u << 3,
 } PsbcUnresolvedField;
 
 typedef struct {
@@ -196,6 +206,22 @@ typedef struct {
     PsbcRegisterWrite    linkage_ge_cntl;
     PsbcRegisterWrite    linkage_stages_en;
     PsbcRegisterWrite    linkage_user_vgpr_en;
+    /* Hull halves.  A GFX10 hull stage runs two programs: the LS half (the
+     * vertex shader, R_00B520..) and the HS half (the tessellation-control
+     * shader, R_00B420..).  psbc_compile_tess_pipeline() compiles both and
+     * publishes the LS half here, with the HS half's RSRC1/RSRC2 replaced by
+     * the combined pair radv produces with radv_shader_combine_cfg_vs_tcs().
+     * hull_ls_valid stays false for a stand-alone control shader. */
+    bool                 hull_ls_valid;
+    uint32_t             hull_ls_code_size;
+    /* Byte offset of the LS program inside PsbcShaderOutput::machine_code.  The
+     * HS program starts at offset 0, so a consumer that only knows the HS half
+     * still reads the same bytes it always did. */
+    uint32_t             hull_ls_code_offset;
+    PsbcRegisterWrite    hull_ls_pgm_lo;
+    PsbcRegisterWrite    hull_ls_pgm_hi;
+    PsbcRegisterWrite    hull_ls_rsrc1;
+    PsbcRegisterWrite    hull_ls_rsrc2;
     uint32_t             input_semantic_count;
     uint32_t             input_semantics[PSBC_MAX_SEMANTICS];
     uint32_t             output_semantic_count;
@@ -391,6 +417,23 @@ PsbcResult psbc_compile_geometry_pipeline(
 PsbcResult psbc_compile_nir_geometry_pipeline(
     const struct nir_shader* vertex_nir,
     const struct nir_shader* geometry_nir,
+    const PsbcCompileOptions* opts,
+    PsbcShaderOutput* out
+);
+
+/* Compile a PS5 tessellation pipeline's two hull halves: the vertex shader as
+ * the LS half and the tessellation-control shader as the HS half.  Both are
+ * compiled with the pinned ACO path, the LS half is published through the
+ * hull_ls_* metadata fields, and the HS half's RSRC1/RSRC2 are replaced by the
+ * combined pair radv_shader_combine_cfg_vs_tcs() produces.  The returned
+ * output is still not a loadable hull package (the LS code and the hull state
+ * the pipeline owns are not in it), which PSBC_UNRESOLVED_TESS_PIPELINE keeps
+ * explicit. */
+PsbcResult psbc_compile_tess_pipeline(
+    const uint32_t* vertex_spirv,
+    size_t vertex_spirv_size,
+    const uint32_t* tess_ctrl_spirv,
+    size_t tess_ctrl_spirv_size,
     const PsbcCompileOptions* opts,
     PsbcShaderOutput* out
 );
