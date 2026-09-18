@@ -381,6 +381,14 @@ typedef struct {
     uint32_t             scratch_bytes_per_wave;
     uint32_t             scratch_size_per_thread;
     uint32_t             scratch_buffer_table_user_data_dword;
+    /* PS5 tessellation only: where the driver must write the 64-bit address
+     * of the ring descriptor table, as a user-data dword index. The
+     * tessellation stages dereference that table (entry 5 is the tess-factor
+     * ring, entry 6 the off-chip ring); on this platform the system-block
+     * ring_offsets at s0/s1 cannot be written, so it travels as user data. */
+    bool                 ps5_ring_table_valid;
+    uint32_t             ps5_ring_table_user_data_dword;
+
     bool                 ngg_lds_layout_valid;
     uint32_t             ngg_lds_layout_user_data_dword;
     uint32_t             ngg_lds_layout; /* GS output base in bytes, after ES inputs. */

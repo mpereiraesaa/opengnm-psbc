@@ -782,6 +782,11 @@ static void fill_shader_metadata(const BuildContext* ctx,
                 .shader_data[AC_UD_PUSH_CONSTANTS].sgpr_idx;
         metadata->push_constant_size = ctx->rinfo->push_constant_size;
     }
+    if (ctx->rargs->ps5_ring_table.used) {
+        metadata->ps5_ring_table_valid = true;
+        metadata->ps5_ring_table_user_data_dword =
+            ctx->rargs->user_sgprs_locs.shader_data[AC_UD_PS5_RING_TABLE].sgpr_idx;
+    }
     if (ctx->ngg && ctx->rargs->ngg_lds_layout.used) {
         metadata->ngg_lds_layout_valid = true;
         metadata->ngg_lds_layout_user_data_dword =
@@ -2406,6 +2411,7 @@ static PsbcResult psbc_compile_impl(
     compiler_info.key.use_ngg = opts->ngg;
     compiler_info.key.ps5_global_streamout = opts->ps5_global_streamout;
     compiler_info.key.ps5_fragment_view_index = opts->target == PSBC_TARGET_PS5;
+    compiler_info.key.ps5_tess_ring_table = opts->target == PSBC_TARGET_PS5;
     /* ACO uses debug.family for disassembly and init_program assertion */
     compiler_info.debug.family = chipfamily;
 

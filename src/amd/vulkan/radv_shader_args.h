@@ -30,6 +30,9 @@ enum radv_ud_index {
    AC_UD_VGT_ESGS_RING_ITEMSIZE = 13,
    AC_UD_FORCE_VRS_RATES = 14,
    AC_UD_TASK_RING_ENTRY = 15,
+   /* PS5 only, see radv_shader_args.h's ps5_ring_table. Takes a slot that is
+    * unused on this target (task shaders do not exist here). */
+   AC_UD_PS5_RING_TABLE = AC_UD_TASK_RING_ENTRY,
    AC_UD_NEXT_STAGE_PC = 16,
    AC_UD_EPILOG_PC = 17,
    AC_UD_DYNAMIC_DESCRIPTORS = 18,
@@ -90,6 +93,9 @@ struct radv_shader_args {
    /* NGG */
    struct ac_arg ngg_state;
    struct ac_arg ngg_lds_layout;
+   /* PS5 only: the ring descriptor table, delivered as USER DATA because the
+    * system-block ring_offsets at s0/s1 is not writable on this platform. */
+   struct ac_arg ps5_ring_table;
    struct ac_arg ngg_query_buf_va; /* GFX11+ */
 
    /* NGG Culling */
