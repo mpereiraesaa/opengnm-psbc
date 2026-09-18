@@ -246,7 +246,7 @@ typedef struct {
      * vertex shader, R_00B520..) and the HS half (the tessellation-control
      * shader, R_00B420..).  psbc_compile_tess_pipeline() compiles both and
      * publishes the LS half here, with the HS half's RSRC1/RSRC2 replaced by
-     * the combined pair radv produces with radv_shader_combine_cfg_vs_tcs().
+     * the combined pair radv_shader_combine_cfg_vs_tcs() produces.
      * hull_ls_valid stays false for a stand-alone control shader. */
     bool                 hull_ls_valid;
     uint32_t             hull_ls_code_size;
@@ -258,6 +258,17 @@ typedef struct {
     PsbcRegisterWrite    hull_ls_pgm_hi;
     PsbcRegisterWrite    hull_ls_rsrc1;
     PsbcRegisterWrite    hull_ls_rsrc2;
+    /* Tessellation workgroup layout, computed when the caller supplied the
+     * pipeline's patch control points in PsbcCompileOptions: the patch count
+     * per LS/HS workgroup (VGT_LS_HS_CONFIG NUM_PATCHES), the LDS bytes that
+     * workgroup needs and the workgroup size the launch derives from. The
+     * fields are the compiler's own tessellation workgroup computation, not a
+     * driver guess, and stay false for a compile that was not given the patch
+     * state. */
+    bool                 hull_tess_wg_valid;
+    uint32_t             hull_num_patches_per_wg;
+    uint32_t             hull_tcs_lds_size;
+    uint32_t             hull_workgroup_size;
     /* Fragment-stage distance usage.  The masks above describe what a pre-raster
      * stage exports; these two describe what a pixel stage declares and reads,
      * which is the input the rasterizer would have to deliver to it.  Both are
@@ -410,6 +421,10 @@ typedef struct {
      * bounded block and bind its 32-bit gfx1013 address in a user SGPR. */
     bool        force_indirect_push_constants;
     uint32_t    rasterization_samples; /* 0=single/default, otherwise 1/2/4/8 */
+    /* The pipeline's input patch size. A tessellation hull compile needs it to
+     * size the LS/HS workgroup and name the patch count its launch state
+     * carries; every other compile ignores it. */
+    uint32_t    patch_control_points;
     uint32_t    spi_shader_col_format; /* Per-MRT export nibbles; 0=legacy defaults */
     uint32_t    color_is_int8;         /* Per-MRT narrow integer clamp masks */
     uint32_t    color_is_int10;

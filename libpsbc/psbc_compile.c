@@ -1314,6 +1314,19 @@ static void fill_shader_metadata(const BuildContext* ctx,
         metadata_add_register(sh, sh_count, PSBC_MAX_SHADER_REGISTERS,
             PSBC_SH_OFFSET(R_00B42C_SPI_SHADER_PGM_RSRC2_HS),
             ctx->config->rsrc2);
+        /* The tessellation workgroup layout this stage computed when the
+         * caller supplied the pipeline's patch control points: the patch count
+         * per workgroup, the LDS the LS/HS workgroup needs and its size. This
+         * is the compiler's own tessellation workgroup computation (the same
+         * numbers the io-to-mem lowering sized the offchip layout with), which
+         * is what makes the driver's VGT_LS_HS_CONFIG and launch derivation
+         * come from the compile rather than from a driver guess. */
+        if (ctx->rinfo->tcs.lds_size || ctx->rinfo->num_tess_patches) {
+            metadata->hull_tess_wg_valid = true;
+            metadata->hull_num_patches_per_wg = ctx->rinfo->num_tess_patches;
+            metadata->hull_tcs_lds_size = ctx->rinfo->tcs.lds_size;
+            metadata->hull_workgroup_size = ctx->rinfo->workgroup_size;
+        }
         return;
     }
 
@@ -2488,6 +2501,12 @@ static PsbcResult psbc_compile_impl(
         previous.layout = layout;
     struct radv_graphics_state_key gfx_state = {0};
     gfx_state.rs.provoking_vtx_last = opts->provoking_vtx_last;
+    /* The tessellation workgroup layout is derived from the pipeline's patch
+     * control points (the input patch size, not the control stage's output
+     * vertex count), so the hull compile can size its LDS and name the patch
+     * count the LS_HS launch state needs. Zero keeps the tessellation info
+     * uncomputed, exactly like a pipeline that does not draw patches. */
+    gfx_state.ts.patch_control_points = opts->patch_control_points;
     if (opts->rasterization_samples != 0 &&
         opts->rasterization_samples != 1 &&
         opts->rasterization_samples != 2 &&
