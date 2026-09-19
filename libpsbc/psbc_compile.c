@@ -1414,6 +1414,16 @@ static void fill_shader_metadata(const BuildContext* ctx,
             PSBC_CX_OFFSET(R_028AB4_VGT_REUSE_OFF), 0);
         metadata_add_register(cx, cx_count, PSBC_MAX_CONTEXT_REGISTERS,
             PSBC_CX_OFFSET(R_028A84_VGT_PRIMITIVEID_EN), 0);
+        /* radv_precompute_registers_hw_vs, gfx10+: "Required programming for
+         * tessellation (legacy pipeline only)". The legacy domain's wave
+         * grouping comes from this register even though no GS is present; the
+         * values are radv's, verbatim. Left at an NGG program's counts, the
+         * first legacy patch draw on this device stalled past its fence. */
+        metadata_add_register(cx, cx_count, PSBC_MAX_CONTEXT_REGISTERS,
+            PSBC_CX_OFFSET(R_028A44_VGT_GS_ONCHIP_CNTL),
+            S_028A44_ES_VERTS_PER_SUBGRP(250) |
+            S_028A44_GS_PRIMS_PER_SUBGRP(126) |
+            S_028A44_GS_INST_PRIMS_IN_SUBGRP(126));
 
         metadata_add_register(sh, sh_count, PSBC_MAX_SHADER_REGISTERS,
             PSBC_SH_OFFSET(R_00B120_SPI_SHADER_PGM_LO_VS), 0);
