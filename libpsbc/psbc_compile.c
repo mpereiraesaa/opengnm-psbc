@@ -611,6 +611,23 @@ static bool fill_output_semantics(const struct radv_shader_info* info,
         metadata->output_semantics[metadata->output_semantic_count++] =
             PSBC_SEMANTIC_PRIMITIVE_ID | ((uint32_t)primitive_id << 8);
     }
+    /* The geometry stage's viewport selection is a parameter export too: RADV
+     * gives it a slot in vs_output_param_offset and counts it in
+     * param_exports, so a merged pair that writes gl_ViewportIndex exports one
+     * parameter that the varying loop above cannot describe - the name it
+     * carries is VARYING_SLOT_VIEWPORT rather than a user location. Naming it
+     * here is what keeps the list and the export count equal; without it the
+     * whole linkage field stays unresolved and the pair is refused, which is
+     * exactly the shape the viewport-routing witness hit. A pipeline that does
+     * not write it is byte-identical to before, because this emits nothing. */
+    const uint8_t viewport_index =
+        info->outinfo.vs_output_param_offset[VARYING_SLOT_VIEWPORT];
+    if (viewport_index < PSBC_MAX_SEMANTICS) {
+        if (metadata->output_semantic_count >= PSBC_MAX_SEMANTICS)
+            return false;
+        metadata->output_semantics[metadata->output_semantic_count++] =
+            PSBC_SEMANTIC_VIEWPORT_INDEX | ((uint32_t)viewport_index << 8);
+    }
     /* The packed distance registers are pixel attributes too, and a pixel
      * stage that reads a distance needs to name the register it reads: publish
      * one word per register, after the described varyings and with the
