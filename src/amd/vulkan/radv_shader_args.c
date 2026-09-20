@@ -161,7 +161,8 @@ declare_global_input_sgprs(struct radv_shader_args_state *state, const enum amd_
     * hardware system SGPRs, on top of tess_offchip_offset and
     * merged_wave_info. */
    if (state->compiler_info && state->compiler_info->key.ps5_tess_ring_table &&
-       (info->stage == MESA_SHADER_TESS_CTRL || info->stage == MESA_SHADER_TESS_EVAL)) {
+       (info->stage == MESA_SHADER_TESS_CTRL || info->stage == MESA_SHADER_TESS_EVAL ||
+        (info->stage == MESA_SHADER_GEOMETRY && info->gs.es_type == MESA_SHADER_TESS_EVAL))) {
       RADV_ADD_UD_ARG(state, 2, AC_ARG_CONST_ADDR, ps5_ring_table, AC_UD_PS5_RING_TABLE);
    }
 

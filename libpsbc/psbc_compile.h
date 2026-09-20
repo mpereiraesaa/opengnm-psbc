@@ -24,7 +24,8 @@ extern "C" {
  * user-data window base, and the pixel stage's distance reads. A consumer that
  * cached a program against version 16 must not interpret those fields with the
  * new layout, so the version and the driver's cache key move together. */
-#define PSBC_SHADER_METADATA_VERSION 17u
+/* 21: merged ES source identity distinguishes vertex-fed GS from TES-fed GS. */
+#define PSBC_SHADER_METADATA_VERSION 21u
 
 struct nir_shader;
 struct nir_shader_compiler_options;
@@ -175,6 +176,15 @@ typedef struct {
     uint8_t  data[PSBC_MAX_SPECIALIZATION_BYTES];
 } PsbcSpecializationConstant;
 
+/* Source-specific parameters for linked stages. An enabled empty map means
+ * defaults, not inheritance from the stage being compiled. */
+typedef struct {
+    bool enabled;
+    const char *entrypoint;
+    uint32_t specialization_constant_count;
+    PsbcSpecializationConstant specialization_constants[PSBC_MAX_SPECIALIZATION_CONSTANTS];
+} PsbcLinkedStageParameters;
+
 typedef enum {
     PSBC_HW_STAGE_UNKNOWN = 0,
     PSBC_HW_STAGE_VERTEX  = 1,
@@ -235,6 +245,7 @@ typedef struct {
      * slots and the register set, and the ES half's parameter exports follow
      * from the item size, so they are not duplicated here. */
     bool                 merged_geometry;
+    PsbcStage            merged_es_source_stage;
     uint32_t             merged_es_itemsize;
     uint32_t             merged_esgs_ring_itemsize;
     /* GE PC-line allocation (UC R_030980).  radv programs it for every NGG
@@ -335,6 +346,17 @@ typedef struct {
     bool                 push_constants_valid;
     uint32_t             push_constants_user_data_dword;
     uint32_t             push_constant_size;
+    /* Version19: reads of the source stage and genuinely merged previous VS.
+     * Link-only TCS input of TES is excluded. Unknown never means unused. */
+    bool                 push_use_valid;
+    uint64_t             stage_push_dwords;
+    uint64_t             previous_stage_push_dwords;
+    /* Version18: bounded256-byte push reads before merged LS/HS linkage.
+     * BitN is DWORD N; dynamic offsets conservatively include their NIR range.
+     * Invalid means unknown, never permission to treat a half as unused. */
+    bool                 hull_push_use_valid;
+    uint64_t             hull_vertex_push_dwords;
+    uint64_t             hull_control_push_dwords;
     uint32_t             descriptor_binding_count;
     PsbcDescriptorBinding descriptor_bindings[PSBC_MAX_DESCRIPTOR_BINDINGS];
     /* Bindings this stage statically uses, per descriptor set, derived from the
@@ -416,6 +438,8 @@ typedef struct {
     bool        ngg;         /* Experimental PS5 VS->FS NGG lowering */
     bool        omit_implicit_primitive_id; /* Caller proves FS does not read it; false if unknown. */
     bool        primitive_id_per_primitive; /* FS consumes an implicit PS5 NGG VS export, not a GS varying. */
+    bool        fragment_distance_layout_valid; /* Link cull inputs to the producer's packed clip prefix. */
+    uint32_t    fragment_clip_distance_count;
     bool        ps5_global_streamout; /* No-GDS NGG GS counters */
     bool        force_accelerated_dot; /* Diagnostic only: emit native dot ISA */
     uint32_t    primitive_type; /* GFX10 DI primitive type: 0, 1..6, 10..13 */
@@ -428,6 +452,8 @@ typedef struct {
     uint32_t    specialization_constant_count;
     PsbcSpecializationConstant
         specialization_constants[PSBC_MAX_SPECIALIZATION_CONSTANTS];
+    PsbcLinkedStageParameters previous_parameters;
+    PsbcLinkedStageParameters next_link_parameters;
     /* Keep push constants indirect so the public runtime can upload one
      * bounded block and bind its 32-bit gfx1013 address in a user SGPR. */
     bool        force_indirect_push_constants;
@@ -541,6 +567,15 @@ PsbcResult psbc_compile_geometry_pipeline(
     const PsbcCompileOptions* opts,
     PsbcShaderOutput* out
 );
+
+/* Experimental TES+GS merged executable. TCS is link-only. Current parameters
+ * name GS; previous_parameters name TES; next_link_parameters name TCS.
+ * Native launch acceptance is separate from successful compilation. */
+PsbcResult psbc_compile_tess_geometry_pipeline(
+    const uint32_t *control, size_t control_size,
+    const uint32_t *evaluation, size_t evaluation_size,
+    const uint32_t *geometry, size_t geometry_size,
+    const PsbcCompileOptions *opts, PsbcShaderOutput *out);
 
 /* NIR equivalent used by Gallium when a geometry shader is bound. */
 PsbcResult psbc_compile_nir_geometry_pipeline(

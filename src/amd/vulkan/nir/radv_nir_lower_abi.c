@@ -230,7 +230,12 @@ lower_abi_instr(nir_builder *b, nir_intrinsic_instr *intrin, void *state)
          replacement = nir_imm_int(b, get_tcs_input_vertex_stride(s->info->vs.num_linked_outputs));
       } else {
          assert(stage == MESA_SHADER_TESS_CTRL);
-         if (s->info->inputs_linked) {
+         /* PS5's merged static LS/HS program has a known input layout even
+          * when it retains the unlinked location mapping. Its native ABI does
+          * not supply RADV's dynamic tcs_offchip_layout argument. Use that
+          * known stride, as LS does, instead of reading an undefined SGPR. */
+         if (s->info->inputs_linked ||
+             (s->args->ps5_ring_table.used && s->gfx_state->ts.patch_control_points)) {
             replacement = nir_imm_int(b, get_tcs_input_vertex_stride(s->info->tcs.num_linked_inputs));
          } else {
             nir_def *num_ls_out = GET_SGPR_FIELD_NIR(s->args->ac.tcs_offchip_layout, TCS_OFFCHIP_LAYOUT_NUM_LS_OUTPUTS);
