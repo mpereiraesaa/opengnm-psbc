@@ -715,7 +715,17 @@ radv_shader_spirv_to_nir(const struct radv_compiler_info *compiler_info, struct 
    /* Vulkan uses the separate-shader linking model */
    nir->info.separate_shader = true;
 
+   /* Before IO lowering, indirect fragment distance reads can be absent
+    * from gather_info's slot mask even though their array derefs survive.
+    * Retain the widths collected before clip/cull variable merging; PSBC
+    * needs them to link the producer's packed clip/cull interface. */
+   const unsigned fragment_clip_count = nir->info.clip_distance_array_size;
+   const unsigned fragment_cull_count = nir->info.cull_distance_array_size;
    nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+   if (nir->info.stage == MESA_SHADER_FRAGMENT) {
+      nir->info.clip_distance_array_size = fragment_clip_count;
+      nir->info.cull_distance_array_size = fragment_cull_count;
+   }
 
    if (nir->info.ray_queries > 0) {
       /* Lower shared variables early to prevent the over allocation of shared memory in
@@ -910,6 +920,10 @@ radv_shader_spirv_to_nir(const struct radv_compiler_info *compiler_info, struct 
    if (stage->key.descriptor_heap)
       vk_sampler_state_array_finish(&embedded_samplers);
 
+   if (nir->info.stage == MESA_SHADER_FRAGMENT) {
+      nir->info.clip_distance_array_size = fragment_clip_count;
+      nir->info.cull_distance_array_size = fragment_cull_count;
+   }
    return nir;
 }
 

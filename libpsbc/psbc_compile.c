@@ -329,6 +329,10 @@ typedef struct {
     /* Bindings the compiled stage statically uses, per set; zero when the caller
      * did not request static descriptor use. */
     uint64_t descriptor_used_binding_mask[PSBC_MAX_DESCRIPTOR_SETS];
+    bool hull_push_use_valid;
+    bool push_use_valid;
+    uint64_t stage_push_dwords, previous_stage_push_dwords;
+    uint64_t hull_vertex_push_dwords, hull_control_push_dwords;
 } BuildContext;
 
 static unsigned ps5_last_provoking_vertex(uint32_t primitive_type) {
@@ -531,17 +535,26 @@ static bool build_input_semantics(const nir_shader* nir,
                 const bool cull_distance = io.location == VARYING_SLOT_CULL_DIST0 ||
                     io.location == VARYING_SLOT_CULL_DIST1;
                 if (clip_distance || cull_distance) {
-                    const unsigned declared = clip_distance ?
-                        nir->info.clip_distance_array_size :
+                    /* nir_merge_clip_cull_distance_vars packs both built-ins
+                     * into CLIP_DIST slots, including a cull-only interface.
+                     * An unlowered CULL_DIST slot has no packed identity yet. */
+                    if (cull_distance)
+                        return false;
+                    const unsigned declared = nir->info.clip_distance_array_size +
                         nir->info.cull_distance_array_size;
                     const uint32_t attribute = nir_intrinsic_base(intrin);
+                    /* base is the compact pixel input index, not the packed
+                     * distance register. Reading only ClipDistance[4] leaves
+                     * CLIP_DIST1 at base zero. Preserve the logical location
+                     * when constructing the producer/consumer match key. */
+                    const uint32_t distance_register =
+                        io.location - VARYING_SLOT_CLIP_DIST0;
                     if (io.num_slots != 1 || !declared || declared > 8u ||
                         attribute >= generic_count ||
-                        PSBC_SEMANTIC_DISTANCE_REGISTER + attribute >
-                            PSBC_SEMANTIC_DISTANCE_REGISTER + 1u)
+                        distance_register > 1u)
                         return false;
                     const uint32_t word =
-                        PSBC_SEMANTIC_DISTANCE_REGISTER + attribute;
+                        PSBC_SEMANTIC_DISTANCE_REGISTER + distance_register;
                     if (seen[attribute] && words_by_attribute[attribute] != word)
                         return false;
                     words_by_attribute[attribute] = word;
@@ -590,9 +603,6 @@ static bool fill_output_semantics(const struct radv_shader_info* info,
                 (15u + semantic) | ((uint32_t)parameter << 8);
         }
     }
-    /* The distance registers follow the described varyings in the parameter
-     * space, so their parameter indices start at this count. */
-    const unsigned generic_semantics = metadata->output_semantic_count;
     const uint8_t primitive_id =
         info->outinfo.vs_output_param_offset[VARYING_SLOT_PRIMITIVE_ID];
     if (primitive_id < PSBC_MAX_SEMANTICS) {
@@ -613,11 +623,17 @@ static bool fill_output_semantics(const struct radv_shader_info* info,
         (clip_components + cull_components + 3u) / 4u;
     for (unsigned register_index = 0; register_index < distance_registers;
          ++register_index) {
-        if (metadata->output_semantic_count >= PSBC_MAX_SEMANTICS)
+        /* TES can insert an implicit PrimitiveID parameter between generic
+         * varyings and distances. Use the assigned export index, never the
+         * number of user varying semantics as an approximation. */
+        const uint8_t parameter = info->outinfo.vs_output_param_offset[
+            VARYING_SLOT_CLIP_DIST0 + register_index];
+        if (metadata->output_semantic_count >= PSBC_MAX_SEMANTICS ||
+            parameter >= PSBC_MAX_SEMANTICS)
             return false;
         metadata->output_semantics[metadata->output_semantic_count++] =
             (PSBC_SEMANTIC_DISTANCE_REGISTER + register_index) |
-            ((uint32_t)(generic_semantics + register_index) << 8);
+            ((uint32_t)parameter << 8);
     }
     return metadata->output_semantic_count ==
         info->outinfo.param_exports + info->outinfo.prim_param_exports;
@@ -715,6 +731,33 @@ static void record_descriptor_use(uint32_t set, uint32_t binding,
  * the stage really dereferences. RADV's own info pass records the same sources
  * as a set mask; the standalone ABI also needs the binding identity so a
  * consumer can tell a required descriptor from a declared-but-unused one. */
+static bool gather_push_dwords(const nir_shader *nir, uint64_t *mask)
+{
+    *mask = 0;
+    nir_foreach_function_impl(impl, nir) {
+        nir_foreach_block(block, impl) {
+            nir_foreach_instr(instr, block) {
+                if (instr->type != nir_instr_type_intrinsic) continue;
+                const nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
+                if (intrin->intrinsic != nir_intrinsic_load_push_constant) continue;
+                uint64_t offset = nir_intrinsic_base(intrin);
+                uint64_t size = nir_intrinsic_range(intrin);
+                if (nir_src_is_const(intrin->src[0])) {
+                    offset += nir_src_as_uint(intrin->src[0]);
+                    size = intrin->num_components * (intrin->def.bit_size / 8u);
+                }
+                if (!size || offset >= 256 || size > 256 - offset) {
+                    *mask = 0; return false;
+                }
+                for (unsigned dw = (unsigned)(offset / 4);
+                     dw < (offset + size + 3) / 4; ++dw)
+                    *mask |= UINT64_C(1) << dw;
+            }
+        }
+    }
+    return true;
+}
+
 static void gather_static_descriptor_use(
     const nir_shader *nir, uint32_t *set_mask,
     uint64_t binding_mask[PSBC_MAX_DESCRIPTOR_SETS])
@@ -791,6 +834,8 @@ static uint32_t tess_tf_param(const nir_shader* nir) {
     uint32_t tf_topology;
     if (nir->info.tess.point_mode) {
         tf_topology = V_028B6C_OUTPUT_POINT;
+    } else if (nir->info.tess._primitive_mode == TESS_PRIMITIVE_ISOLINES) {
+        tf_topology = V_028B6C_OUTPUT_LINE;
     } else if (nir->info.tess.ccw) {
         tf_topology = V_028B6C_OUTPUT_TRIANGLE_CCW;
     } else {
@@ -813,6 +858,12 @@ static void fill_shader_metadata(const BuildContext* ctx,
     metadata->cull_distance_mask = ctx->rinfo->outinfo.cull_dist_mask;
     metadata->address32_hi = ctx->address32_hi;
     metadata->user_sgpr_count = ctx->rargs->num_user_sgprs;
+    metadata->hull_push_use_valid = ctx->hull_push_use_valid;
+    metadata->push_use_valid = ctx->push_use_valid;
+    metadata->stage_push_dwords = ctx->stage_push_dwords;
+    metadata->previous_stage_push_dwords = ctx->previous_stage_push_dwords;
+    metadata->hull_vertex_push_dwords = ctx->hull_vertex_push_dwords;
+    metadata->hull_control_push_dwords = ctx->hull_control_push_dwords;
     if (ctx->rinfo->loads_push_constants &&
         ctx->rargs->ac.push_constants.used) {
         metadata->push_constants_valid = true;
@@ -853,9 +904,12 @@ static void fill_shader_metadata(const BuildContext* ctx,
     metadata->descriptor_set0_valid = metadata->descriptor_set_valid[0];
     metadata->descriptor_set0_user_data_dword =
         metadata->descriptor_set_user_data_dword[0];
-    if ((ctx->stage == MESA_SHADER_VERTEX ||
+    const bool has_vertex_half = ctx->stage == MESA_SHADER_TESS_CTRL &&
+        ctx->rinfo->vs.as_ls;
+    if ((has_vertex_half || ctx->stage == MESA_SHADER_VERTEX ||
          (ctx->stage == MESA_SHADER_GEOMETRY && ctx->ngg)) &&
-        ctx->rargs->ac.vertex_buffers.used) {
+        ctx->rargs->ac.vertex_buffers.used &&
+        (!has_vertex_half || ctx->rinfo->vs.vb_desc_usage_mask)) {
         metadata->vertex_buffer_table_valid = true;
         metadata->vertex_buffer_usage_mask = ctx->rinfo->vs.vb_desc_usage_mask;
         metadata->vertex_buffer_per_attribute = ctx->rinfo->vs.use_per_attribute_vb_descs;
@@ -863,7 +917,7 @@ static void fill_shader_metadata(const BuildContext* ctx,
             ctx->rargs->user_sgprs_locs
                 .shader_data[AC_UD_VS_VERTEX_BUFFERS].sgpr_idx;
     }
-    if ((ctx->stage == MESA_SHADER_VERTEX ||
+    if ((has_vertex_half || ctx->stage == MESA_SHADER_VERTEX ||
          (ctx->stage == MESA_SHADER_GEOMETRY && ctx->ngg)) &&
         ctx->rargs->ac.base_vertex.used) {
         metadata->base_vertex_valid = true;
@@ -871,7 +925,7 @@ static void fill_shader_metadata(const BuildContext* ctx,
             ctx->rargs->user_sgprs_locs
                 .shader_data[AC_UD_VS_BASE_VERTEX_START_INSTANCE].sgpr_idx;
     }
-    if ((ctx->stage == MESA_SHADER_VERTEX ||
+    if ((has_vertex_half || ctx->stage == MESA_SHADER_VERTEX ||
          (ctx->stage == MESA_SHADER_GEOMETRY && ctx->ngg)) &&
         ctx->rargs->ac.base_vertex.used && ctx->rargs->ac.draw_id.used) {
         /* DrawIndex lands in the same user-data block as the base vertex, so
@@ -886,7 +940,7 @@ static void fill_shader_metadata(const BuildContext* ctx,
             args->args[args->draw_id.arg_index].offset -
             args->args[args->base_vertex.arg_index].offset;
     }
-    if ((ctx->stage == MESA_SHADER_VERTEX ||
+    if ((has_vertex_half || ctx->stage == MESA_SHADER_VERTEX ||
          (ctx->stage == MESA_SHADER_GEOMETRY && ctx->ngg)) &&
         ctx->rargs->ac.start_instance.used) {
         const struct ac_shader_args* args = &ctx->rargs->ac;
@@ -1041,7 +1095,8 @@ static void fill_shader_metadata(const BuildContext* ctx,
          ctx->stage == MESA_SHADER_TESS_EVAL ||
          ctx->stage == MESA_SHADER_GEOMETRY) && ctx->ngg) {
         const bool has_geometry = ctx->stage == MESA_SHADER_GEOMETRY;
-        const bool is_tess_eval = ctx->stage == MESA_SHADER_TESS_EVAL;
+        const bool merged_tess_eval = ctx->es_info &&
+            ctx->es_info->stage == MESA_SHADER_TESS_EVAL;
         const uint32_t nparams = MAX2(ctx->rinfo->outinfo.param_exports, 1);
         const bool no_pc_export = ctx->rinfo->outinfo.param_exports == 0 &&
                                   ctx->rinfo->outinfo.prim_param_exports == 0;
@@ -1071,7 +1126,8 @@ static void fill_shader_metadata(const BuildContext* ctx,
              * through the ES/GS hardware path even without an API geometry
              * shader.  A real GS must enable GS and cannot use NGG
              * passthrough; otherwise its emitted primitives are skipped. */
-            .value = S_028B54_ES_EN(V_028B54_ES_STAGE_REAL) |
+            .value = S_028B54_ES_EN(merged_tess_eval?
+                         V_028B54_ES_STAGE_DS:V_028B54_ES_STAGE_REAL) |
                      S_028B54_GS_EN(has_geometry) |
                      S_028B54_PRIMGEN_EN(1) |
                      S_028B54_MAX_PRIMGRP_IN_WAVE(2) |
@@ -1096,6 +1152,8 @@ static void fill_shader_metadata(const BuildContext* ctx,
          * uses. */
         if (ctx->es_info) {
             metadata->merged_geometry = true;
+            metadata->merged_es_source_stage=merged_tess_eval?
+                PSBC_STAGE_TESS_EVAL:PSBC_STAGE_VERTEX;
             metadata->merged_es_itemsize = ctx->es_info->esgs_itemsize;
             metadata->merged_esgs_ring_itemsize =
                 ctx->rinfo->ngg_info.vgt_esgs_ring_itemsize;
@@ -1278,6 +1336,7 @@ static void fill_shader_metadata(const BuildContext* ctx,
             .offset = PSBC_UC_OFFSET(R_030988_GE_USER_VGPR_EN),
             .value = 0,
         };
+        publish_ge_pc_alloc(ctx, metadata);
 
         metadata_add_register(cx, cx_count, PSBC_MAX_CONTEXT_REGISTERS,
             PSBC_CX_OFFSET(R_0286C4_SPI_VS_OUT_CONFIG),
@@ -1289,6 +1348,15 @@ static void fill_shader_metadata(const BuildContext* ctx,
         metadata_add_register(cx, cx_count, PSBC_MAX_CONTEXT_REGISTERS,
             PSBC_CX_OFFSET(R_02881C_PA_CL_VS_OUT_CNTL),
             build_pa_cl_vs_out_cntl(ctx, num_pos_exports));
+        /* The three registers an NGG pipeline leaves to the engine and a
+         * legacy one must state: GS mode off, vertex reuse on, no primitive
+         * id export - the same set the legacy evaluation half publishes. */
+        metadata_add_register(cx, cx_count, PSBC_MAX_CONTEXT_REGISTERS,
+            PSBC_CX_OFFSET(R_028A40_VGT_GS_MODE), 0);
+        metadata_add_register(cx, cx_count, PSBC_MAX_CONTEXT_REGISTERS,
+            PSBC_CX_OFFSET(R_028AB4_VGT_REUSE_OFF), 0);
+        metadata_add_register(cx, cx_count, PSBC_MAX_CONTEXT_REGISTERS,
+            PSBC_CX_OFFSET(R_028A84_VGT_PRIMITIVEID_EN), 0);
 
         metadata_add_register(sh, sh_count, PSBC_MAX_SHADER_REGISTERS,
             PSBC_SH_OFFSET(R_00B120_SPI_SHADER_PGM_LO_VS), 0);
@@ -1300,10 +1368,31 @@ static void fill_shader_metadata(const BuildContext* ctx,
         metadata_add_register(sh, sh_count, PSBC_MAX_SHADER_REGISTERS,
             PSBC_SH_OFFSET(R_00B12C_SPI_SHADER_PGM_RSRC2_VS),
             ctx->config->rsrc2);
+        /* The gfx10 legacy-VS resource registers radv's preamble writes:
+         * every CU enabled, the wave limit open, late allocation off (PAL
+         * documents LIMIT = 0 as a supported configuration). */
+        metadata_add_register(sh, sh_count, PSBC_MAX_SHADER_REGISTERS,
+            PSBC_SH_OFFSET(R_00B118_SPI_SHADER_PGM_RSRC3_VS),
+            S_00B118_CU_EN(0xffff) | S_00B118_WAVE_LIMIT(0x3f));
+        metadata_add_register(sh, sh_count, PSBC_MAX_SHADER_REGISTERS,
+            PSBC_SH_OFFSET(R_00B104_SPI_SHADER_PGM_RSRC4_VS),
+            S_00B104_CU_EN(0xffff));
+        metadata_add_register(sh, sh_count, PSBC_MAX_SHADER_REGISTERS,
+            PSBC_SH_OFFSET(R_00B11C_SPI_SHADER_LATE_ALLOC_VS),
+            S_00B11C_LIMIT(0));
         return;
     }
 
     if (ctx->stage == MESA_SHADER_TESS_CTRL) {
+        /* Publish the merged LS/HS user-data window from the actual ring
+         * argument, not from an NGG-only LDS-layout argument absent here. */
+        if (has_vertex_half && ctx->rargs->ps5_ring_table.used) {
+            const uint32_t offset = ctx->rargs->ac.args[
+                ctx->rargs->ps5_ring_table.arg_index].offset;
+            if (offset >= metadata->ps5_ring_table_user_data_dword)
+                metadata->user_data_window_base =
+                    offset - metadata->ps5_ring_table_user_data_dword;
+        }
         /* The merged LS/HS program.  On GFX10 this hardware stage is ONE
          * program counter, and the pinned radv_get_shader_regs() puts it at
          * the LS block while the resource pair stays at the HS block:
@@ -2176,6 +2265,58 @@ static bool psbc_licm_speculatable(nir_instr* instr, nir_loop* loop,
     return nir_instr_can_speculate(instr);
 }
 
+/* Distance arrays are independent API built-ins but share hardware vectors.
+ * Scalarize before moving cull components so a non-vec4 clip prefix can split
+ * a formerly vectorized load across two parameter registers safely. */
+static bool link_fragment_distance_layout(nir_shader *nir,
+                                          const PsbcCompileOptions *opts) {
+    if (!opts->fragment_distance_layout_valid || nir->info.stage != MESA_SHADER_FRAGMENT)
+        return true;
+    const unsigned old_clip = nir->info.clip_distance_array_size;
+    const unsigned cull = nir->info.cull_distance_array_size;
+    const unsigned prefix = opts->fragment_clip_distance_count;
+    if (prefix > 8 || prefix < old_clip || cull > 8 - prefix)
+        return false;
+    if (!cull || prefix == old_clip)
+        return true;
+    NIR_PASS(_, nir, nir_lower_io_to_scalar, nir_var_shader_in, NULL, NULL);
+    nir_foreach_function_impl(impl, nir) {
+        nir_builder b = nir_builder_create(impl);
+        nir_foreach_block(block, impl) {
+            nir_foreach_instr(instr, block) {
+                if (instr->type != nir_instr_type_intrinsic)
+                    continue;
+                nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
+                if (in->intrinsic != nir_intrinsic_load_input &&
+                    in->intrinsic != nir_intrinsic_load_interpolated_input)
+                    continue;
+                nir_io_semantics io = nir_intrinsic_io_semantics(in);
+                if (io.location != VARYING_SLOT_CLIP_DIST0 &&
+                    io.location != VARYING_SLOT_CLIP_DIST1)
+                    continue;
+                nir_src *offset = nir_get_io_offset_src(in);
+                if (!offset || !nir_src_is_const(*offset) || in->num_components != 1 ||
+                    nir_src_as_uint(*offset) > 1 || nir_intrinsic_component(in) > 3)
+                    return false;
+                unsigned component = (io.location - VARYING_SLOT_CLIP_DIST0) * 4 +
+                    nir_intrinsic_component(in) + nir_src_as_uint(*offset) * 4;
+                if (component < old_clip)
+                    continue;
+                if (component - old_clip >= cull)
+                    return false;
+                component += prefix - old_clip;
+                io.location = VARYING_SLOT_CLIP_DIST0 + component / 4;
+                io.num_slots = 1;
+                nir_intrinsic_set_io_semantics(in, io);
+                nir_intrinsic_set_component(in, component % 4);
+                b.cursor = nir_before_instr(instr);
+                nir_src_rewrite(offset, nir_imm_int(&b, 0));
+            }
+        }
+    }
+    return true;
+}
+
 static nir_shader* prepare_stage_nir(
     const struct radv_compiler_info* compiler_info,
     struct radv_shader_stage* stage,
@@ -2231,6 +2372,13 @@ static nir_shader* prepare_stage_nir(
     if (!nir)
         return NULL;
 
+    /* Indirect array lowering can replace the distance variables with
+     * temporaries before gather_info runs again. Preserve their declared
+     * widths from the normalized entry-point interface, not the surviving
+     * variable list after optimization. */
+    const unsigned fragment_clip_count = nir->info.clip_distance_array_size;
+    const unsigned fragment_cull_count = nir->info.cull_distance_array_size;
+
     if (input_nir) {
         if (opts->descriptor_binding_count)
             nir_shader_instructions_pass(nir, lower_gallium_ubo_index,
@@ -2261,7 +2409,26 @@ static nir_shader* prepare_stage_nir(
             radv_optimize_nir(nir, false);
     }
     nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+    if (nir->info.stage == MESA_SHADER_FRAGMENT) {
+        nir->info.clip_distance_array_size = fragment_clip_count;
+        nir->info.cull_distance_array_size = fragment_cull_count;
+    }
     radv_nir_lower_io(nir);
+    if (!link_fragment_distance_layout(nir, opts)) {
+        ralloc_free(nir);
+        return NULL;
+    }
+    if (nir->info.stage == MESA_SHADER_FRAGMENT && opts->fragment_distance_layout_valid) {
+        nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+        nir->info.clip_distance_array_size = fragment_clip_count;
+        nir->info.cull_distance_array_size = fragment_cull_count;
+    }
+    /* TCS offchip visibility is gathered from lowered store_output and
+     * store_per_vertex_output, not the preceding store_deref form. Leaving
+     * these masks at zero makes ac_nir_get_tess_io_info discard all stores
+     * consumed by TES, even when the linked TES input mask is correct. */
+    if (nir->info.stage == MESA_SHADER_TESS_CTRL)
+        nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
     /* Standalone SPIR-V has not gone through graphics-pipeline IO linking.
      * Its variables can all have driver_location zero. Canonicalize fragment
      * input bases from semantic locations before RADV gathers input masks and
@@ -2323,6 +2490,30 @@ static PsbcResult validate_spirv_capabilities(
     return PSBC_RESULT_OK;
 }
 
+static bool specialization_parameters_valid(uint32_t count,
+    const PsbcSpecializationConstant *entries)
+{
+    if (count > PSBC_MAX_SPECIALIZATION_CONSTANTS) return false;
+    for (uint32_t i = 0; i < count; ++i) {
+        if (!entries[i].size || entries[i].size > PSBC_MAX_SPECIALIZATION_BYTES)
+            return false;
+        for (uint32_t j = 0; j < i; ++j)
+            if (entries[j].constant_id == entries[i].constant_id) return false;
+    }
+    return true;
+}
+
+static void select_linked_parameters(PsbcCompileOptions *out,
+    const PsbcCompileOptions *base, const PsbcLinkedStageParameters *source)
+{
+    *out = *base;
+    if (!source->enabled) return; /* Legacy callers preserve inherited behaviour. */
+    out->entrypoint = source->entrypoint;
+    out->specialization_constant_count = source->specialization_constant_count;
+    memcpy(out->specialization_constants, source->specialization_constants,
+           sizeof(out->specialization_constants));
+}
+
 static PsbcResult psbc_compile_impl(
     const uint32_t*       spirv,
     size_t                spirv_size,
@@ -2371,6 +2562,7 @@ static PsbcResult psbc_compile_impl(
         return PSBC_RESULT_UNSUPPORTED_STAGE;
     const bool paired_geometry =
         paired_previous && mesa_stage == MESA_SHADER_GEOMETRY;
+    const bool paired_tess_geometry = paired_geometry && next_link_spirv;
     const bool paired_hull =
         paired_previous && mesa_stage == MESA_SHADER_TESS_CTRL;
     /* The DOMAIN pair is a LINK, not a merge: the evaluation half is its own
@@ -2397,7 +2589,8 @@ static PsbcResult psbc_compile_impl(
         return PSBC_RESULT_UNSUPPORTED_STAGE;
     if (previous_input_nir &&
         previous_input_nir->info.stage !=
-            (paired_domain ? MESA_SHADER_TESS_CTRL : MESA_SHADER_VERTEX))
+            (paired_domain ? MESA_SHADER_TESS_CTRL :
+             paired_tess_geometry ? MESA_SHADER_TESS_EVAL : MESA_SHADER_VERTEX))
         return PSBC_RESULT_UNSUPPORTED_STAGE;
     if (previous_spirv) {
         const PsbcResult validation =
@@ -2413,19 +2606,15 @@ static PsbcResult psbc_compile_impl(
         return PSBC_RESULT_UNSUPPORTED_STAGE;
     if (opts->descriptor_binding_count > PSBC_MAX_DESCRIPTOR_BINDINGS)
         return PSBC_RESULT_INTERNAL_ERROR;
-    if (opts->specialization_constant_count >
-        PSBC_MAX_SPECIALIZATION_CONSTANTS)
+    if (!specialization_parameters_valid(opts->specialization_constant_count,
+                                        opts->specialization_constants) ||
+        (opts->previous_parameters.enabled &&
+         !specialization_parameters_valid(opts->previous_parameters.specialization_constant_count,
+                                          opts->previous_parameters.specialization_constants)) ||
+        (opts->next_link_parameters.enabled &&
+         !specialization_parameters_valid(opts->next_link_parameters.specialization_constant_count,
+                                          opts->next_link_parameters.specialization_constants)))
         return PSBC_RESULT_INTERNAL_ERROR;
-    for (uint32_t i = 0; i < opts->specialization_constant_count; ++i) {
-        const PsbcSpecializationConstant* spec =
-            &opts->specialization_constants[i];
-        if (!spec->size || spec->size > PSBC_MAX_SPECIALIZATION_BYTES)
-            return PSBC_RESULT_INTERNAL_ERROR;
-        for (uint32_t j = 0; j < i; ++j)
-            if (opts->specialization_constants[j].constant_id ==
-                spec->constant_id)
-                return PSBC_RESULT_INTERNAL_ERROR;
-    }
     if ((opts->color_is_int8 | opts->color_is_int10) & ~UINT32_C(0xff))
         return PSBC_RESULT_INTERNAL_ERROR;
     for (unsigned i = 0; i < 8; ++i)
@@ -2571,8 +2760,8 @@ static PsbcResult psbc_compile_impl(
     if (paired_previous) {
         /* The consumer's own previous stage: a control half consumes the
          * vertex half, an evaluation half consumes the control half. */
-        previous.stage = paired_domain ? MESA_SHADER_TESS_CTRL
-                                       : MESA_SHADER_VERTEX;
+        previous.stage = paired_domain ? MESA_SHADER_TESS_CTRL :
+            paired_tess_geometry ? MESA_SHADER_TESS_EVAL : MESA_SHADER_VERTEX;
         /* THE switch that decides the vertex half's hardware role. RADV's
          * gather_shader_info_vs sets vs.as_ls only when next_stage is
          * TESS_CTRL and vs.as_es only when it is GEOMETRY; with the default
@@ -2580,9 +2769,11 @@ static PsbcResult psbc_compile_impl(
          * parameter cache instead of writing its outputs to LDS for the
          * consumer. */
         previous.next_stage = mesa_stage;
+        PsbcCompileOptions previous_options;
+        select_linked_parameters(&previous_options, opts, &opts->previous_parameters);
         previous_nir = prepare_stage_nir(
             &compiler_info, &previous, previous_spirv, previous_spirv_size,
-            previous_input_nir, opts
+            previous_input_nir, &previous_options
         );
         if (!previous_nir) {
             ralloc_free(nir);
@@ -2632,9 +2823,11 @@ static PsbcResult psbc_compile_impl(
         struct radv_shader_stage next_link = {0};
         next_link.stage = MESA_SHADER_TESS_EVAL;
         next_link.next_stage = MESA_SHADER_FRAGMENT;
+        PsbcCompileOptions next_options;
+        select_linked_parameters(&next_options, opts, &opts->next_link_parameters);
         next_link_nir = prepare_stage_nir(
             &compiler_info, &next_link, next_link_spirv,
-            next_link_spirv_size, NULL, opts
+            next_link_spirv_size, NULL, &next_options
         );
         if (!next_link_nir) {
             ralloc_free(previous_nir);
@@ -2657,7 +2850,7 @@ static PsbcResult psbc_compile_impl(
                (VARYING_BIT_TESS_LEVEL_INNER | VARYING_BIT_TESS_LEVEL_OUTER));
         next_link_inputs_read = next_link_nir->info.inputs_read;
         next_link_patch_inputs_read = next_link_nir->info.patch_inputs_read;
-        next_link_primitive_mode = next_link_nir->info.tess._primitive_mode;
+        next_link_primitive_mode = nir->info.tess._primitive_mode;
         next_link_valid = true;
         ralloc_free(next_link_nir);
         next_link_nir = NULL;
@@ -2695,6 +2888,37 @@ static PsbcResult psbc_compile_impl(
     }
 
     /* Shader info + args + postprocess */
+    struct radv_shader_stage control_link = {0};
+    if (paired_tess_geometry) {
+        /* The merged executable is TES+GS. TCS is link-only, so TES keeps the
+         * same offchip layout/patch-count derivation as standalone domain. */
+        control_link.stage = MESA_SHADER_TESS_CTRL;
+        control_link.next_stage = MESA_SHADER_TESS_EVAL;
+        PsbcCompileOptions control_options;
+        select_linked_parameters(&control_options,opts,&opts->next_link_parameters);
+        control_link.nir=prepare_stage_nir(&compiler_info,&control_link,
+            next_link_spirv,next_link_spirv_size,NULL,&control_options);
+        if(!control_link.nir) {
+            ralloc_free(previous_nir);ralloc_free(nir);psbc_shutdown();
+            return PSBC_RESULT_COMPILE_NIR;
+        }
+        /* Tie the link-only allocation to the current shader on all exits. */
+        ralloc_steal(nir,control_link.nir);
+        previous_nir->info.tess.tcs_vertices_out |= control_link.nir->info.tess.tcs_vertices_out;
+        previous_nir->info.tess.spacing |= control_link.nir->info.tess.spacing;
+        previous_nir->info.tess._primitive_mode |= control_link.nir->info.tess._primitive_mode;
+        previous_nir->info.tess.ccw |= control_link.nir->info.tess.ccw;
+        previous_nir->info.tess.point_mode |= control_link.nir->info.tess.point_mode;
+        control_link.nir->info.tess.tcs_vertices_out=previous_nir->info.tess.tcs_vertices_out;
+        control_link.nir->info.tess.spacing=previous_nir->info.tess.spacing;
+        control_link.nir->info.tess._primitive_mode=previous_nir->info.tess._primitive_mode;
+        control_link.nir->info.tess.ccw=previous_nir->info.tess.ccw;
+        control_link.nir->info.tess.point_mode=previous_nir->info.tess.point_mode;
+        radv_nir_shader_info_init(control_link.stage,control_link.next_stage,&control_link.info);
+        control_link.info.outputs_linked=true;
+        control_link.nir->info.tess.tcs_outputs_read_by_tes &= previous_nir->info.inputs_read;
+        control_link.nir->info.tess.tcs_patch_outputs_read_by_tes &= previous_nir->info.patch_inputs_read;
+    }
     stage.nir = nir;
     /* radv_link_shaders_info() detects a stage by its .nir pointer. The
      * geometry pair deliberately leaves previous.nir unset and marks its
@@ -2702,10 +2926,25 @@ static PsbcResult psbc_compile_impl(
      * move; the hull pair needs the real VS->TCS linking, which computes
      * vs.tcs_inputs_via_lds, the LSHS workgroup size and tcs_in_out_eq from
      * the two shaders' actual IO. */
-    if (paired_hull || paired_domain)
+    if (paired_hull || paired_domain || paired_tess_geometry)
         previous.nir = previous_nir;
     radv_nir_shader_info_init(stage.stage, stage.next_stage, &stage.info);
     stage.info.is_ngg = opts->ngg;
+    /* Linked output mapping must precede gather_shader_info_tcs: its
+     * io_info.highest_remapped_vram_output defines the per-patch region
+     * base. Setting this only after info gathering leaves fixed-location
+     * padding on the hull while the linked domain uses compact slots. */
+    if (next_link_valid) {
+        stage.info.outputs_linked = true;
+        /* A TCS output may exist only for cross-invocation LDS communication.
+         * Standalone lowering initially marks every output TES-readable.
+         * Use the actual linked consumer before gather_shader_info_tcs derives
+         * highest_remapped_vram_output and the patch-region base. Keep the
+         * independent outputs_read/written masks intact: they still size LDS.
+         * The late tes_inputs_read override alone cannot repair this base. */
+        nir->info.tess.tcs_outputs_read_by_tes &= next_link_inputs_read;
+        nir->info.tess.tcs_patch_outputs_read_by_tes &= next_link_patch_inputs_read;
+    }
     if (paired_previous) {
         radv_nir_shader_info_init(previous.stage, previous.next_stage,
                                   &previous.info);
@@ -2714,6 +2953,21 @@ static PsbcResult psbc_compile_impl(
         previous.info.is_ngg = paired_geometry;
         /* The control half of a domain pair needs its own patch-count
          * derivation to run, which is what the link then copies across. */
+    }
+    if (paired_domain) {
+        /* Mirror radv_graphics_shaders_fill_linked_tcs_tes_io_info: the
+         * paired hull uses compact TES-consumed slots, so the domain must
+         * not read RADV's unlinked fixed-location layout. Include the same
+         * tess-level/per-patch reservation used by the upstream linker. */
+        const uint64_t levels = VARYING_BIT_TESS_LEVEL_OUTER |
+                                VARYING_BIT_TESS_LEVEL_INNER;
+        previous.info.outputs_linked = true;
+        stage.info.tes.num_linked_inputs =
+            util_bitcount64(nir->info.inputs_read & ~levels);
+        stage.info.tes.num_linked_patch_inputs =
+            util_bitcount64(nir->info.inputs_read & levels) +
+            util_bitcount64(nir->info.patch_inputs_read);
+        stage.info.inputs_linked = true;
     }
     if (paired_geometry) {
         NIR_PASS(_, nir, nir_lower_gs_intrinsics,
@@ -2727,7 +2981,14 @@ static PsbcResult psbc_compile_impl(
          * existing shared driver-location interface accordingly; otherwise
          * RADV selects the ABI for independently compiled merged halves. */
         const unsigned linked_slots = util_bitcount64(nir->info.inputs_read);
-        previous.info.vs.num_linked_outputs = linked_slots;
+        if(paired_tess_geometry) {
+            const uint64_t levels=VARYING_BIT_TESS_LEVEL_OUTER|VARYING_BIT_TESS_LEVEL_INNER;
+            previous.info.tes.num_linked_inputs=util_bitcount64(previous_nir->info.inputs_read&~levels);
+            previous.info.tes.num_linked_patch_inputs=util_bitcount64(previous_nir->info.inputs_read&levels)+
+                util_bitcount64(previous_nir->info.patch_inputs_read);
+            previous.info.inputs_linked=true;
+            previous.info.tes.num_linked_outputs=linked_slots;
+        } else previous.info.vs.num_linked_outputs = linked_slots;
         previous.info.outputs_linked = true;
         stage.info.gs.num_linked_inputs = linked_slots;
         stage.info.inputs_linked = true;
@@ -2772,6 +3033,7 @@ static PsbcResult psbc_compile_impl(
                 (struct radv_descriptor_set_layout*)descriptor_set_storage[set];
     }
     stage.layout = layout;
+    if(paired_tess_geometry)control_link.layout=layout;
     if (paired_previous)
         previous.layout = layout;
     struct radv_graphics_state_key gfx_state = {0};
@@ -3056,12 +3318,38 @@ static PsbcResult psbc_compile_impl(
             RADV_PIPELINE_GRAPHICS, false, &previous.info
         );
     }
+    if(paired_tess_geometry)
+        radv_nir_shader_info_pass(&compiler_info,control_link.nir,&layout,
+            &control_link.key,&gfx_state,RADV_PIPELINE_GRAPHICS,false,&control_link.info);
+    if (paired_hull) {
+        /* Keep the unlinked semantic mapping, but one merged LS/HS program
+         * needs ONE LDS input stride. TCS sizing already uses its consumed
+         * input span; LS lowering stores only tcs_inputs_via_lds. Unconsumed
+         * high-location VS outputs must not enlarge just the writer's stride.
+         * Do this after both info passes and before their merged link/lowering. */
+        previous.info.vs.num_linked_outputs = stage.info.tcs.num_linked_inputs;
+    }
     /* Legacy Gallium texture indices carry no Vulkan deref for RADV's info
      * pass to discover; that caller keeps the explicit PSBC layout. A caller
      * that asserts static descriptor use leaves RADV's NIR-derived set mask
      * exactly as the optimized shader produced it, so a layout binding the NIR
      * never dereferences cannot acquire a native descriptor dependency. */
     uint64_t static_binding_mask[PSBC_MAX_DESCRIPTOR_SETS] = {0};
+    uint64_t stage_push = 0, previous_stage_push = 0;
+    bool push_valid = gather_push_dwords(nir, &stage_push);
+    if (paired_hull || paired_geometry) {
+        bool previous_valid = gather_push_dwords(previous_nir, &previous_stage_push);
+        push_valid = push_valid && previous_valid;
+    }
+    if (!push_valid) stage_push = previous_stage_push = 0;
+    uint64_t hull_vertex_push = 0, hull_control_push = 0;
+    bool hull_push_valid = false;
+    if (paired_hull) {
+        bool vertex_valid = gather_push_dwords(previous_nir, &hull_vertex_push);
+        bool control_valid = gather_push_dwords(nir, &hull_control_push);
+        hull_push_valid = vertex_valid && control_valid;
+        if (!hull_push_valid) hull_vertex_push = hull_control_push = 0;
+    }
     if (opts->descriptor_binding_count && !opts->static_descriptor_use) {
         uint32_t descriptor_set_mask = 0;
         for (uint32_t i = 0; i < opts->descriptor_binding_count; ++i)
@@ -3075,12 +3363,30 @@ static PsbcResult psbc_compile_impl(
          * that records the used sets from the same sources. */
         uint32_t used_set_mask = 0;
         gather_static_descriptor_use(nir, &used_set_mask, static_binding_mask);
+        uint32_t unknown_sets = stage.info.desc_set_used_mask;
+        for (unsigned set = 0; set < PSBC_MAX_DESCRIPTOR_SETS; ++set)
+            if (static_binding_mask[set])
+                unknown_sets &= ~(1u << set);
+        /* LS/HS and ES/GS execute both input modules with one shared table.
+         * Collect both BEFORE lowering removes descriptor dereferences. A
+         * precise mask from one half must not hide unknown use in the other. */
+        if (paired_geometry || paired_hull) {
+            uint64_t previous_bindings[PSBC_MAX_DESCRIPTOR_SETS] = {0};
+            uint32_t previous_sets = 0;
+            gather_static_descriptor_use(previous_nir, &previous_sets, previous_bindings);
+            uint32_t previous_unknown = previous.info.desc_set_used_mask;
+            for (unsigned set = 0; set < PSBC_MAX_DESCRIPTOR_SETS; ++set) {
+                if (previous_bindings[set])
+                    previous_unknown &= ~(1u << set);
+                static_binding_mask[set] |= previous_bindings[set];
+            }
+            unknown_sets |= previous_unknown;
+        }
         for (uint32_t i = 0; i < opts->descriptor_binding_count; ++i) {
             const PsbcDescriptorBinding *declared = &opts->descriptor_bindings[i];
             uint32_t set = declared->set;
             if (set >= PSBC_MAX_DESCRIPTOR_SETS || declared->binding >= 64u ||
-                !(stage.info.desc_set_used_mask & (1u << set)) ||
-                static_binding_mask[set] != 0)
+                !(unknown_sets & (1u << set)))
                 continue;
             /* A set the NIR uses whose binding the walk could not name must not
              * look unused: fall back to this set's whole declaration. */
@@ -3113,6 +3419,7 @@ static PsbcResult psbc_compile_impl(
         stages[mesa_stage] = stage;
         if (paired_previous)
             stages[previous.stage] = previous;
+        if(paired_tess_geometry)stages[MESA_SHADER_TESS_CTRL]=control_link;
         radv_nir_shader_info_link(&compiler_info, &gfx_state, stages);
         stage.info = stages[mesa_stage].info;
         if (paired_previous)
@@ -3203,10 +3510,20 @@ static PsbcResult psbc_compile_impl(
     switch (mesa_stage) {
     case MESA_SHADER_TESS_CTRL: previous_stage = MESA_SHADER_VERTEX;    break;
     case MESA_SHADER_TESS_EVAL: previous_stage = MESA_SHADER_TESS_CTRL; break;
-    case MESA_SHADER_GEOMETRY:  previous_stage = MESA_SHADER_VERTEX;    break;
+    case MESA_SHADER_GEOMETRY: previous_stage = paired_tess_geometry?
+        MESA_SHADER_TESS_EVAL:MESA_SHADER_VERTEX; break;
     default:                    previous_stage = MESA_SHADER_NONE;      break;
     }
 
+    /* PSBC emits LS and HS in one ACO program. The generic unlinked IO
+     * layout does not make them separately executable shader objects: that
+     * ABI reserves prolog/epilog PCs and descriptor pointers never supplied
+     * by this native pipeline. Keep IO mapping unchanged, but select the
+     * merged argument ABI for the program we actually compile. */
+    if (paired_hull) {
+        stage.info.merged_shader_compiled_separately = false;
+        previous.info.merged_shader_compiled_separately = false;
+    }
     radv_declare_shader_args(
         &compiler_info, &gfx_state, &stage, previous_stage, NULL
     );
@@ -3404,6 +3721,12 @@ static PsbcResult psbc_compile_impl(
         .address32_hi = opts->address32_hi,
         .options = opts,
         .input_semantics = &input_semantics,
+        .hull_push_use_valid = hull_push_valid,
+        .push_use_valid = push_valid,
+        .stage_push_dwords = stage_push,
+        .previous_stage_push_dwords = previous_stage_push,
+        .hull_vertex_push_dwords = hull_vertex_push,
+        .hull_control_push_dwords = hull_control_push,
     };
     memcpy(buildctx.descriptor_used_binding_mask, static_binding_mask,
            sizeof(buildctx.descriptor_used_binding_mask));
@@ -3576,6 +3899,33 @@ PsbcResult psbc_compile_domain_pipeline(
     return psbc_compile_impl(tess_eval_spirv, tess_eval_spirv_size, NULL,
                              tess_ctrl_spirv, tess_ctrl_spirv_size, NULL,
                              NULL, 0, opts, out);
+}
+
+PsbcResult psbc_compile_tess_geometry_pipeline(
+    const uint32_t *control, size_t control_size,
+    const uint32_t *evaluation, size_t evaluation_size,
+    const uint32_t *geometry, size_t geometry_size,
+    const PsbcCompileOptions *opts, PsbcShaderOutput *out)
+{
+    if(out)memset(out,0,sizeof(*out));
+    if(!out || !opts || !control || !evaluation || !geometry)
+        return PSBC_RESULT_INVALID_SPIRV;
+    if(opts->target!=PSBC_TARGET_PS5 || opts->stage!=PSBC_STAGE_GEOMETRY ||
+       !opts->ngg || !opts->patch_control_points || opts->patch_control_points>32)
+        return PSBC_RESULT_UNSUPPORTED_STAGE;
+    const PsbcResult validation=validate_spirv_capabilities(control,control_size,opts);
+    if(validation!=PSBC_RESULT_OK)return validation;
+    const PsbcResult result=psbc_compile_impl(geometry,geometry_size,NULL,evaluation,evaluation_size,
+        NULL,control,control_size,opts,out);
+    /* A compiled TES-fed GS must carry its distinct source and ring ABI.
+     * Native execution/feature promotion remains the driver's responsibility. */
+    if(result==PSBC_RESULT_OK && (!out->metadata.merged_geometry ||
+       out->metadata.merged_es_source_stage!=PSBC_STAGE_TESS_EVAL ||
+       !out->metadata.ps5_ring_table_valid)) {
+        psbc_free_output(out);
+        return PSBC_RESULT_INTERNAL_ERROR;
+    }
+    return result;
 }
 
 PsbcResult psbc_compile_nir_geometry_pipeline(
