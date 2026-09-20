@@ -567,7 +567,10 @@ struct radv_compiler_info {
       uint32_t nir_debug_info : 1;
       uint32_t ps5_global_streamout : 1;
       uint32_t ps5_fragment_view_index : 1;
-      uint32_t padding : 26;
+      /* PS5 only: deliver the ring descriptor table as user data instead of
+       * through the system-block ring_offsets at s0/s1. See load_ring(). */
+      uint32_t ps5_tess_ring_table : 1;
+      uint32_t padding : 25;
 
       int32_t force_aniso;
 

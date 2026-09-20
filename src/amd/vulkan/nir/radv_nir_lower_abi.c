@@ -31,6 +31,11 @@ load_ring(nir_builder *b, unsigned ring, lower_abi_state *s)
    struct ac_arg arg =
       b->shader->info.stage == MESA_SHADER_TASK ? s->args->task_ring_offsets : s->args->ac.ring_offsets;
 
+   /* PS5: the ring descriptor table arrives as user data, because the
+    * system-block ring_offsets at s0/s1 is not writable on that platform. */
+   if (s->args->ps5_ring_table.used)
+      arg = s->args->ps5_ring_table;
+
    nir_def *ring_offsets = ac_nir_load_arg(b, &s->args->ac, arg);
    ring_offsets = nir_pack_64_2x32_split(b, nir_channel(b, ring_offsets, 0), nir_channel(b, ring_offsets, 1));
    return ac_nir_load_smem(b, 4, ring_offsets, nir_imm_int(b, ring * 16u), 4, ACCESS_CAN_SPECULATE);
