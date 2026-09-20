@@ -444,6 +444,12 @@ nir_get_explicit_deref_range(nir_deref_instr *deref,
       nir_deref_instr *parent = nir_deref_instr_parent(deref);
 
       switch (deref->deref_type) {
+      case nir_deref_type_var:
+         if (deref->var->data.mode != nir_var_mem_push_const)
+            goto fail;
+         *out_base = base;
+         *out_range = range;
+         return;
       case nir_deref_type_array:
       case nir_deref_type_array_wildcard:
       case nir_deref_type_ptr_as_array: {
@@ -775,8 +781,21 @@ build_explicit_io_load(nir_builder *b, nir_intrinsic_instr *intrin,
        * variable so we can provide a base/range.
        */
       nir_variable *var = nir_deref_instr_get_variable(deref);
-      nir_intrinsic_set_base(load, 0);
-      nir_intrinsic_set_range(load, glsl_get_explicit_size(var->type, false));
+      unsigned base, range;
+      nir_get_explicit_deref_range(deref, addr_format, &base, &range);
+      const unsigned block_size = glsl_get_explicit_size(var->type, false);
+      if (range == ~0u || base > block_size || range > block_size - base) {
+         base = 0;
+         range = block_size;
+      }
+      /* Retain the accessed member range, including the full declared array
+       * for a dynamic index. Moving its base out of the offset preserves the
+       * effective address while keeping unrelated block members out of the
+       * shader's static push-constant dependency. */
+      if (base)
+         load->src[0] = nir_src_for_ssa(nir_iadd_imm(b, load->src[0].ssa, -(int64_t)base));
+      nir_intrinsic_set_base(load, base);
+      nir_intrinsic_set_range(load, range);
    }
 
    unsigned bit_size = intrin->def.bit_size;
