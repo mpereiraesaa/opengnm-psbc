@@ -311,6 +311,7 @@ typedef struct {
      * published program is a real merged LS/HS image rather than a control
      * half that has nothing to run with. */
     bool ls_merged;
+    bool domain_linked; /* evaluation half linked to its control half */
     const struct radv_shader_args* rargs;
     const struct ac_shader_config* config;
     enum amd_gfx_level gfx_level;
@@ -620,6 +621,44 @@ static bool fill_output_semantics(const struct radv_shader_info* info,
     }
     return metadata->output_semantic_count ==
         info->outinfo.param_exports + info->outinfo.prim_param_exports;
+}
+
+/* The GE's parameter-cache allocation, when the caller supplied the device
+ * facts. radv programs GE_PC_ALLOC for every gfx10 pre-raster pipeline, NGG or
+ * legacy, through the same ac_compute_late_alloc(); the NGG argument is the
+ * program's own shape. */
+static void publish_ge_pc_alloc(const BuildContext* ctx,
+                                PsbcShaderMetadata* metadata) {
+    if (ctx->options->ngg_device_facts) {
+        struct radeon_info facts = {0};
+        unsigned late_alloc_wave64 = 0;
+        unsigned cu_mask = 0xffff;
+        facts.gfx_level = ctx->gfx_level;
+        facts.family = ctx->family;
+        facts.pc_lines = ctx->options->ngg_pc_lines;
+        facts.min_good_cu_per_sa = ctx->options->ngg_min_good_cu_per_sa;
+        ac_compute_late_alloc(&facts, ctx->ngg, ctx->options->ngg_culling,
+                              ctx->options->ngg_uses_scratch,
+                              &late_alloc_wave64, &cu_mask);
+        uint32_t oversub_pc_lines =
+            late_alloc_wave64 ? ctx->options->ngg_pc_lines / 4 : 0;
+        if (ctx->options->ngg_culling) {
+            /* Same oversubscription factor radv applies to a culling NGG
+             * pipeline, from the exports this stage already produces. */
+            unsigned oversub_factor = 2;
+            if (ctx->rinfo->outinfo.param_exports > 4)
+                oversub_factor = 4;
+            else if (ctx->rinfo->outinfo.param_exports > 2)
+                oversub_factor = 3;
+            oversub_pc_lines *= oversub_factor;
+        }
+        metadata->linkage_ge_pc_alloc_valid = true;
+        metadata->linkage_ge_pc_alloc = (PsbcRegisterWrite) {
+            .offset = PSBC_UC_OFFSET(R_030980_GE_PC_ALLOC),
+            .value = S_030980_OVERSUB_EN(oversub_pc_lines > 0) |
+                     S_030980_NUM_PC_LINES(oversub_pc_lines - 1),
+        };
+    }
 }
 
 static uint32_t build_pa_cl_vs_out_cntl(const BuildContext* ctx,
@@ -1061,36 +1100,7 @@ static void fill_shader_metadata(const BuildContext* ctx,
             metadata->merged_esgs_ring_itemsize =
                 ctx->rinfo->ngg_info.vgt_esgs_ring_itemsize;
         }
-        if (ctx->options->ngg_device_facts) {
-            struct radeon_info facts = {0};
-            unsigned late_alloc_wave64 = 0;
-            unsigned cu_mask = 0xffff;
-            facts.gfx_level = ctx->gfx_level;
-            facts.family = ctx->family;
-            facts.pc_lines = ctx->options->ngg_pc_lines;
-            facts.min_good_cu_per_sa = ctx->options->ngg_min_good_cu_per_sa;
-            ac_compute_late_alloc(&facts, true, ctx->options->ngg_culling,
-                                  ctx->options->ngg_uses_scratch,
-                                  &late_alloc_wave64, &cu_mask);
-            uint32_t oversub_pc_lines =
-                late_alloc_wave64 ? ctx->options->ngg_pc_lines / 4 : 0;
-            if (ctx->options->ngg_culling) {
-                /* Same oversubscription factor radv applies to a culling NGG
-                 * pipeline, from the exports this stage already produces. */
-                unsigned oversub_factor = 2;
-                if (ctx->rinfo->outinfo.param_exports > 4)
-                    oversub_factor = 4;
-                else if (ctx->rinfo->outinfo.param_exports > 2)
-                    oversub_factor = 3;
-                oversub_pc_lines *= oversub_factor;
-            }
-            metadata->linkage_ge_pc_alloc_valid = true;
-            metadata->linkage_ge_pc_alloc = (PsbcRegisterWrite) {
-                .offset = PSBC_UC_OFFSET(R_030980_GE_PC_ALLOC),
-                .value = S_030980_OVERSUB_EN(oversub_pc_lines > 0) |
-                         S_030980_NUM_PC_LINES(oversub_pc_lines - 1),
-            };
-        }
+        publish_ge_pc_alloc(ctx, metadata);
         metadata_add_register(cx, cx_count, PSBC_MAX_CONTEXT_REGISTERS,
             PSBC_CX_OFFSET(R_0286C4_SPI_VS_OUT_CONFIG),
             S_0286C4_VS_EXPORT_COUNT(nparams - 1) |
@@ -1341,6 +1351,103 @@ static void fill_shader_metadata(const BuildContext* ctx,
             metadata->unresolved_fields |= PSBC_UNRESOLVED_TESS_PIPELINE;
         else
             metadata->hardware_stage = PSBC_HW_STAGE_HULL;
+        return;
+    }
+
+    if (ctx->stage == MESA_SHADER_TESS_EVAL && !ctx->ngg && ctx->domain_linked) {
+        /* The evaluation half as a LEGACY hardware vertex shader: radv's
+         * "Tessellation Evaluation Shader as VS" (radv_shader.c). The stage is
+         * fed by the tessellator through VS_EN = VS_STAGE_DS, with no ES/GS
+         * and no primitive generator, and its program lives in the VS block.
+         * radv_postprocess_config already put the TES-as-VS facts into the
+         * resource pair: VGPR_COMP_CNT for the patch/tess-coord inputs and
+         * OC_LDS_EN for the off-chip patch data.
+         *
+         * The stage enables follow radv_pipeline_generate_vgt_shader_config
+         * for a legacy tessellation pipeline on gfx9+: LS and HS on, the
+         * domain on the VS stage, DYNAMIC_HS, and the gfx9+ primgroup wave
+         * bound. The remaining context state is the legacy vertex shape's
+         * plus the three registers an NGG pipeline leaves to the engine and a
+         * legacy one must clear: GS mode off, vertex reuse on, no primitive
+         * id export. */
+        const uint32_t nparams = MAX2(ctx->rinfo->outinfo.param_exports, 1);
+        const unsigned num_pos_exports =
+            get_num_pos_exports(ctx->rinfo, NULL, NULL);
+
+        metadata->hardware_stage = PSBC_HW_STAGE_VERTEX;
+        if (!fill_output_semantics(ctx->rinfo, metadata))
+            metadata->unresolved_fields |= PSBC_UNRESOLVED_AGC_LINKAGE;
+        metadata->linkage_valid = true;
+        metadata->linkage_ge_cntl = (PsbcRegisterWrite) {
+            .offset = PSBC_UC_OFFSET(R_03096C_GE_CNTL),
+            .value = S_03096C_PRIM_GRP_SIZE_GFX10(128) |
+                     S_03096C_VERT_GRP_SIZE(256),
+        };
+        metadata->linkage_stages_en = (PsbcRegisterWrite) {
+            .offset = PSBC_CX_OFFSET(R_028B54_VGT_SHADER_STAGES_EN),
+            .value = S_028B54_LS_EN(V_028B54_LS_STAGE_ON) |
+                     S_028B54_HS_EN(V_028B54_HS_STAGE_ON) |
+                     S_028B54_VS_EN(V_028B54_VS_STAGE_DS) |
+                     S_028B54_DYNAMIC_HS(1) |
+                     S_028B54_MAX_PRIMGRP_IN_WAVE(2) |
+                     S_028B54_VS_W32_EN(ctx->rinfo->wave_size == 32),
+        };
+        metadata->linkage_user_vgpr_en = (PsbcRegisterWrite) {
+            .offset = PSBC_UC_OFFSET(R_030988_GE_USER_VGPR_EN),
+            .value = 0,
+        };
+        publish_ge_pc_alloc(ctx, metadata);
+
+        metadata_add_register(cx, cx_count, PSBC_MAX_CONTEXT_REGISTERS,
+            PSBC_CX_OFFSET(R_0286C4_SPI_VS_OUT_CONFIG),
+            S_0286C4_VS_EXPORT_COUNT(nparams - 1) |
+            S_0286C4_NO_PC_EXPORT(ctx->rinfo->outinfo.param_exports == 0));
+        metadata_add_register(cx, cx_count, PSBC_MAX_CONTEXT_REGISTERS,
+            PSBC_CX_OFFSET(R_02870C_SPI_SHADER_POS_FORMAT),
+            build_spi_shader_pos_format(num_pos_exports));
+        metadata_add_register(cx, cx_count, PSBC_MAX_CONTEXT_REGISTERS,
+            PSBC_CX_OFFSET(R_02881C_PA_CL_VS_OUT_CNTL),
+            build_pa_cl_vs_out_cntl(ctx, num_pos_exports));
+        metadata_add_register(cx, cx_count, PSBC_MAX_CONTEXT_REGISTERS,
+            PSBC_CX_OFFSET(R_028A40_VGT_GS_MODE), 0);
+        metadata_add_register(cx, cx_count, PSBC_MAX_CONTEXT_REGISTERS,
+            PSBC_CX_OFFSET(R_028AB4_VGT_REUSE_OFF), 0);
+        metadata_add_register(cx, cx_count, PSBC_MAX_CONTEXT_REGISTERS,
+            PSBC_CX_OFFSET(R_028A84_VGT_PRIMITIVEID_EN), 0);
+        /* radv_precompute_registers_hw_vs, gfx10+: "Required programming for
+         * tessellation (legacy pipeline only)". The legacy domain's wave
+         * grouping comes from this register even though no GS is present; the
+         * values are radv's, verbatim. Left at an NGG program's counts, the
+         * first legacy patch draw on this device stalled past its fence. */
+        metadata_add_register(cx, cx_count, PSBC_MAX_CONTEXT_REGISTERS,
+            PSBC_CX_OFFSET(R_028A44_VGT_GS_ONCHIP_CNTL),
+            S_028A44_ES_VERTS_PER_SUBGRP(250) |
+            S_028A44_GS_PRIMS_PER_SUBGRP(126) |
+            S_028A44_GS_INST_PRIMS_IN_SUBGRP(126));
+
+        metadata_add_register(sh, sh_count, PSBC_MAX_SHADER_REGISTERS,
+            PSBC_SH_OFFSET(R_00B120_SPI_SHADER_PGM_LO_VS), 0);
+        metadata_add_register(sh, sh_count, PSBC_MAX_SHADER_REGISTERS,
+            PSBC_SH_OFFSET(R_00B124_SPI_SHADER_PGM_HI_VS), 0);
+        metadata_add_register(sh, sh_count, PSBC_MAX_SHADER_REGISTERS,
+            PSBC_SH_OFFSET(R_00B128_SPI_SHADER_PGM_RSRC1_VS),
+            ctx->config->rsrc1);
+        metadata_add_register(sh, sh_count, PSBC_MAX_SHADER_REGISTERS,
+            PSBC_SH_OFFSET(R_00B12C_SPI_SHADER_PGM_RSRC2_VS),
+            ctx->config->rsrc2);
+        /* The gfx10 legacy-VS resource registers radv's preamble writes and
+         * this platform has nothing else to write: every CU enabled, the
+         * wave limit open, and late allocation off (the conservative
+         * ac_compute_late_alloc fallback, as for the NGG stage). */
+        metadata_add_register(sh, sh_count, PSBC_MAX_SHADER_REGISTERS,
+            PSBC_SH_OFFSET(R_00B118_SPI_SHADER_PGM_RSRC3_VS),
+            S_00B118_CU_EN(0xffff) | S_00B118_WAVE_LIMIT(0x3f));
+        metadata_add_register(sh, sh_count, PSBC_MAX_SHADER_REGISTERS,
+            PSBC_SH_OFFSET(R_00B104_SPI_SHADER_PGM_RSRC4_VS),
+            S_00B104_CU_EN(0xffff));
+        metadata_add_register(sh, sh_count, PSBC_MAX_SHADER_REGISTERS,
+            PSBC_SH_OFFSET(R_00B11C_SPI_SHADER_LATE_ALLOC_VS),
+            S_00B11C_LIMIT(0));
         return;
     }
 
@@ -2281,7 +2388,6 @@ static PsbcResult psbc_compile_impl(
     if (paired_previous &&
         ((!paired_geometry && !paired_hull && !paired_domain) ||
          (paired_geometry && !opts->ngg) || (paired_hull && opts->ngg) ||
-         (paired_domain && !opts->ngg) ||
          opts->target != PSBC_TARGET_PS5))
         return PSBC_RESULT_UNSUPPORTED_STAGE;
     if (opts->ps5_global_streamout && !paired_geometry)
@@ -2999,7 +3105,10 @@ static PsbcResult psbc_compile_impl(
     if (paired_previous)
         debug_shader_io("previous-info", previous_nir, &previous.info);
 
-    if (opts->ngg || paired_hull) {
+    /* The info link runs for every linked or NGG shape, the legacy domain
+     * included: radv_nir_shader_info_link is where the pre-raster stage's
+     * export parameters are assigned, NGG or not. */
+    if (opts->ngg || paired_hull || paired_domain) {
         struct radv_shader_stage stages[MESA_VULKAN_SHADER_STAGES] = {0};
         stages[mesa_stage] = stage;
         if (paired_previous)
@@ -3279,6 +3388,7 @@ static PsbcResult psbc_compile_impl(
         .rinfo = &binary->info,
         .es_info = paired_geometry ? &previous.info : NULL,
         .ls_merged = paired_hull,
+        .domain_linked = paired_domain,
         .rargs = &stage.args,
         .config = &binary->config,
         .nir = nir,
