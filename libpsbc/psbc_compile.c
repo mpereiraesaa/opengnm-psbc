@@ -2531,6 +2531,26 @@ static void select_linked_parameters(PsbcCompileOptions *out,
            sizeof(out->specialization_constants));
 }
 
+/* Fold the runtime fragment-coordinate selection the lowering may leave behind
+ * to the shape this standalone compile already committed to. The bit it would
+ * otherwise read comes from the PS state user SGPR, which a standalone caller
+ * does not supply; the compile's own argument map decides the same question
+ * through pos_fixed_pt. */
+static bool
+fold_use_float_frag_coord_xy(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
+{
+    if (intrin->intrinsic != nir_intrinsic_load_use_float_frag_coord_xy_amd)
+        return false;
+    const bool use_float = *(const bool *)data;
+    b->cursor = nir_before_instr(&intrin->instr);
+    if (getenv("PSBC_DEBUG_FOLD"))
+        fprintf(stderr, "PSBC_FOLD intrinsic replaced use_float=%d\n", use_float ? 1 : 0);
+    /* The intrinsic's destination is a 1-bit boolean (nir_intrinsics.py:
+     * bit_sizes=[1]), not a 32-bit integer. */
+    nir_def_replace(&intrin->def, nir_imm_bool(b, use_float));
+    return true;
+}
+
 static PsbcResult psbc_compile_impl(
     const uint32_t*       spirv,
     size_t                spirv_size,
@@ -3349,6 +3369,48 @@ static PsbcResult psbc_compile_impl(
                  gfx_state.ms.sample_shading_enable ||
                     nir->info.fs.uses_sample_shading);
 
+    /* The pass above can leave a RUNTIME selection behind: when the fragment
+     * coordinate is used as float in both components and the shader has no
+     * sample position, it emits load_use_float_frag_coord_xy_amd so a driver can
+     * pick between the interpolated coordinate and pixel_coord + 0.5 through a
+     * bit of the PS state user SGPR.
+     *
+     * A standalone compile supplies no such SGPR, and needs none: the pipeline
+     * it is compiling for already says whether the pixel stage runs once per
+     * fragment or once per sample. Per-sample shading needs the INTERPOLATED
+     * coordinate - the fixed-point one is the pixel's, never the sample's - so
+     * the selection is folded to that state HERE, before the shader-info pass
+     * and the argument map that follows it. Folding it afterwards (after
+     * radv_declare_shader_args) left POS_FIXED_PT enabled and the shader reading
+     * the pixel centre for every sample, which is exactly what the pinned
+     * min_sample_shading leaves measured: one unique colour per pixel where the
+     * oracle requires one per shaded sample. */
+    if (mesa_stage == MESA_SHADER_FRAGMENT) {
+        const bool sample_shaded = gfx_state.ms.sample_shading_enable ||
+            nir->info.fs.uses_sample_shading;
+        /* The lowering ran here, so the standalone postprocess must not run it
+         * a second time: the second run decides from what the first left and
+         * can re-emit the very selection folded below. */
+        gfx_state.frag_pos_already_lowered = true;
+        NIR_PASS(_, nir, nir_shader_intrinsics_pass, fold_use_float_frag_coord_xy,
+                 nir_metadata_control_flow, (void *)&sample_shaded);
+    }
+
+    /* The pass above can leave a RUNTIME selection behind: when the fragment
+     * coordinate is used as float in both components and the shader has no
+     * sample position, it emits load_use_float_frag_coord_xy_amd so the driver
+     * can pick between the interpolated coordinate and pixel_coord + 0.5 with
+     * a bit of the PS state user SGPR.
+     *
+     * A standalone compile has no such SGPR - and does not need one, because it
+     * already committed to one of the two shapes itself: its argument map
+     * carries pos_fixed_pt exactly when the fixed-point position is what the
+     * hardware will deliver. Fold the selection to that fact, so the branch
+     * cannot disagree with what the pipeline was built for. Measured before
+     * this: the pinned min_sample_shading leaves took the pixel-centre branch on
+     * every sample iteration because the never-written SGPR read as zero, so
+     * every sample received (0.5, 0.5) and the oracle's unique-colour count
+     * could not be satisfied. */
     radv_nir_shader_info_pass(
         &compiler_info, nir, &layout, &stage.key, &gfx_state,
         RADV_PIPELINE_GRAPHICS, false, &stage.info
