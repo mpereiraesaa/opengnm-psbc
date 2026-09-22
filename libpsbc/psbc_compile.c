@@ -3317,9 +3317,24 @@ static PsbcResult psbc_compile_impl(
     /* RADV normally lowers fragment coordinates before collecting shader
      * info.  Keep standalone compilation in that order so the PS argument
      * map enables POS_FIXED_PT when the optimization selects it. */
-    if (mesa_stage == MESA_SHADER_FRAGMENT &&
-        !gfx_state.ms.sample_shading_enable &&
-        !nir->info.fs.uses_sample_shading)
+    /* Standalone fragment compiles run the fragment-coordinate lowering
+     * UNCONDITIONALLY, exactly as the graphics pipeline path does
+     * (radv_pipeline_graphics.c: the pass is called for every fragment stage
+     * with sample_shading = state || nir->info.fs.uses_sample_shading).
+     *
+     * It used to be skipped whenever the pipeline or the shader asked for
+     * sample shading, and that skip is what this profile measured as a crash:
+     * the pass is then run later, inside radv_postprocess_nir, AFTER
+     * radv_nir_shader_info_pass has already decided the stage's arguments. A
+     * shader that reads gl_FragCoord while declaring gl_SampleID (the pinned
+     * CTS leaf min_sample_shading.min_0_0.samples_2.primitive_triangle) leaves
+     * the pass with a dynamic float/integer fragment-coordinate choice, so it
+     * emits load_use_float_frag_coord_xy_amd - and the ABI, built from the
+     * pre-lowering info, has no ps_state argument for ABI lowering to read it
+     * from. The compiler then ABORTS the process on assert(arg.used)
+     * (src/amd/common/nir/ac_nir.c ac_nir_load_arg_at_offset); that abort, not
+     * a driver refusal, is what killed the focused CTS payload. */
+    if (mesa_stage == MESA_SHADER_FRAGMENT)
         NIR_PASS(_, nir, radv_nir_lower_opt_fs_frag_pos,
                  gfx_state.vrs_may_be_enabled,
                  gfx_state.ms.sample_shading_enable ||
