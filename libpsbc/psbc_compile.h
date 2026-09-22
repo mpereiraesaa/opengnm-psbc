@@ -464,6 +464,14 @@ typedef struct {
      * bounded block and bind its 32-bit gfx1013 address in a user SGPR. */
     bool        force_indirect_push_constants;
     uint32_t    rasterization_samples; /* 0=single/default, otherwise 1/2/4/8 */
+    /* Whether the pipeline enables per-sample shading (Vulkan's
+     * sampleShadingEnable). The standalone fragment compile has to know it:
+     * radv_nir_lower_opt_fs_frag_pos chooses between the per-sample position
+     * path and the pixel-centre one from this state, and when it cannot decide
+     * it emits a runtime selection that reads the PS state user SGPR - an ABI a
+     * standalone caller does not otherwise supply. Zero keeps every earlier
+     * caller's behaviour (sample shading disabled). */
+    bool        sample_shading_enable;
     /* The pipeline's input patch size. A tessellation hull compile needs it to
      * size the LS/HS workgroup and name the patch count its launch state
      * carries; every other compile ignores it. */

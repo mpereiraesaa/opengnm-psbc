@@ -3073,6 +3073,15 @@ static PsbcResult psbc_compile_impl(
         return PSBC_RESULT_INTERNAL_ERROR;
     }
     gfx_state.ms.rasterization_samples = opts->rasterization_samples;
+    /* The pipeline's own sample-shading state. radv's graphics path fills this
+     * from the pipeline and the fragment-coordinate lowering then chooses the
+     * per-sample position path statically; a standalone caller has to say the
+     * same thing, or the lowering falls back to a runtime selection that reads
+     * the PS state user SGPR - which no standalone caller supplies, so a shader
+     * that reads gl_FragCoord gets the same coordinate for every sample
+     * iteration (measured: the pinned min_sample_shading leaves receive one
+     * unique colour per pixel where the oracle requires one per shaded sample). */
+    gfx_state.ms.sample_shading_enable = opts->sample_shading_enable;
     switch (opts->primitive_type) {
     case 0:
         break;
