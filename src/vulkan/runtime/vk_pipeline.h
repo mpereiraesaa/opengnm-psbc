@@ -24,9 +24,21 @@ vk_set_subgroup_size(nir_shader *shader,
                      bool allow_varying,
                      bool require_full)
 {
-   (void)shader; (void)subgroup_size; (void)min_subgroup_size;
-   (void)max_subgroup_size; (void)spirv_version; (void)info_pNext;
-   (void)allow_varying; (void)require_full;
+   /* The standalone compiler has no Vulkan pipeline-stage pNext chain. Honor
+    * its fixed subgroup configuration before RADV selects and lowers waves. */
+   (void)info_pNext;
+   if (subgroup_size && !allow_varying && spirv_version < 0x10600) {
+      shader->info.api_subgroup_size = subgroup_size;
+      shader->info.max_subgroup_size = subgroup_size;
+      if (require_full)
+         shader->info.min_subgroup_size = subgroup_size;
+   }
+   if (max_subgroup_size) {
+      if (shader->info.max_subgroup_size > max_subgroup_size)
+         shader->info.max_subgroup_size = max_subgroup_size;
+      if (shader->info.min_subgroup_size < min_subgroup_size)
+         shader->info.min_subgroup_size = min_subgroup_size;
+   }
 }
 
 #endif
