@@ -1,0 +1,23 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+
+#ifndef LOCAL_X
+#define LOCAL_X 64
+#endif
+#ifndef LOCAL_Y
+#define LOCAL_Y 1
+#endif
+#ifndef LOCAL_Z
+#define LOCAL_Z 1
+#endif
+
+layout(local_size_x = LOCAL_X, local_size_y = LOCAL_Y,
+       local_size_z = LOCAL_Z) in;
+layout(set = 0, binding = 0, std430) buffer Data { uint values[]; } data;
+
+void main()
+{
+    uint index = gl_LocalInvocationID.x +
+                 (gl_LocalInvocationID.y + gl_LocalInvocationID.z * 16u) * 64u;
+    data.values[index] = gl_SubgroupID;
+}

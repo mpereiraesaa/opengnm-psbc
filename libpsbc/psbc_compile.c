@@ -127,6 +127,43 @@ static bool lower_gallium_ubo_index(nir_builder* b, nir_instr* instruction,
     return true;
 }
 
+/* PS5 is GFX10_1 hardware, but this standalone compiler uses GFX10_3/NAVI21
+ * granularity for ACO. The latter reads subgroup ID from the GFX10_3 TG_SIZE
+ * wave-ID field, which the PS5 compute dispatch does not supply. Form the
+ * index from the local invocation coordinates instead. This also works for
+ * 2D/3D workgroups and does not depend on a dispatch packet's wave-ID field. */
+static bool lower_ps5_compute_subgroup_id(nir_builder* b, nir_instr* instruction,
+                                           void* data) {
+    if (instruction->type != nir_instr_type_intrinsic)
+        return false;
+    nir_intrinsic_instr* intrinsic = nir_instr_as_intrinsic(instruction);
+    if (intrinsic->intrinsic != nir_intrinsic_load_subgroup_id)
+        return false;
+    const unsigned wave_size = *(const unsigned*)data;
+    if (wave_size != 32 && wave_size != 64)
+        return false;
+
+    b->cursor = nir_before_instr(instruction);
+    nir_def* local = nir_load_local_invocation_id(b);
+    nir_def* x = nir_channel(b, local, 0);
+    nir_def* y = nir_channel(b, local, 1);
+    nir_def* z = nir_channel(b, local, 2);
+    nir_def* width;
+    nir_def* height;
+    if (b->shader->info.workgroup_size_variable) {
+        nir_def* size = nir_load_workgroup_size(b);
+        width = nir_channel(b, size, 0);
+        height = nir_channel(b, size, 1);
+    } else {
+        width = nir_imm_int(b, b->shader->info.workgroup_size[0]);
+        height = nir_imm_int(b, b->shader->info.workgroup_size[1]);
+    }
+    nir_def* index = nir_iadd(b, x, nir_imul(b, width,
+                           nir_iadd(b, y, nir_imul(b, height, z))));
+    nir_def_replace(&intrinsic->def, nir_udiv_imm(b, index, wave_size));
+    return true;
+}
+
 /* === Mesa stage mapping === */
 
 static mesa_shader_stage psbc_to_mesa_stage(PsbcStage s) {
@@ -2389,6 +2426,12 @@ static nir_shader* prepare_stage_nir(
     if (!nir)
         return NULL;
 
+    if (opts->target == PSBC_TARGET_PS5 && nir->info.stage == MESA_SHADER_COMPUTE) {
+        const unsigned wave_size = compiler_info->key.cs_wave_size;
+        nir_shader_instructions_pass(nir, lower_ps5_compute_subgroup_id,
+                                     nir_metadata_control_flow, (void*)&wave_size);
+    }
+
     /* Indirect array lowering can replace the distance variables with
      * temporaries before gather_info runs again. Preserve their declared
      * widths from the normalized entry-point interface, not the surviving
@@ -2745,6 +2788,13 @@ static PsbcResult psbc_compile_impl(
     compiler_info.key.ps_wave_size = (gfxlevel >= GFX10_3) ? 32 : 64;
     compiler_info.key.cs_wave_size = (gfxlevel >= GFX10_3) ? 32 : 64;
     compiler_info.key.rt_wave_size = 64;
+    if (opts->target == PSBC_TARGET_PS5 && opts->stage == PSBC_STAGE_COMPUTE) {
+        /* Dispatch uses wave32. Keep NIR's subgroup arithmetic and ACO's
+         * selected wave size in agreement even for wide subgroup intrinsics. */
+        compiler_info.subgroup_size = 32;
+        compiler_info.min_subgroup_size = 32;
+        compiler_info.max_subgroup_size = 32;
+    }
     compiler_info.key.family = chipfamily;
     compiler_info.key.load_grid_size_from_user_sgpr = (gfxlevel >= GFX10_3);
     compiler_info.key.use_ngg = opts->ngg;
