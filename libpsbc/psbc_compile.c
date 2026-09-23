@@ -2788,6 +2788,13 @@ static PsbcResult psbc_compile_impl(
     compiler_info.key.ps_wave_size = (gfxlevel >= GFX10_3) ? 32 : 64;
     compiler_info.key.cs_wave_size = (gfxlevel >= GFX10_3) ? 32 : 64;
     compiler_info.key.rt_wave_size = 64;
+    if (opts->target == PSBC_TARGET_PS5 && opts->stage == PSBC_STAGE_COMPUTE) {
+        /* Dispatch uses wave32. Keep NIR's subgroup arithmetic and ACO's
+         * selected wave size in agreement even for wide subgroup intrinsics. */
+        compiler_info.subgroup_size = 32;
+        compiler_info.min_subgroup_size = 32;
+        compiler_info.max_subgroup_size = 32;
+    }
     compiler_info.key.family = chipfamily;
     compiler_info.key.load_grid_size_from_user_sgpr = (gfxlevel >= GFX10_3);
     compiler_info.key.use_ngg = opts->ngg;
