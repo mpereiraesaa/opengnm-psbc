@@ -488,6 +488,9 @@ typedef struct {
     bool        enable_uniform_and_storage_buffer_8bit_access;
     bool        enable_storage_buffer_16bit_access;
     bool        enable_uniform_and_storage_buffer_16bit_access;
+    bool        enable_physical_storage_buffer_addresses;
+    bool        enable_vulkan_memory_model;
+    bool        enable_vulkan_memory_model_device_scope;
     /* Derive the used descriptor sets, and the used bindings inside them, from
      * the optimized NIR instead of treating every layout binding as used.  A
      * caller that supplies legacy texture indices carrying no Vulkan deref must

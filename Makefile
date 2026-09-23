@@ -48,6 +48,16 @@ test-storage-widths: $(LIBPSBC)
 	$(CC) -std=c11 -Wall -Wextra -Werror -Ilibpsbc tests/test_storage_widths.c $(LIBPSBC) -lstdc++ -lm -lpthread -o tests/test_storage_widths
 	./tests/test_storage_widths
 
+.PHONY: test-t08-capabilities
+test-t08-capabilities: $(LIBPSBC)
+	mkdir -p build
+	$(GLSLANG) -V --target-env vulkan1.1 tests/t08_address.comp -o tests/t08_address.comp.spv
+	$(GLSLANG) -V --target-env vulkan1.1 tests/t08_memory_model_queue.comp -o tests/t08_memory_model_queue.comp.spv
+	$(GLSLANG) -V --target-env vulkan1.1 tests/t08_memory_model.comp -o tests/t08_memory_model.comp.spv
+	$(CC) -std=c11 -Wall -Wextra -Werror -Ilibpsbc tests/test_t08_capabilities.c $(LIBPSBC) -lstdc++ -lm -lpthread -o build/test_t08_capabilities
+	PSBC_DEBUG_NIR=1 ./build/test_t08_capabilities 2>build/t08_capabilities.nir.log
+	$(PYTHON) tests/verify_t08_nir.py build/t08_capabilities.nir.log
+
 .PHONY: test-draw-id
 test-draw-id: $(LIBPSBC)
 	# DrawIndex is a Vulkan 1.1 feature; the positive source reads it and the
