@@ -2539,6 +2539,15 @@ static PsbcResult validate_spirv_capabilities(
             case SpvCapabilityUniformAndStorageBuffer16BitAccess:
                 enabled = opts->enable_uniform_and_storage_buffer_16bit_access;
                 break;
+            case SpvCapabilityPhysicalStorageBufferAddresses:
+                enabled = opts->enable_physical_storage_buffer_addresses;
+                break;
+            case SpvCapabilityVulkanMemoryModel:
+                enabled = opts->enable_vulkan_memory_model;
+                break;
+            case SpvCapabilityVulkanMemoryModelDeviceScope:
+                enabled = opts->enable_vulkan_memory_model_device_scope;
+                break;
             default:
                 break;
             }
@@ -2618,7 +2627,9 @@ static PsbcResult psbc_compile_impl(
     if ((opts->enable_uniform_and_storage_buffer_8bit_access &&
          !opts->enable_storage_buffer_8bit_access) ||
         (opts->enable_uniform_and_storage_buffer_16bit_access &&
-         !opts->enable_storage_buffer_16bit_access))
+         !opts->enable_storage_buffer_16bit_access) ||
+        (opts->enable_vulkan_memory_model_device_scope &&
+         !opts->enable_vulkan_memory_model))
         return PSBC_RESULT_INTERNAL_ERROR;
 
     /* Validate SPIR-V structure and opt-in capabilities before Mesa lowering.
@@ -2770,6 +2781,12 @@ static PsbcResult psbc_compile_impl(
         opts->enable_storage_buffer_16bit_access;
     compiler_info.spirv_caps.StorageUniform16 =
         opts->enable_uniform_and_storage_buffer_16bit_access;
+    compiler_info.spirv_caps.PhysicalStorageBufferAddresses =
+        opts->enable_physical_storage_buffer_addresses;
+    compiler_info.spirv_caps.VulkanMemoryModel =
+        opts->enable_vulkan_memory_model;
+    compiler_info.spirv_caps.VulkanMemoryModelDeviceScope =
+        opts->enable_vulkan_memory_model_device_scope;
     if (opts->force_accelerated_dot) {
         compiler_info.spirv_caps.Int16 = true;
         compiler_info.spirv_caps.DotProductInputAll = true;
