@@ -145,7 +145,12 @@ struct radv_graphics_state_key {
    uint32_t enable_remove_point_size : 1;
    uint32_t unknown_rast_prim : 1;
    uint32_t dcc_decompress_gfx11 : 1;
-   uint32_t reserved : 12;
+   /* Standalone compilation lowers fragment coordinates exactly once, in its
+    * pre-pass, so the shader and the argument map built from it agree and the
+    * postprocess pass must not re-decide the shape (it would re-emit the PS
+    * state runtime selection the pre-pass already folded away). */
+   uint32_t frag_pos_already_lowered : 1;
+   uint32_t reserved : 11;
 
    struct {
       uint8_t topology;
