@@ -163,6 +163,8 @@ typedef enum {
      * subpassLoad: eight DWORDs, exactly like a sampled T# but with no
      * sampler words, so it is never conflated with a combined T#/S# pair. */
     PSBC_DESCRIPTOR_INPUT_ATTACHMENT,
+    /* Eight-DWORD resource-only UAV record; no sampler words. */
+    PSBC_DESCRIPTOR_STORAGE_IMAGE,
 } PsbcDescriptorType;
 
 typedef struct {

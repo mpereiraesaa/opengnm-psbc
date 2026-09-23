@@ -96,6 +96,12 @@ test-descriptor-static-use: $(LIBPSBC)
 	$(CC) -std=c11 -Wall -Wextra -Werror -Ilibpsbc tests/test_descriptor_static_use.c $(LIBPSBC) -lstdc++ -lm -lpthread -o tests/test_descriptor_static_use
 	./tests/test_descriptor_static_use
 
+.PHONY: test-storage-image
+test-storage-image: $(LIBPSBC)
+	$(GLSLANG) -V --target-env vulkan1.0 tests/storage_image.comp -o tests/storage_image.spv
+	$(CC) -std=c11 -Wall -Wextra -Werror -Ilibpsbc tests/test_storage_image.c $(LIBPSBC) -lstdc++ -lm -lpthread -o tests/test_storage_image
+	./tests/test_storage_image
+
 .PHONY: test-tessellation-gap
 test-tessellation-gap: $(LIBPSBC)
 	# The tessellation stages compile to ISA but must report the explicit

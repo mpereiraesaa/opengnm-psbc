@@ -2719,7 +2719,8 @@ static PsbcResult psbc_compile_impl(
             binding->type == PSBC_DESCRIPTOR_UNIFORM_TEXEL_BUFFER ||
             binding->type == PSBC_DESCRIPTOR_COMBINED_IMAGE_SAMPLER ||
             binding->type == PSBC_DESCRIPTOR_STORAGE_BUFFER ||
-            binding->type == PSBC_DESCRIPTOR_INPUT_ATTACHMENT;
+            binding->type == PSBC_DESCRIPTOR_INPUT_ATTACHMENT ||
+            binding->type == PSBC_DESCRIPTOR_STORAGE_IMAGE;
         /* The driver lays every record out in whole DWORDs: sixteen bytes for
          * the buffer SRDs, forty-eight for a combined T#/S# pair and
          * thirty-two for the resource-only image record an input attachment
@@ -2730,7 +2731,8 @@ static PsbcResult psbc_compile_impl(
          * width disagrees with its type. */
         const uint32_t expected_stride =
             binding->type == PSBC_DESCRIPTOR_COMBINED_IMAGE_SAMPLER ? 48u
-            : binding->type == PSBC_DESCRIPTOR_INPUT_ATTACHMENT ? 32u : 16u;
+            : (binding->type == PSBC_DESCRIPTOR_INPUT_ATTACHMENT ||
+               binding->type == PSBC_DESCRIPTOR_STORAGE_IMAGE) ? 32u : 16u;
         if (binding->set >= PSBC_MAX_DESCRIPTOR_SETS ||
             binding->binding >= PSBC_MAX_DESCRIPTOR_BINDINGS ||
             !valid_type || !binding->array_size ||
@@ -3121,6 +3123,8 @@ static PsbcResult psbc_compile_impl(
                                ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
                            : source->type == PSBC_DESCRIPTOR_INPUT_ATTACHMENT
                                ? VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT
+                           : source->type == PSBC_DESCRIPTOR_STORAGE_IMAGE
+                               ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
                                : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
             target->array_size = source->array_size;
             target->offset = source->offset;
