@@ -990,7 +990,8 @@ radv_lower_ngg(const struct radv_compiler_info *compiler_info, struct radv_shade
       ngg_stage->nir->info.stage == MESA_SHADER_GEOMETRY &&
       ngg_stage->nir->xfb_info;
 
-   if (use_primitive_id_streamout) {
+   /* The ordered no-GDS capture reads each workgroup's first primitive id. */
+   if (use_primitive_id_streamout || use_ps5_global_streamout) {
       ngg_stage->info.uses_prim_id = true;
       BITSET_SET(ngg_stage->nir->info.system_values_read,
                  SYSTEM_VALUE_PRIMITIVE_ID);
