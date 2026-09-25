@@ -1,0 +1,21 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+
+#ifndef LOCAL_X
+#define LOCAL_X 16
+#endif
+#ifndef LOCAL_Y
+#define LOCAL_Y 4
+#endif
+
+/* LocalInvocationIndex and NumSubgroups must not come from TG_SIZE, which the
+ * PS5 compute dispatch does not populate (see lower_ps5_compute_subgroup_id). */
+layout(local_size_x = LOCAL_X, local_size_y = LOCAL_Y) in;
+layout(set = 0, binding = 0, std430) buffer Data { uint values[]; } data;
+
+void main()
+{
+    uint index = gl_LocalInvocationIndex;
+    data.values[index * 2u] = gl_NumSubgroups;
+    data.values[index * 2u + 1u] = gl_SubgroupID;
+}
