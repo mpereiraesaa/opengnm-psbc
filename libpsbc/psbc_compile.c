@@ -2720,7 +2720,10 @@ static PsbcResult psbc_compile_impl(
             binding->type == PSBC_DESCRIPTOR_COMBINED_IMAGE_SAMPLER ||
             binding->type == PSBC_DESCRIPTOR_STORAGE_BUFFER ||
             binding->type == PSBC_DESCRIPTOR_INPUT_ATTACHMENT ||
-            binding->type == PSBC_DESCRIPTOR_STORAGE_IMAGE;
+            binding->type == PSBC_DESCRIPTOR_STORAGE_IMAGE ||
+            binding->type == PSBC_DESCRIPTOR_SAMPLER ||
+            binding->type == PSBC_DESCRIPTOR_SAMPLED_IMAGE ||
+            binding->type == PSBC_DESCRIPTOR_STORAGE_TEXEL_BUFFER;
         /* The driver lays every record out in whole DWORDs: sixteen bytes for
          * the buffer SRDs, forty-eight for a combined T#/S# pair and
          * thirty-two for the resource-only image record an input attachment
@@ -2728,11 +2731,13 @@ static PsbcResult psbc_compile_impl(
          * record declared with any other stride - a combined T#/S# presented
          * as an input attachment in particular - is refused instead of being
          * reinterpreted, so the caller can never hand the GPU a slot whose
-         * width disagrees with its type. */
+         * width disagrees with its type. A separate sampler is one
+         * four-DWORD S# and a separate sampled image one eight-DWORD T#. */
         const uint32_t expected_stride =
             binding->type == PSBC_DESCRIPTOR_COMBINED_IMAGE_SAMPLER ? 48u
             : (binding->type == PSBC_DESCRIPTOR_INPUT_ATTACHMENT ||
-               binding->type == PSBC_DESCRIPTOR_STORAGE_IMAGE) ? 32u : 16u;
+               binding->type == PSBC_DESCRIPTOR_STORAGE_IMAGE ||
+               binding->type == PSBC_DESCRIPTOR_SAMPLED_IMAGE) ? 32u : 16u;
         if (binding->set >= PSBC_MAX_DESCRIPTOR_SETS ||
             binding->binding >= PSBC_MAX_DESCRIPTOR_BINDINGS ||
             !valid_type || !binding->array_size ||
@@ -3125,6 +3130,12 @@ static PsbcResult psbc_compile_impl(
                                ? VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT
                            : source->type == PSBC_DESCRIPTOR_STORAGE_IMAGE
                                ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
+                           : source->type == PSBC_DESCRIPTOR_SAMPLER
+                               ? VK_DESCRIPTOR_TYPE_SAMPLER
+                           : source->type == PSBC_DESCRIPTOR_SAMPLED_IMAGE
+                               ? VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE
+                           : source->type == PSBC_DESCRIPTOR_STORAGE_TEXEL_BUFFER
+                               ? VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER
                                : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
             target->array_size = source->array_size;
             target->offset = source->offset;

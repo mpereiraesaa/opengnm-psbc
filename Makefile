@@ -102,6 +102,18 @@ test-storage-image: $(LIBPSBC)
 	$(CC) -std=c11 -Wall -Wextra -Werror -Ilibpsbc tests/test_storage_image.c $(LIBPSBC) -lstdc++ -lm -lpthread -o tests/test_storage_image
 	./tests/test_storage_image
 
+.PHONY: test-separate-sampler
+test-separate-sampler: $(LIBPSBC)
+	# DXVK's DXBC form: SAMPLER + SAMPLED_IMAGE combined by OpSampledImage,
+	# plus uniform and storage texel buffers. The NIR must read the S# at
+	# the sampler's own offset and the T#/V# records from their offsets.
+	@mkdir -p build
+	$(GLSLANG) -V --target-env vulkan1.0 tests/separate_sampler.comp -o tests/separate_sampler.comp.spv
+	$(GLSLANG) -V --target-env vulkan1.0 tests/separate_sampler.frag -o tests/separate_sampler.frag.spv
+	$(CC) -std=c11 -Wall -Wextra -Werror -Ilibpsbc tests/test_separate_sampler.c $(LIBPSBC) -lstdc++ -lm -lpthread -o tests/test_separate_sampler
+	PSBC_DEBUG_NIR=1 ./tests/test_separate_sampler tests/separate_sampler.comp.spv tests/separate_sampler.frag.spv 2>build/separate_sampler.nir.log
+	$(PYTHON) tests/verify_separate_sampler_nir.py build/separate_sampler.nir.log
+
 .PHONY: test-tessellation-gap
 test-tessellation-gap: $(LIBPSBC)
 	# The tessellation stages compile to ISA but must report the explicit

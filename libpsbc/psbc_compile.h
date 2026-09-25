@@ -165,6 +165,14 @@ typedef enum {
     PSBC_DESCRIPTOR_INPUT_ATTACHMENT,
     /* Eight-DWORD resource-only UAV record; no sampler words. */
     PSBC_DESCRIPTOR_STORAGE_IMAGE,
+    /* Separate descriptors, combined in the shader with OpSampledImage (the
+     * form DXVK's DXBC translation emits for every D3D sample): a
+     * four-DWORD S# record and an eight-DWORD sampled T# record. */
+    PSBC_DESCRIPTOR_SAMPLER,
+    PSBC_DESCRIPTOR_SAMPLED_IMAGE,
+    /* Four-DWORD typed buffer V# written or read through imageStore /
+     * imageLoad on a Buffer-dimension storage image. */
+    PSBC_DESCRIPTOR_STORAGE_TEXEL_BUFFER,
 } PsbcDescriptorType;
 
 typedef struct {

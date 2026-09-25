@@ -102,6 +102,12 @@ static PsbcDescriptorType parse_descriptor_type(const char* name) {
 		return PSBC_DESCRIPTOR_COMBINED_IMAGE_SAMPLER;
 	if (!strcmp(name, "storage_buffer"))
 		return PSBC_DESCRIPTOR_STORAGE_BUFFER;
+	if (!strcmp(name, "sampler"))
+		return PSBC_DESCRIPTOR_SAMPLER;
+	if (!strcmp(name, "sampled_image"))
+		return PSBC_DESCRIPTOR_SAMPLED_IMAGE;
+	if (!strcmp(name, "storage_texel_buffer"))
+		return PSBC_DESCRIPTOR_STORAGE_TEXEL_BUFFER;
 	return PSBC_DESCRIPTOR_NONE;
 }
 
