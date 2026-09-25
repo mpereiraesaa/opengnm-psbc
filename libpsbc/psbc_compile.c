@@ -137,13 +137,36 @@ static bool lower_ps5_compute_subgroup_id(nir_builder* b, nir_instr* instruction
     if (instruction->type != nir_instr_type_intrinsic)
         return false;
     nir_intrinsic_instr* intrinsic = nir_instr_as_intrinsic(instruction);
-    if (intrinsic->intrinsic != nir_intrinsic_load_subgroup_id)
+    if (intrinsic->intrinsic != nir_intrinsic_load_subgroup_id &&
+        intrinsic->intrinsic != nir_intrinsic_load_local_invocation_index &&
+        intrinsic->intrinsic != nir_intrinsic_load_num_subgroups)
         return false;
     const unsigned wave_size = *(const unsigned*)data;
     if (wave_size != 32 && wave_size != 64)
         return false;
 
     b->cursor = nir_before_instr(instruction);
+    /* The same TG_SIZE register also feeds ACO's LocalInvocationIndex (wave
+     * ID * wave size + lane) and NumSubgroups (wave count) lowerings, so
+     * both come from the local invocation coordinates and the workgroup
+     * size too. */
+    if (intrinsic->intrinsic == nir_intrinsic_load_num_subgroups) {
+        nir_def* invocations;
+        if (b->shader->info.workgroup_size_variable) {
+            nir_def* size = nir_load_workgroup_size(b);
+            invocations = nir_imul(b, nir_channel(b, size, 0),
+                                   nir_imul(b, nir_channel(b, size, 1),
+                                            nir_channel(b, size, 2)));
+        } else {
+            invocations = nir_imm_int(b, b->shader->info.workgroup_size[0] *
+                                         b->shader->info.workgroup_size[1] *
+                                         b->shader->info.workgroup_size[2]);
+        }
+        nir_def_replace(&intrinsic->def,
+                        nir_udiv_imm(b, nir_iadd_imm(b, invocations, wave_size - 1),
+                                     wave_size));
+        return true;
+    }
     nir_def* local = nir_load_local_invocation_id(b);
     nir_def* x = nir_channel(b, local, 0);
     nir_def* y = nir_channel(b, local, 1);
@@ -160,7 +183,9 @@ static bool lower_ps5_compute_subgroup_id(nir_builder* b, nir_instr* instruction
     }
     nir_def* index = nir_iadd(b, x, nir_imul(b, width,
                            nir_iadd(b, y, nir_imul(b, height, z))));
-    nir_def_replace(&intrinsic->def, nir_udiv_imm(b, index, wave_size));
+    nir_def_replace(&intrinsic->def,
+                    intrinsic->intrinsic == nir_intrinsic_load_local_invocation_index ?
+                    index : nir_udiv_imm(b, index, wave_size));
     return true;
 }
 

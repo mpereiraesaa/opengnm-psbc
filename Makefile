@@ -46,6 +46,10 @@ test-subgroup-id: $(LIBPSBC)
 	$(CC) -std=c11 -Wall -Wextra -Werror -Ilibpsbc tests/test_subgroup_id.c $(LIBPSBC) -lstdc++ -lm -lpthread -o tests/test_subgroup_id
 	PSBC_DEBUG_NIR=1 ./tests/test_subgroup_id tests/subgroup-id-1d.spv tests/subgroup-id-2d.spv tests/subgroup-id-3d.spv 2>tests/subgroup-id.nir.log
 	$(PYTHON) -c 'from pathlib import Path; s=Path("tests/subgroup-id.nir.log").read_text(); blocks=s.split("shader: MESA_SHADER_COMPUTE")[1:]; assert len(blocks)==3; assert all("api_subgroup_size: 32" in b and "@load_vector_arg_amd" in b and "ushr" in b and "load_subgroup_id" not in b for b in blocks)'
+	$(GLSLANG) -V --target-env vulkan1.1 -DLOCAL_X=16 -DLOCAL_Y=4 tests/local-index.comp -o tests/local-index-2d.spv
+	$(GLSLANG) -V --target-env vulkan1.1 -DLOCAL_X=96 -DLOCAL_Y=1 tests/local-index.comp -o tests/local-index-1d.spv
+	PSBC_DEBUG_NIR=1 ./tests/test_subgroup_id tests/local-index-2d.spv tests/local-index-1d.spv tests/local-index-2d.spv 2>tests/local-index.nir.log
+	$(PYTHON) -c 'from pathlib import Path; s=Path("tests/local-index.nir.log").read_text(); blocks=s.split("shader: MESA_SHADER_COMPUTE")[1:]; assert len(blocks)==3; import re; assert all(len(set(re.findall("load_scalar_arg_amd [(]base=([0-9]+)", b))) == 1 and "load_num_subgroups" not in b and "load_local_invocation_index" not in b for b in blocks), "compute index or wave count reads a scalar argument (TG_SIZE)"'
 
 test-storage-widths: $(LIBPSBC)
 	# Vulkan 1.1 makes the StorageBuffer storage class core, which lets this
