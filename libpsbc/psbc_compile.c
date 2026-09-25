@@ -2383,6 +2383,8 @@ static nir_shader* prepare_stage_nir(
     stage->spirv.size = spirv_size;
     stage->entrypoint = opts->entrypoint ? opts->entrypoint : "main";
     stage->key.optimisations_disabled = !opts->optimise;
+    stage->key.storage_robustness2 = opts->robust_buffer_access2;
+    stage->key.uniform_robustness2 = opts->robust_buffer_access2;
 
     VkSpecializationMapEntry
         spec_entries[PSBC_MAX_SPECIALIZATION_CONSTANTS] = {0};

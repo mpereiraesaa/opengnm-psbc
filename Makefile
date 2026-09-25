@@ -96,6 +96,12 @@ test-descriptor-static-use: $(LIBPSBC)
 	$(CC) -std=c11 -Wall -Wextra -Werror -Ilibpsbc tests/test_descriptor_static_use.c $(LIBPSBC) -lstdc++ -lm -lpthread -o tests/test_descriptor_static_use
 	./tests/test_descriptor_static_use
 
+.PHONY: test-robust-buffer-access2
+test-robust-buffer-access2: $(LIBPSBC)
+	$(GLSLANG) -V --target-env vulkan1.0 tests/robust_buffer_access2.comp -o tests/robust_buffer_access2.spv
+	$(CC) -std=c11 -Wall -Wextra -Werror -Ilibpsbc tests/test_robust_buffer_access2.c $(LIBPSBC) -lstdc++ -lm -lpthread -o tests/test_robust_buffer_access2
+	./tests/test_robust_buffer_access2 tests/robust_buffer_access2.spv
+
 .PHONY: test-storage-image
 test-storage-image: $(LIBPSBC)
 	$(GLSLANG) -V --target-env vulkan1.0 tests/storage_image.comp -o tests/storage_image.spv

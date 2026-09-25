@@ -530,6 +530,14 @@ typedef struct {
     uint32_t    ngg_min_good_cu_per_sa; /* radeon_info::min_good_cu_per_sa */
     bool        ngg_culling;            /* info->has_ngg_culling */
     bool        ngg_uses_scratch;       /* scratch_bytes_per_wave > 0 */
+    /* VK_EXT_robustness2 robustBufferAccess2 is enabled on the caller's
+     * device. RADV then sets storage_robustness2 and uniform_robustness2 in
+     * the stage key, which makes nir_opt_load_store_vectorize treat SSBO and
+     * UBO accesses as robust: two loads are not combined when the offset
+     * addition of the combined access could wrap, because the hardware would
+     * then bounds-check the high half against the wrapped low offset. Default
+     * false keeps the robustBufferAccess (1.0) behaviour. */
+    bool        robust_buffer_access2;
 } PsbcCompileOptions;
 
 /* === API === */
