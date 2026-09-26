@@ -16,6 +16,9 @@
 
 using namespace aco;
 
+extern "C" __attribute__((weak)) void psbc_stage_hook(const char* label);
+#define ACO_STAGE(label) do { if (psbc_stage_hook) psbc_stage_hook(label); } while (0)
+
 namespace {
 
 static void
@@ -70,6 +73,7 @@ aco_postprocess_shader(const struct aco_compiler_options* options,
    ASSERTED bool is_valid = validate_cfg(program.get());
    assert(is_valid);
 
+   ACO_STAGE("aco-dominator");
    dominator_tree(program.get());
    if (program->should_repair_ssa)
       repair_ssa(program.get());
@@ -94,13 +98,16 @@ aco_postprocess_shader(const struct aco_compiler_options* options,
 
    /* cleanup and exec mask handling */
    setup_reduce_temp(program.get());
+   ACO_STAGE("aco-exec-mask");
    insert_exec_mask(program.get());
    validate(program.get());
 
    /* spilling and scheduling */
+   ACO_STAGE("aco-live-vars");
    live_var_analysis(program.get());
    if (program->collect_statistics)
       collect_presched_stats(program.get());
+   ACO_STAGE("aco-spill");
    spill(program.get());
 
    if (options->record_ir) {
@@ -126,6 +133,7 @@ aco_postprocess_shader(const struct aco_compiler_options* options,
    validate(program.get());
 
    /* Register Allocation */
+   ACO_STAGE("aco-ra");
    register_allocation(program.get());
 
    if ((debug_flags & DEBUG_VALIDATE_RA) && validate_ra(program.get())) {
@@ -146,6 +154,7 @@ aco_postprocess_shader(const struct aco_compiler_options* options,
    spill_preserved(program.get());
 
    /* Lower to HW Instructions */
+   ACO_STAGE("aco-ssa-elim");
    ssa_elimination(program.get());
    lower_to_hw_instr(program.get());
    lower_branches(program.get());
@@ -163,6 +172,7 @@ aco_postprocess_shader(const struct aco_compiler_options* options,
    if (program->needs_fp_mode_insertion)
       insert_fp_mode(program.get());
 
+   ACO_STAGE("aco-waitcnt");
    insert_waitcnt(program.get());
    insert_NOPs(program.get());
    if (program->gfx_level >= GFX11)
@@ -242,6 +252,7 @@ aco_compile_shader(const struct aco_compiler_options* options, const struct aco_
    memset(&program->statistics, 0, sizeof(program->statistics));
 
    /* Instruction Selection */
+   ACO_STAGE("aco-isel");
    select_program(program.get(), shader_count, shaders, &config, options, info, args);
 
    std::string llvm_ir = aco_postprocess_shader(options, program);
@@ -253,6 +264,7 @@ aco_compile_shader(const struct aco_compiler_options* options, const struct aco_
     * so only last part need the s_endpgm instruction.
     */
    bool append_endpgm = !(options->is_opengl && info->ps.has_epilog);
+   ACO_STAGE("aco-emit");
    unsigned exec_size = emit_program(program.get(), code, &symbols, append_endpgm);
 
    if (program->collect_statistics)

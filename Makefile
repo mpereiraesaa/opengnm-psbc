@@ -60,6 +60,11 @@ test-storage-widths: $(LIBPSBC)
 	$(CC) -std=c11 -Wall -Wextra -Werror -Ilibpsbc tests/test_storage_widths.c $(LIBPSBC) -lstdc++ -lm -lpthread -o tests/test_storage_widths
 	./tests/test_storage_widths
 
+.PHONY: test-aco-arena
+test-aco-arena:
+	$(CXX) -std=c++17 -O1 -g -DUTIL_ARCH_LITTLE_ENDIAN=1 -DUTIL_ARCH_BIG_ENDIAN=0 -Iinclude -Iinclude/mesa -Isrc -Isrc/amd/compiler -Isrc/amd/common -Isrc/compiler -Isrc/util tests/test_aco_arena.cpp -ldl -o tests/test_aco_arena
+	./tests/test_aco_arena
+
 .PHONY: test-t08-capabilities
 test-t08-capabilities: $(LIBPSBC)
 	mkdir -p build

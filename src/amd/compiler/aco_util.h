@@ -13,6 +13,8 @@
 #include "util/u_math.h"
 
 #include <array>
+#include <cerrno>
+#include <cstdio>
 #include <cassert>
 #include <cstddef>
 #include <functional>
@@ -228,6 +230,23 @@ private:
  * The memory resource is not thread-safe.
  * This class mimics std::pmr::monotonic_buffer_resource
  */
+} /* namespace aco */
+extern "C" __attribute__((weak)) void psbc_stage_hook(const char* label);
+namespace aco {
+/* An arena block could not be allocated. Instructions and other IR live in
+ * these blocks, so there is no way to continue the compile: report the size
+ * through the embedder's stage hook (when present) and stop, instead of
+ * writing through a null block. */
+[[noreturn]] static inline void aco_arena_exhausted(size_t size)
+{
+   char text[96];
+   snprintf(text, sizeof(text), "arena-exhausted %zu errno=%d", size, errno);
+   if (psbc_stage_hook)
+      psbc_stage_hook(text);
+   fprintf(stderr, "ACO: %s\n", text);
+   abort();
+}
+
 class monotonic_buffer_resource final {
 public:
    explicit monotonic_buffer_resource(size_t size = initial_size)
@@ -237,6 +256,8 @@ public:
        */
       size = MAX2(size, minimum_size);
       buffer = (Buffer*)malloc(size);
+      if (!buffer)
+         aco_arena_exhausted(size);
       buffer->next = nullptr;
       buffer->data_size = size - sizeof(Buffer);
       buffer->current_idx = 0;
@@ -273,13 +294,18 @@ public:
          return ptr;
       }
 
-      /* create new larger buffer */
+      /* create new larger buffer: doubling, but never past maximum_block_size
+       * unless one allocation needs more, so a large program is held in many
+       * modest blocks instead of ever larger contiguous ones (a console heap
+       * can refuse a 1 MiB block long before it is out of memory). */
       size_t total_size = buffer->data_size + sizeof(Buffer);
-      do {
+      total_size = MIN2(total_size * 2, maximum_block_size);
+      while (total_size - sizeof(Buffer) < size)
          total_size *= 2;
-      } while (total_size - sizeof(Buffer) < size);
       Buffer* next = buffer;
       buffer = (Buffer*)malloc(total_size);
+      if (!buffer)
+         aco_arena_exhausted(total_size);
       buffer->next = next;
       buffer->data_size = total_size - sizeof(Buffer);
       buffer->current_idx = 0;
@@ -324,6 +350,8 @@ public:
          total_size *= 2;
       } while (total_size - sizeof(Buffer) < size);
       buffer = (Buffer*)malloc(total_size);
+      if (!buffer)
+         aco_arena_exhausted(total_size);
       buffer->next = NULL;
       buffer->data_size = total_size - sizeof(Buffer);
       buffer->current_idx = 0;
@@ -341,6 +369,7 @@ private:
 
    Buffer* buffer;
    static constexpr size_t initial_size = 4096;
+   static constexpr size_t maximum_block_size = 256 * 1024;
    static constexpr size_t minimum_size = 128;
    static_assert(minimum_size > sizeof(Buffer));
 };
@@ -1237,12 +1266,17 @@ public:
       if (n > capacity) {
          if constexpr (std::is_trivial<T>::value) {
             if (capacity > Size) {
-               data = (T*)realloc(data, sizeof(T) * n);
+               T* grown = (T*)realloc(data, sizeof(T) * n);
+               if (!grown)
+                  aco_arena_exhausted(sizeof(T) * n);
+               data = grown;
                capacity = n;
                return;
             }
          }
          T* ptr = (T*)malloc(sizeof(T) * n);
+         if (!ptr)
+            aco_arena_exhausted(sizeof(T) * n);
          std::uninitialized_move(begin(), end(), ptr);
          if (capacity > Size)
             free(data);
