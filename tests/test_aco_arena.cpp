@@ -26,7 +26,11 @@ extern "C" void* malloc(size_t size)
 }
 
 static char last_label[96];
-extern "C" void psbc_stage_hook(const char* label)
+/* The test links only this header, so it supplies the accessor the library
+ * normally defines. */
+static void record_label(const char* label);
+extern "C" void (*psbc_get_stage_hook(void))(const char*) { return record_label; }
+static void record_label(const char* label)
 {
    strncpy(last_label, label, sizeof(last_label) - 1);
 }

@@ -670,6 +670,14 @@ PsbcResult psbc_compile_tess_pipeline(
  */
 void psbc_free_output(PsbcShaderOutput* out);
 
+/* Optional stage reporting: once set, every compile-stage label (import,
+ * postprocess, isel, RA, emit, binary packing, arena exhaustion) is passed to
+ * `hook` instead of the PSBC_DEBUG_STAGE stderr path. NULL clears it. */
+typedef void (*PsbcStageHook)(const char* label);
+void psbc_set_stage_hook(PsbcStageHook hook);
+/* The hook currently set, or NULL. */
+PsbcStageHook psbc_get_stage_hook(void);
+
 /*
  * Convert a PsbcResult to a human-readable string.
  */
