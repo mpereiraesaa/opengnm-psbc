@@ -100,6 +100,13 @@ test-descriptor-static-use: $(LIBPSBC)
 	$(CC) -std=c11 -Wall -Wextra -Werror -Ilibpsbc tests/test_descriptor_static_use.c $(LIBPSBC) -lstdc++ -lm -lpthread -o tests/test_descriptor_static_use
 	./tests/test_descriptor_static_use
 
+.PHONY: test-ordered-streamout
+test-ordered-streamout: $(LIBPSBC)
+	$(GLSLANG) -V --target-env vulkan1.0 tests/ordered_streamout.vert -o tests/ordered_streamout.vert.spv
+	$(GLSLANG) -V --target-env vulkan1.0 -S geom tests/ordered_streamout.geom -o tests/ordered_streamout.geom.spv
+	$(CC) -std=c11 -Wall -Wextra -Werror -Ilibpsbc tests/test_ordered_streamout.c $(LIBPSBC) -lstdc++ -lm -lpthread -o tests/test_ordered_streamout
+	PSBC_DEBUG_DISASM=1 ./tests/test_ordered_streamout tests/ordered_streamout.vert.spv tests/ordered_streamout.geom.spv
+
 .PHONY: test-robust-buffer-access2
 test-robust-buffer-access2: $(LIBPSBC)
 	$(GLSLANG) -V --target-env vulkan1.0 tests/robust_buffer_access2.comp -o tests/robust_buffer_access2.spv

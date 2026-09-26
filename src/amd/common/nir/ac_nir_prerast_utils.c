@@ -973,6 +973,7 @@ ac_nir_ngg_build_streamout_buffer_info(nir_builder *b,
       }
 
       nir_def *buffer_offsets = NULL, *xfb_state_address = NULL, *xfb_voffset = NULL;
+      nir_def *ps5_ordered_id = NULL, *ps5_ordered_next = NULL;
 
       /* Reserve each workgroup's global buffer range. Native paths order the
        * reservation by ordered_id. PS5's no-GDS path uses global atomics,
@@ -1116,6 +1117,55 @@ ac_nir_ngg_build_streamout_buffer_info(nir_builder *b,
 
          xfb_state_address = nir_pack_64_2x32_split(
             b, nir_channel(b, state_desc, 0), state_hi);
+
+         /* Primitive order without GDS. A workgroup's input primitives are
+          * one contiguous range of the draw's primitive ids, starting at the
+          * id of its first invocation, so the ticket at state + 48 names the
+          * first primitive id whose range may be reserved next: a workgroup
+          * waits until the ticket equals its first primitive id, reserves,
+          * makes its range final and advances the ticket past its input
+          * primitives. The hardware ordered id is not usable here: on this
+          * GPU it does not restart per draw. Primitive ids do, per draw and
+          * per instance, so the driver zeroes the ticket before every draw
+          * and draws a capture one instance at a time. A workgroup that binds
+          * no valid buffer captures nothing and does not wait. The wait is
+          * bounded: past the bound the workgroup proceeds unordered and
+          * records it at state + 52, so a stalled ticket can never hang the
+          * GPU. */
+         ps5_ordered_id = nir_load_primitive_id(b);
+         ps5_ordered_next = nir_iadd(b, ps5_ordered_id,
+                                     nir_load_workgroup_num_input_primitives_amd(b));
+         nir_if *if_ordered = nir_push_if(b, any_buffer_valid);
+         {
+            nir_variable *spins =
+               nir_local_variable_create(b->impl, glsl_uint_type(), "xfb_ticket_spins");
+            nir_store_var(b, spins, nir_imm_int(b, 0), 0x1);
+            nir_loop *wait = nir_push_loop(b);
+            {
+               nir_def *ticket = nir_global_atomic_amd(
+                  b, 32, xfb_state_address, nir_imm_int(b, 0), nir_imm_int(b, 48),
+                  .atomic_op = nir_atomic_op_iadd);
+               nir_def *count = nir_iadd_imm(b, nir_load_var(b, spins), 1);
+               nir_store_var(b, spins, count, 0x1);
+               nir_def *turn = nir_ieq(b, ticket, ps5_ordered_id);
+               nir_if *if_done = nir_push_if(b, turn);
+               {
+                  nir_jump(b, nir_jump_break);
+               }
+               nir_pop_if(b, if_done);
+               nir_if *if_bound = nir_push_if(b, nir_uge_imm(b, count, 1u << 16));
+               {
+                  nir_global_atomic_amd(b, 32, xfb_state_address, nir_imm_int(b, 1),
+                                        nir_imm_int(b, 52),
+                                        .atomic_op = nir_atomic_op_iadd);
+                  nir_jump(b, nir_jump_break);
+               }
+               nir_pop_if(b, if_bound);
+               ac_nir_sleep(b, 8);
+            }
+            nir_pop_loop(b, wait);
+         }
+         nir_pop_if(b, if_ordered);
          nir_def *offset[4] = {undef, undef, undef, undef};
          u_foreach_bit(buffer, info->buffers_written) {
             offset[buffer] = nir_global_atomic_amd(
@@ -1198,17 +1248,24 @@ ac_nir_ngg_build_streamout_buffer_info(nir_builder *b,
 
          if_invocation_0 = nir_push_if(b, nir_ieq_imm(b, tid_in_tg, 0));
       } else if (use_ps5_global_streamout) {
-         nir_if *if_any_overflow = nir_push_if(b, any_overflow);
-         {
-            u_foreach_bit(buffer, info->buffers_written) {
+         /* Return exactly the part of the reservation this workgroup did
+          * not write, so the offset (and the Vulkan counter copied from it)
+          * is the byte offset after the last primitive actually captured.
+          * A primitive that does not fit whole is neither written nor
+          * counted, including the first one past the end of the buffer. */
+         u_foreach_bit(buffer, info->buffers_written) {
+            unsigned stream = info->buffer_to_stream[buffer];
+            nir_def *written = nir_imul(b, emit_prim[stream], prim_stride[buffer]);
+            nir_def *unused = nir_isub(b, workgroup_buffer_sizes[buffer], written);
+            nir_if *if_unused = nir_push_if(b, nir_ine_imm(b, unused, 0));
+            {
                nir_global_atomic_amd(
-                  b, 32, xfb_state_address,
-                  nir_ineg(b, overflow_amount[buffer]),
+                  b, 32, xfb_state_address, nir_ineg(b, unused),
                   nir_imm_int(b, buffer * 4),
                   .atomic_op = nir_atomic_op_iadd);
             }
+            nir_pop_if(b, if_unused);
          }
-         nir_pop_if(b, if_any_overflow);
       } else {
          nir_if *if_any_overflow = nir_push_if(b, any_overflow);
          nir_xfb_counter_sub_gfx11_amd(b, nir_vec(b, overflow_amount, 4),
@@ -1249,6 +1306,16 @@ ac_nir_ngg_build_streamout_buffer_info(nir_builder *b,
       if (use_ps5_global_streamout) {
          nir_scoped_memory_barrier(b, SCOPE_DEVICE, NIR_MEMORY_ACQ_REL,
                                    nir_var_mem_global);
+         /* Hand the ticket to the next workgroup only after this range is
+          * final. */
+         nir_if *if_release = nir_push_if(b, any_buffer_valid);
+         {
+            nir_global_atomic_amd(b, 32, xfb_state_address,
+                                  ps5_ordered_next,
+                                  nir_imm_int(b, 48),
+                                  .atomic_op = nir_atomic_op_xchg);
+         }
+         nir_pop_if(b, if_release);
       }
    }
    nir_pop_if(b, if_invocation_0);
