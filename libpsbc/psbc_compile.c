@@ -82,7 +82,14 @@ static void debug_shader_io(const char* label, const nir_shader* nir,
                 ? info->gs.num_linked_inputs : 0);
 }
 
+/* Optional embedder hook: when an application defines it, every stage label
+ * goes there instead of stderr (the console has no usable stderr). */
+__attribute__((weak)) void psbc_stage_hook(const char* label);
 static void debug_stage(const char* label) {
+    if (psbc_stage_hook) {
+        psbc_stage_hook(label);
+        return;
+    }
     if (!getenv("PSBC_DEBUG_STAGE"))
         return;
     fprintf(stderr, "PSBC stage %s\n", label);
@@ -3873,6 +3880,7 @@ static PsbcResult psbc_compile_impl(
     }
     if (getenv("PSBC_DEBUG_DISASM"))
         stage.key.keep_executable_info = true;
+    debug_stage("aco-begin");
     struct radv_shader_binary* binary = radv_shader_nir_to_asm(
         &compiler_info, &stage, shaders, shader_count, &gfx_state
     );
@@ -3945,8 +3953,10 @@ static PsbcResult psbc_compile_impl(
 
     uint8_t* output_data = NULL;
     size_t output_size = 0;
+    debug_stage("binary-begin");
     PsbcResult result = buildshaderbinary(&buildctx, code, code_dw,
                                           &output_data, &output_size);
+    debug_stage("binary-end");
     if (result != PSBC_RESULT_OK) {
         free(binary);
         if (previous_nir)
