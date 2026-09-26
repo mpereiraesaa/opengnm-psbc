@@ -231,7 +231,7 @@ private:
  * This class mimics std::pmr::monotonic_buffer_resource
  */
 } /* namespace aco */
-extern "C" __attribute__((weak)) void psbc_stage_hook(const char* label);
+extern "C" void (*psbc_get_stage_hook(void))(const char* label);
 namespace aco {
 /* An arena block could not be allocated. Instructions and other IR live in
  * these blocks, so there is no way to continue the compile: report the size
@@ -241,8 +241,8 @@ namespace aco {
 {
    char text[96];
    snprintf(text, sizeof(text), "arena-exhausted %zu errno=%d", size, errno);
-   if (psbc_stage_hook)
-      psbc_stage_hook(text);
+   if (psbc_get_stage_hook())
+      psbc_get_stage_hook()(text);
    fprintf(stderr, "ACO: %s\n", text);
    abort();
 }

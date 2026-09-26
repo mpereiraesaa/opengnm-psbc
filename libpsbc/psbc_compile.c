@@ -84,10 +84,14 @@ static void debug_shader_io(const char* label, const nir_shader* nir,
 
 /* Optional embedder hook: when an application defines it, every stage label
  * goes there instead of stderr (the console has no usable stderr). */
-__attribute__((weak)) void psbc_stage_hook(const char* label);
+/* A set function pointer rather than a weak symbol: an undefined weak
+ * reference stays a dynamic import that console linkers cannot resolve. */
+static PsbcStageHook g_stage_hook;
+void psbc_set_stage_hook(PsbcStageHook hook) { g_stage_hook = hook; }
+PsbcStageHook psbc_get_stage_hook(void) { return g_stage_hook; }
 static void debug_stage(const char* label) {
-    if (psbc_stage_hook) {
-        psbc_stage_hook(label);
+    if (g_stage_hook) {
+        g_stage_hook(label);
         return;
     }
     if (!getenv("PSBC_DEBUG_STAGE"))

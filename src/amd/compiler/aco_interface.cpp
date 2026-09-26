@@ -16,8 +16,8 @@
 
 using namespace aco;
 
-extern "C" __attribute__((weak)) void psbc_stage_hook(const char* label);
-#define ACO_STAGE(label) do { if (psbc_stage_hook) psbc_stage_hook(label); } while (0)
+extern "C" void (*psbc_get_stage_hook(void))(const char* label);
+#define ACO_STAGE(label) do { if (psbc_get_stage_hook()) psbc_get_stage_hook()(label); } while (0)
 
 namespace {
 
